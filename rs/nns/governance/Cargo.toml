@@ -47,6 +47,7 @@ bytes = "1.0.1"
 strum_macros = "0.23.0"
 strum = "0.23.0"
 comparable = { version = "0.5", features = ["derive"] }
+ic-cdk = { version = "0.3.3", default-features = false }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 clap = "3.0.0-beta.2"
