@@ -1799,6 +1799,7 @@ dependencies = [
  "dfn_core",
  "dfn_protobuf",
  "ic-base-types",
+ "ic-cdk",
  "ic-certified-map",
  "ic-crypto-tree-hash",
  "ic-nervous-system-common",
@@ -2010,6 +2011,7 @@ dependencies = [
  "candid",
  "dfn_candid",
  "dfn_core",
+ "ic-cdk",
  "serde",
  "serde_bytes",
 ]
@@ -3387,6 +3389,7 @@ dependencies = [
  "candid",
  "comparable",
  "crc32fast",
+ "ic-cdk",
  "ic-crypto-sha",
  "ic-protobuf",
  "phantom_newtype",
@@ -3693,12 +3696,12 @@ dependencies = [
 
 [[package]]
 name = "ic-cdk"
-version = "0.3.1"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "59ff298314d235dd2c150f74157df5bbcdbd48604b895425840c2fe9225c9a3a"
+checksum = "606276ed1ce363eb9ccaf492e36fb40425417dcd4598f261d47e0ed6a1309faa"
 dependencies = [
  "candid",
- "cfg-if 0.1.10",
+ "cfg-if 1.0.0",
  "serde",
 ]
 
@@ -4896,6 +4899,7 @@ version = "0.8.0"
 dependencies = [
  "candid",
  "ic-base-types",
+ "ic-cdk",
  "ic-error-types",
  "ic-protobuf",
  "num-traits",
@@ -5155,6 +5159,7 @@ dependencies = [
  "comparable",
  "dfn_core",
  "ic-base-types",
+ "ic-cdk",
  "ic-crypto-sha",
  "ic-nervous-system-common",
  "ic-nns-constants",
@@ -5176,8 +5181,12 @@ dependencies = [
 name = "ic-nns-constants"
 version = "0.8.0"
 dependencies = [
+ "ed25519-dalek",
  "ic-base-types",
+ "ic-types 0.8.0",
  "lazy_static",
+ "rand_chacha 0.2.2",
+ "rand_core 0.5.1",
 ]
 
 [[package]]
@@ -5198,6 +5207,7 @@ dependencies = [
  "dfn_protobuf",
  "futures",
  "ic-base-types",
+ "ic-cdk",
  "ic-config",
  "ic-crypto-sha",
  "ic-nervous-system-common",
@@ -5651,6 +5661,7 @@ dependencies = [
  "bincode",
  "candid",
  "erased-serde",
+ "ic-cdk",
  "maplit",
  "prost",
  "prost-build",
@@ -5855,6 +5866,7 @@ name = "ic-registry-subnet-features"
 version = "0.8.0"
 dependencies = [
  "candid",
+ "ic-cdk",
  "ic-protobuf",
  "serde",
 ]
@@ -5864,6 +5876,7 @@ name = "ic-registry-subnet-type"
 version = "0.8.0"
 dependencies = [
  "candid",
+ "ic-cdk",
  "ic-protobuf",
  "serde",
  "strum 0.23.0",
@@ -5876,6 +5889,7 @@ version = "0.8.0"
 dependencies = [
  "bytes",
  "candid",
+ "ic-cdk",
  "ic-protobuf",
  "prost",
  "prost-build",
@@ -9663,6 +9677,7 @@ dependencies = [
  "dfn_core",
  "ic-base-types",
  "ic-canister-client",
+ "ic-cdk",
  "ic-certified-map",
  "ic-crypto",
  "ic-crypto-node-key-validation",
