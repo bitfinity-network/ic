@@ -20,7 +20,7 @@ use std::{
 use futures::future::join_all;
 use prost::Message;
 
-use candid::Encode;
+use candid::{CandidType, Encode};
 use canister_test::{
     local_test_with_config_e, local_test_with_config_with_mutations, Canister, Project, Runtime,
     Wasm,
@@ -57,6 +57,7 @@ use ledger_canister::AccountIdentifier;
 use lifeline::LIFELINE_CANISTER_WASM;
 use on_wire::{bytes, IntoWire};
 use registry_canister::init::{RegistryCanisterInitPayload, RegistryCanisterInitPayloadBuilder};
+use serde::{Deserialize, Serialize};
 
 /// All the NNS canisters that exist at genesis.
 #[derive(Clone)]
@@ -83,6 +84,7 @@ pub struct NnsInitPayloads {
     pub cycles_minting: CyclesCanisterInitPayload,
     pub lifeline: LifelineCanisterInitPayload,
     pub genesis_token: Gtc,
+    pub identity: Option<IdentityCanisterInitPayload>,
 }
 
 /// Builder to help create the intial payloads for the NNS canisters.
@@ -94,6 +96,12 @@ pub struct NnsInitPayloadsBuilder {
     pub cycles_minting: CyclesCanisterInitPayload,
     pub lifeline: LifelineCanisterInitPayloadBuilder,
     pub genesis_token: GenesisTokenCanisterInitPayloadBuilder,
+    pub identity: Option<IdentityCanisterInitPayload>,
+}
+
+#[derive(Serialize, Deserialize, CandidType, Clone, Debug, PartialEq, Eq)]
+pub struct IdentityCanisterInitPayload {
+    assigned_user_number_range: (u64, u64),
 }
 
 #[allow(clippy::new_without_default)]
@@ -129,6 +137,7 @@ impl NnsInitPayloadsBuilder {
             },
             lifeline: LifelineCanisterInitPayloadBuilder::new(),
             genesis_token: GenesisTokenCanisterInitPayloadBuilder::new(),
+            identity: None,
         }
     }
 
@@ -239,6 +248,7 @@ impl NnsInitPayloadsBuilder {
             cycles_minting: self.cycles_minting.clone(),
             lifeline: self.lifeline.build(),
             genesis_token: self.genesis_token.build(),
+            identity: self.identity.clone(),
         }
     }
 }
@@ -271,7 +281,7 @@ impl NnsCanisters<'_> {
         let mut cycles_minting = Canister::new(runtime, CYCLES_MINTING_CANISTER_ID);
         let mut lifeline = Canister::new(runtime, LIFELINE_CANISTER_ID);
         let mut genesis_token = Canister::new(runtime, GENESIS_TOKEN_CANISTER_ID);
-        let identity = Canister::new(runtime, IDENTITY_CANISTER_ID);
+        let mut identity = Canister::new(runtime, IDENTITY_CANISTER_ID);
         let nns_ui = Canister::new(runtime, NNS_UI_CANISTER_ID);
 
         // Install canisters
@@ -286,6 +296,7 @@ impl NnsCanisters<'_> {
             ),
             install_lifeline_canister(&mut lifeline, init_payloads.lifeline.clone()),
             install_genesis_token_canister(&mut genesis_token, init_payloads.genesis_token.clone()),
+            install_identity_canister(&mut identity, init_payloads.identity.clone()),
         );
 
         eprintln!("NNS canisters installed after {:.1} s", since_start_secs());
@@ -452,6 +463,15 @@ pub async fn install_genesis_token_canister(canister: &mut Canister<'_>, init_pa
         Some(serialized),
     )
     .await
+}
+
+pub async fn install_identity_canister(
+    canister: &mut Canister<'_>,
+    init_payload: Option<IdentityCanisterInitPayload>,
+) {
+    let serialized = candid::Encode!(&init_payload).unwrap();
+
+    install_rust_canister(canister, "", "identity-canister", &[], Some(serialized)).await
 }
 
 /// Creates and installs the GTC canister.
