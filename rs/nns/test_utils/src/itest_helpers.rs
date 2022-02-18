@@ -107,11 +107,18 @@ pub struct IdentityCanisterInitPayload {
 #[allow(clippy::new_without_default)]
 impl NnsInitPayloadsBuilder {
     pub fn new() -> NnsInitPayloadsBuilder {
+        let minter = minter
+            .and_then(|hex_str| AccountIdentifier::from_hex(hex_str.as_str()).ok())
+            .unwrap_or_else(|| {
+                eprintln!("unable to parse minter ID, switch to GOVERNANCE_CANISTER_ID");
+                GOVERNANCE_CANISTER_ID.get().into()
+            });
+
         NnsInitPayloadsBuilder {
             registry: RegistryCanisterInitPayloadBuilder::new(),
             governance: GovernanceCanisterInitPayloadBuilder::new(),
             ledger: LedgerCanisterInitPayload::builder()
-                .minting_account(GOVERNANCE_CANISTER_ID.get().into())
+                .minting_account(minter)
                 .archive_options(ledger::ArchiveOptions {
                     trigger_threshold: 2000,
                     num_blocks_to_archive: 1000,
@@ -133,7 +140,7 @@ impl NnsInitPayloadsBuilder {
             cycles_minting: CyclesCanisterInitPayload {
                 ledger_canister_id: LEDGER_CANISTER_ID,
                 governance_canister_id: GOVERNANCE_CANISTER_ID,
-                minting_account_id: Some(GOVERNANCE_CANISTER_ID.get().into()),
+                minting_account_id: Some(minter),
             },
             lifeline: LifelineCanisterInitPayloadBuilder::new(),
             genesis_token: GenesisTokenCanisterInitPayloadBuilder::new(),

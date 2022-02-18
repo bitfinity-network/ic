@@ -27,6 +27,12 @@ struct CliArgs {
     #[structopt(long, parse(from_os_str))]
     wasm_dir: Option<PathBuf>,
 
+    /// Sets the minter account
+    ///
+    /// Optional: defaults to the governance canister ID.
+    #[structopt(long)]
+    minter: Option<String>,
+
     /// Path to a .csv file for initialising the `neurons` canister.
     ///
     /// Optional: defaults to creating canisters with test neurons.
@@ -195,7 +201,7 @@ async fn main() {
 
 /// Constructs the `NnsInitPayloads` from the command line options.
 fn create_init_payloads(args: &CliArgs) -> NnsInitPayloads {
-    let mut init_payloads_builder = NnsInitPayloadsBuilder::new();
+    let mut init_payloads_builder = NnsInitPayloadsBuilder::new(args.minter.clone());
 
     add_registry_content(
         &mut init_payloads_builder,
