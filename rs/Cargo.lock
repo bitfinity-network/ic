@@ -5123,6 +5123,7 @@ dependencies = [
  "dfn_core",
  "dfn_protobuf",
  "ic-base-types",
+ "ic-cdk",
  "ic-crypto-sha",
  "ledger-canister",
  "serde",
@@ -5181,12 +5182,8 @@ dependencies = [
 name = "ic-nns-constants"
 version = "0.8.0"
 dependencies = [
- "ed25519-dalek",
  "ic-base-types",
- "ic-types 0.8.0",
  "lazy_static",
- "rand_chacha 0.2.2",
- "rand_core 0.5.1",
 ]
 
 [[package]]
@@ -6773,6 +6770,7 @@ dependencies = [
  "http",
  "ic-base-types",
  "ic-btc-types-internal",
+ "ic-cdk",
  "ic-constants",
  "ic-crypto-internal-types",
  "ic-crypto-sha",
@@ -7310,6 +7308,7 @@ dependencies = [
  "hex",
  "ic-base-types",
  "ic-canister-client",
+ "ic-cdk",
  "ic-constants",
  "ic-crypto-sha",
  "ic-ic00-types",
