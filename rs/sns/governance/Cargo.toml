@@ -37,6 +37,11 @@ strum = "0.18.0"
 comparable = { version = "0.5", features = ["derive"] }
 hex = "0.4.3"
 
+# INFINITY-SWAP: DO NOT REMOVE!!!
+# several crates in the ic/rs/ will fail to build and we have to add
+# ic-cdk as a dependency explicitly.
+ic-cdk = { version = "0.3" }
+
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 clap = "3.0.0-beta.2"
 csv = "1.1"
