@@ -3708,7 +3708,7 @@ dependencies = [
 [[package]]
 name = "ic-certified-map"
 version = "0.2.0"
-source = "git+git://github.com/dfinity/cdk-rs?rev=2112e912e156b271389a51777680de542bb43980#2112e912e156b271389a51777680de542bb43980"
+source = "git+http://github.com/dfinity/cdk-rs?rev=2112e912e156b271389a51777680de542bb43980#2112e912e156b271389a51777680de542bb43980"
 dependencies = [
  "serde",
  "serde_bytes",
@@ -5145,6 +5145,7 @@ dependencies = [
  "dfn_candid",
  "dfn_core",
  "ic-base-types",
+ "ic-cdk",
  "ic-crypto-sha",
  "ic-ic00-types",
  "ic-nervous-system-common",
@@ -5240,6 +5241,7 @@ dependencies = [
  "hex",
  "hex-literal 0.3.3",
  "ic-base-types",
+ "ic-cdk",
  "ic-crypto-sha",
  "ic-nervous-system-common",
  "ic-nns-common",
@@ -6294,6 +6296,7 @@ dependencies = [
  "futures",
  "hex",
  "ic-base-types",
+ "ic-cdk",
  "ic-config",
  "ic-crypto-sha",
  "ic-nervous-system-common",
@@ -6816,6 +6819,7 @@ version = "0.8.0"
 dependencies = [
  "candid",
  "hex-literal 0.2.1",
+ "ic-cdk",
  "ic-crypto-sha",
  "ic-types 0.8.0",
  "serde",
@@ -12502,6 +12506,7 @@ version = "0.8.0"
 dependencies = [
  "candid",
  "dfn_core",
+ "ic-cdk",
  "rand 0.7.3",
  "rand_pcg 0.2.1",
  "serde",

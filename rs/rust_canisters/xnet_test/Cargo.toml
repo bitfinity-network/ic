@@ -13,3 +13,8 @@ dfn_core = { path = "../dfn_core" }
 rand = "0.7.3"
 rand_pcg = "0.2.1"
 serde = "1.0"
+
+# INFINITY-SWAP: DO NOT REMOVE!!!
+# several crates in the ic/rs/ will fail to build and we have to add
+# ic-cdk as a dependency explicitly.
+ic-cdk = { version = "0.3" }
