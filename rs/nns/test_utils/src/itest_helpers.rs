@@ -106,7 +106,7 @@ pub struct IdentityCanisterInitPayload {
 
 #[allow(clippy::new_without_default)]
 impl NnsInitPayloadsBuilder {
-    pub fn new() -> NnsInitPayloadsBuilder {
+    pub fn new(minter: Option<String>) -> NnsInitPayloadsBuilder {
         let minter = minter
             .and_then(|hex_str| AccountIdentifier::from_hex(hex_str.as_str()).ok())
             .unwrap_or_else(|| {
