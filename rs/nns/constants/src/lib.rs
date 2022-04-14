@@ -26,7 +26,7 @@ pub const IDENTITY_CANISTER_INDEX_IN_NNS_SUBNET: u64 = 7;
 pub const NNS_UI_CANISTER_INDEX_IN_NNS_SUBNET: u64 = 8;
 
 /// The names of all expected .wasm files to set up the NNS.
-pub const NNS_CANISTER_WASMS: [&str; 10] = [
+pub const NNS_CANISTER_WASMS: [&str; 9] = [
     // The lifeline is not present! Because its wasm is embedded in the source code using
     // include_bytes, it is not provided on the path. We want to change that, though.
     "registry-canister",
@@ -36,7 +36,7 @@ pub const NNS_CANISTER_WASMS: [&str; 10] = [
     "root-canister",
     "cycles-minting-canister",
     // The lifeline is built differently, which explains why its wasm has a different name pattern.
-    "lifeline",
+    // "lifeline",
     "genesis-token-canister",
     "identity-canister",
     "nns-ui-canister",
