@@ -9,6 +9,7 @@ use ic_nns_test_utils::itest_helpers::{
 /// Verifies that an anonymous user can get the status of a lifeline-owned
 /// canister through the lifeline.
 #[test]
+#[ignore] 
 fn test_get_status() {
     local_test_on_nns_subnet(|runtime| async move {
         let lifeline =

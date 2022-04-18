@@ -301,7 +301,7 @@ impl NnsCanisters<'_> {
                 &mut cycles_minting,
                 init_payloads.cycles_minting.clone()
             ),
-            install_lifeline_canister(&mut lifeline, init_payloads.lifeline.clone()),
+            // install_lifeline_canister(&mut lifeline, init_payloads.lifeline.clone()),
             install_genesis_token_canister(&mut genesis_token, init_payloads.genesis_token.clone()),
             install_identity_canister(&mut identity, init_payloads.identity.clone()),
         );
