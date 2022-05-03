@@ -1,19 +1,18 @@
 //! Module that deals with requests to /api/v2/canister/.../query
 
 use crate::{
-    common::{cbor_response, make_response, make_response_on_validation_error},
-    types::{ApiReqType, RequestType},
+    common::{cbor_response, make_plaintext_response, make_response_on_validation_error},
+    types::{to_legacy_request_type, ApiReqType},
     HttpHandlerMetrics, ReplicaHealthStatus, UNKNOWN_LABEL,
 };
 use futures_util::FutureExt;
-use hyper::{Body, Response};
+use hyper::{Body, Response, StatusCode};
 use ic_interfaces::{
     crypto::IngressSigVerifier, execution_environment::QueryExecutionService,
     registry::RegistryClient,
 };
 use ic_logger::{trace, ReplicaLogger};
 use ic_types::{
-    canonical_error::{invalid_argument_error, permission_denied_error, unavailable_error},
     malicious_flags::MaliciousFlags,
     messages::{
         CertificateDelegation, HttpQueryContent, HttpRequest, HttpRequestEnvelope,
@@ -81,15 +80,16 @@ impl Service<Vec<u8>> for QueryService {
         self.metrics
             .requests_body_size_bytes
             .with_label_values(&[
-                RequestType::Query.as_str(),
-                ApiReqType::Query.as_str(),
+                to_legacy_request_type(ApiReqType::Query),
+                ApiReqType::Query.into(),
                 UNKNOWN_LABEL,
             ])
             .observe(body.len() as f64);
         if *self.health_status.read().unwrap() != ReplicaHealthStatus::Healthy {
-            let res = make_response(unavailable_error(
-                "Replica is starting. Check the /api/v2/status for more information.",
-            ));
+            let res = make_plaintext_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Replica is starting. Check the /api/v2/status for more information.".to_string(),
+            );
             return Box::pin(async move { Ok(res) });
         }
         let delegation_from_nns = self.delegation_from_nns.read().unwrap().clone();
@@ -99,9 +99,10 @@ impl Service<Vec<u8>> for QueryService {
         ) {
             Ok(request) => request,
             Err(e) => {
-                let res = make_response(invalid_argument_error(
-                    format!("Could not parse body as read request: {}", e).as_str(),
-                ));
+                let res = make_plaintext_response(
+                    StatusCode::BAD_REQUEST,
+                    format!("Could not parse body as read request: {}", e),
+                );
                 return Box::pin(async move { Ok(res) });
             }
         };
@@ -111,9 +112,10 @@ impl Service<Vec<u8>> for QueryService {
         let request = match HttpRequest::<UserQuery>::try_from(request) {
             Ok(request) => request,
             Err(e) => {
-                let res = make_response(invalid_argument_error(
-                    format!("Malformed request: {:?}", e).as_str(),
-                ));
+                let res = make_plaintext_response(
+                    StatusCode::BAD_REQUEST,
+                    format!("Malformed request: {:?}", e),
+                );
                 return Box::pin(async move { Ok(res) });
             }
         };
@@ -128,7 +130,7 @@ impl Service<Vec<u8>> for QueryService {
         ) {
             Ok(targets) => {
                 if !targets.contains(&query.receiver) {
-                    let res = make_response(permission_denied_error(""));
+                    let res = make_plaintext_response(StatusCode::FORBIDDEN, "".to_string());
                     return Box::pin(async move { Ok(res) });
                 }
             }

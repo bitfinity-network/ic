@@ -1,10 +1,8 @@
-FROM debian:bullseye-slim
+FROM ubuntu:20.04
 
-WORKDIR /root
+ARG RELEASE
 
-COPY target/release/ic-rosetta-api /usr/local/bin/ic-rosetta-api
-
-COPY log_config.yml /root
+LABEL RELEASE=${RELEASE}
 
 RUN \
   apt update && \
@@ -15,6 +13,18 @@ RUN \
   rm -rf \
     /tmp/* \
     /var/lib/apt/lists/* \
-    /var/tmp/*
+    /var/tmp/* && \
+  useradd -m rosetta && \
+  mkdir /data && \
+  chown rosetta:rosetta /data && \
+  chmod -R a+rw /home/rosetta
 
-ENTRYPOINT ["/usr/local/bin/ic-rosetta-api", "--store-location", "/data", "--store-type", "sqlite"]
+COPY ic-rosetta-api /usr/local/bin/ic-rosetta-api
+
+COPY --chown=rosetta:rosetta log_config.yml /home/rosetta
+
+USER rosetta
+
+WORKDIR /home/rosetta
+
+ENTRYPOINT ["/usr/local/bin/ic-rosetta-api", "--store-location", "/data"]

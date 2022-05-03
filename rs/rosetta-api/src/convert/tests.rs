@@ -1,15 +1,16 @@
-use crate::models::OperationIdentifier;
+use crate::models::{OperationIdentifier, OperationType};
 
 use super::*;
+use crate::DEFAULT_TOKEN_SYMBOL;
 use ledger_canister::AccountIdentifier;
 use ledger_canister::Operation as LedgerOperation;
 
 struct OperationBuilder(Operation);
 impl OperationBuilder {
-    fn new(idx: i64, typ: impl ToString) -> Self {
+    fn new(idx: i64, _type: OperationType) -> Self {
         Self(Operation {
             operation_identifier: OperationIdentifier::new(idx),
-            _type: typ.to_string(),
+            _type,
             status: None,
             account: None,
             amount: None,
@@ -28,16 +29,16 @@ impl OperationBuilder {
 
     fn amount(self, amount: i128) -> Self {
         Self(Operation {
-            amount: Some(signed_amount(amount)),
+            amount: Some(signed_amount(amount, DEFAULT_TOKEN_SYMBOL)),
             ..self.0
         })
     }
 
-    fn neuron_identifier(self, neuron_identifier: u64) -> Self {
+    fn neuron_index(self, neuron_index: u64) -> Self {
         let mut metadata = self.0.metadata.unwrap_or_default();
         metadata.insert(
-            "neuron_identifier".to_owned(),
-            serde_json::to_value(neuron_identifier).unwrap(),
+            "neuron_index".to_owned(),
+            serde_json::to_value(neuron_index).unwrap(),
         );
         Self(Operation {
             metadata: Some(metadata),
@@ -57,24 +58,27 @@ fn test_account(n: u64) -> AccountIdentifier {
 }
 
 #[test]
-fn test_transfer_request_to_operations() {
+fn test_transfer_requests_to_operations() {
     assert_eq!(
-        Request::requests_to_operations(&[Request::Transfer(LedgerOperation::Transfer {
-            from: test_account(1),
-            to: test_account(2),
-            amount: Tokens::from_e8s(100),
-            fee: Tokens::from_e8s(10),
-        })]),
+        Request::requests_to_operations(
+            &[Request::Transfer(LedgerOperation::Transfer {
+                from: test_account(1),
+                to: test_account(2),
+                amount: Tokens::from_e8s(100),
+                fee: Tokens::from_e8s(10),
+            })],
+            DEFAULT_TOKEN_SYMBOL
+        ),
         Ok(vec![
-            OperationBuilder::new(0, "TRANSACTION")
+            OperationBuilder::new(0, OperationType::Transaction)
                 .account(test_account(1))
                 .amount(-100)
                 .build(),
-            OperationBuilder::new(1, "TRANSACTION")
+            OperationBuilder::new(1, OperationType::Transaction)
                 .account(test_account(2))
                 .amount(100)
                 .build(),
-            OperationBuilder::new(2, "FEE")
+            OperationBuilder::new(2, OperationType::Fee)
                 .account(test_account(1))
                 .amount(-10)
                 .build(),
@@ -85,34 +89,37 @@ fn test_transfer_request_to_operations() {
 #[test]
 fn test_transfer_and_stake_requests_to_operations() {
     assert_eq!(
-        Request::requests_to_operations(&[
-            Request::Transfer(LedgerOperation::Transfer {
-                from: test_account(1),
-                to: test_account(2),
-                amount: Tokens::from_e8s(100),
-                fee: Tokens::from_e8s(10),
-            }),
-            Request::Stake(Stake {
-                account: test_account(2),
-                neuron_identifier: 1,
-            })
-        ]),
+        Request::requests_to_operations(
+            &[
+                Request::Transfer(LedgerOperation::Transfer {
+                    from: test_account(1),
+                    to: test_account(2),
+                    amount: Tokens::from_e8s(100),
+                    fee: Tokens::from_e8s(10),
+                }),
+                Request::Stake(Stake {
+                    account: test_account(2),
+                    neuron_index: 1,
+                })
+            ],
+            DEFAULT_TOKEN_SYMBOL
+        ),
         Ok(vec![
-            OperationBuilder::new(0, "TRANSACTION")
+            OperationBuilder::new(0, OperationType::Transaction)
                 .account(test_account(1))
                 .amount(-100)
                 .build(),
-            OperationBuilder::new(1, "TRANSACTION")
+            OperationBuilder::new(1, OperationType::Transaction)
                 .account(test_account(2))
                 .amount(100)
                 .build(),
-            OperationBuilder::new(2, "FEE")
+            OperationBuilder::new(2, OperationType::Fee)
                 .account(test_account(1))
                 .amount(-10)
                 .build(),
-            OperationBuilder::new(3, "STAKE")
+            OperationBuilder::new(3, OperationType::Stake)
                 .account(test_account(2))
-                .neuron_identifier(1)
+                .neuron_index(1)
                 .build(),
         ])
     );
@@ -121,42 +128,45 @@ fn test_transfer_and_stake_requests_to_operations() {
 #[test]
 fn test_can_handle_multiple_transfers() {
     assert_eq!(
-        Request::requests_to_operations(&[
-            Request::Transfer(LedgerOperation::Transfer {
-                from: test_account(1),
-                to: test_account(2),
-                amount: Tokens::from_e8s(100),
-                fee: Tokens::from_e8s(10),
-            }),
-            Request::Transfer(LedgerOperation::Transfer {
-                from: test_account(3),
-                to: test_account(4),
-                amount: Tokens::from_e8s(200),
-                fee: Tokens::from_e8s(20),
-            }),
-        ]),
+        Request::requests_to_operations(
+            &[
+                Request::Transfer(LedgerOperation::Transfer {
+                    from: test_account(1),
+                    to: test_account(2),
+                    amount: Tokens::from_e8s(100),
+                    fee: Tokens::from_e8s(10),
+                }),
+                Request::Transfer(LedgerOperation::Transfer {
+                    from: test_account(3),
+                    to: test_account(4),
+                    amount: Tokens::from_e8s(200),
+                    fee: Tokens::from_e8s(20),
+                }),
+            ],
+            DEFAULT_TOKEN_SYMBOL
+        ),
         Ok(vec![
-            OperationBuilder::new(0, "TRANSACTION")
+            OperationBuilder::new(0, OperationType::Transaction)
                 .account(test_account(1))
                 .amount(-100)
                 .build(),
-            OperationBuilder::new(1, "TRANSACTION")
+            OperationBuilder::new(1, OperationType::Transaction)
                 .account(test_account(2))
                 .amount(100)
                 .build(),
-            OperationBuilder::new(2, "FEE")
+            OperationBuilder::new(2, OperationType::Fee)
                 .account(test_account(1))
                 .amount(-10)
                 .build(),
-            OperationBuilder::new(3, "TRANSACTION")
+            OperationBuilder::new(3, OperationType::Transaction)
                 .account(test_account(3))
                 .amount(-200)
                 .build(),
-            OperationBuilder::new(4, "TRANSACTION")
+            OperationBuilder::new(4, OperationType::Transaction)
                 .account(test_account(4))
                 .amount(200)
                 .build(),
-            OperationBuilder::new(5, "FEE")
+            OperationBuilder::new(5, OperationType::Fee)
                 .account(test_account(3))
                 .amount(-20)
                 .build(),

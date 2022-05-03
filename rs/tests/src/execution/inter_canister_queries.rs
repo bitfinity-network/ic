@@ -1,33 +1,18 @@
 /* tag::catalog[]
 end::catalog[] */
+use crate::driver::ic::InternetComputer;
 use crate::{
     types::RejectCode,
     util::{
-        assert_create_agent, assert_reject, create_and_install, get_random_nns_node_endpoint,
-        get_random_node_endpoint, get_random_verified_app_node_endpoint, UniversalCanister,
+        assert_create_agent, assert_reject, create_and_install, escape_for_wat,
+        get_random_nns_node_endpoint, get_random_node_endpoint,
+        get_random_verified_app_node_endpoint, UniversalCanister,
     },
 };
-use ic_agent::export::Principal;
-use ic_fondue::{ic_manager::IcHandle, internet_computer::InternetComputer};
+use ic_fondue::ic_manager::IcHandle;
 use ic_registry_subnet_type::SubnetType;
 use ic_types::CanisterId;
 use ic_universal_canister::{call_args, wasm};
-
-/// converts canister id into an escaped byte string, to inject this string into
-/// a data section
-fn escape_for_wat(id: &Principal) -> String {
-    // Quoting from
-    // https://webassembly.github.io/spec/core/text/values.html#text-string:
-    //
-    // "Strings [...] can represent both textual and binary data" and
-    //
-    // "hexadecimal escape sequences ‘∖ℎℎ’, [...] represent raw bytes of the
-    // respective value".
-    id.as_slice().iter().fold(String::new(), |mut res, b| {
-        res.push_str(&format!("\\{:02x}", b));
-        res
-    })
-}
 
 pub fn config() -> InternetComputer {
     InternetComputer::new()
@@ -36,7 +21,7 @@ pub fn config() -> InternetComputer {
 }
 
 /// User queries A on first subnet. A queries B on another subnet which fails.
-pub fn cannot_query_xnet_canister(handle: IcHandle, ctx: &fondue::pot::Context) {
+pub fn cannot_query_xnet_canister(handle: IcHandle, ctx: &ic_fondue::pot::Context) {
     let mut rng = ctx.rng.clone();
     let rt = tokio::runtime::Runtime::new().expect("Could not create tokio runtime.");
     rt.block_on({
@@ -60,7 +45,7 @@ pub fn cannot_query_xnet_canister(handle: IcHandle, ctx: &fondue::pot::Context) 
 }
 
 /// User queries canister A; A replies to user.
-pub fn simple_query(handle: IcHandle, ctx: &fondue::pot::Context) {
+pub fn simple_query(handle: IcHandle, ctx: &ic_fondue::pot::Context) {
     let mut rng = ctx.rng.clone();
     let rt = tokio::runtime::Runtime::new().expect("Could not create tokio runtime.");
     rt.block_on({
@@ -82,7 +67,7 @@ pub fn simple_query(handle: IcHandle, ctx: &fondue::pot::Context) {
 }
 
 /// User queries canister A; A queries self which fails.
-pub fn self_loop_fails(handle: IcHandle, ctx: &fondue::pot::Context) {
+pub fn self_loop_fails(handle: IcHandle, ctx: &ic_fondue::pot::Context) {
     let mut rng = ctx.rng.clone();
     let rt = tokio::runtime::Runtime::new().expect("Could not create tokio runtime.");
     rt.block_on({
@@ -100,7 +85,7 @@ pub fn self_loop_fails(handle: IcHandle, ctx: &fondue::pot::Context) {
 }
 
 /// User queries canister A; A queries B; B queries A which fails.
-pub fn canisters_loop_fails(handle: IcHandle, ctx: &fondue::pot::Context) {
+pub fn canisters_loop_fails(handle: IcHandle, ctx: &ic_fondue::pot::Context) {
     let mut rng = ctx.rng.clone();
     let rt = tokio::runtime::Runtime::new().expect("Could not create tokio runtime.");
     rt.block_on({
@@ -126,7 +111,7 @@ pub fn canisters_loop_fails(handle: IcHandle, ctx: &fondue::pot::Context) {
 
 /// User queries canister A; A queries B; B replies to A; A does not reply to
 /// the user.
-pub fn intermediate_canister_does_not_reply(handle: IcHandle, ctx: &fondue::pot::Context) {
+pub fn intermediate_canister_does_not_reply(handle: IcHandle, ctx: &ic_fondue::pot::Context) {
     let mut rng = ctx.rng.clone();
     let rt = tokio::runtime::Runtime::new().expect("Could not create tokio runtime.");
     rt.block_on({
@@ -153,7 +138,7 @@ pub fn intermediate_canister_does_not_reply(handle: IcHandle, ctx: &fondue::pot:
 
 /// User queries canister A; canister A queries canister B; B replies to A; A
 /// replies to user.
-pub fn query_two_canisters(handle: IcHandle, ctx: &fondue::pot::Context) {
+pub fn query_two_canisters(handle: IcHandle, ctx: &ic_fondue::pot::Context) {
     let mut rng = ctx.rng.clone();
     let rt = tokio::runtime::Runtime::new().expect("Could not create tokio runtime.");
     rt.block_on({
@@ -180,7 +165,7 @@ pub fn query_two_canisters(handle: IcHandle, ctx: &fondue::pot::Context) {
 
 /// User queries A; A queries B; B queries C; C replies to B; B replies to A; A
 /// replies to user
-pub fn query_three_canisters(handle: IcHandle, ctx: &fondue::pot::Context) {
+pub fn query_three_canisters(handle: IcHandle, ctx: &ic_fondue::pot::Context) {
     let mut rng = ctx.rng.clone();
     let rt = tokio::runtime::Runtime::new().expect("Could not create tokio runtime.");
     rt.block_on({
@@ -210,7 +195,7 @@ pub fn query_three_canisters(handle: IcHandle, ctx: &fondue::pot::Context) {
 }
 
 /// User queries A; A queries non-existent canister; A sends error to user;
-pub fn canister_queries_non_existent(handle: IcHandle, ctx: &fondue::pot::Context) {
+pub fn canister_queries_non_existent(handle: IcHandle, ctx: &ic_fondue::pot::Context) {
     let mut rng = ctx.rng.clone();
     let rt = tokio::runtime::Runtime::new().expect("Could not create tokio runtime.");
     rt.block_on({
@@ -230,7 +215,7 @@ pub fn canister_queries_non_existent(handle: IcHandle, ctx: &fondue::pot::Contex
 
 /// User queries A; A queries B; B does not respond; A handles no-reply and
 /// replies to user;
-pub fn canister_queries_does_not_reply(handle: IcHandle, ctx: &fondue::pot::Context) {
+pub fn canister_queries_does_not_reply(handle: IcHandle, ctx: &ic_fondue::pot::Context) {
     let mut rng = ctx.rng.clone();
     let rt = tokio::runtime::Runtime::new().expect("Could not create tokio runtime.");
     rt.block_on({
@@ -256,7 +241,7 @@ pub fn canister_queries_does_not_reply(handle: IcHandle, ctx: &fondue::pot::Cont
 /// second reply from canisterB.
 pub fn inter_canister_query_first_canister_multiple_request(
     handle: IcHandle,
-    ctx: &fondue::pot::Context,
+    ctx: &ic_fondue::pot::Context,
 ) {
     let mut rng = ctx.rng.clone();
     let rt = tokio::runtime::Runtime::new().expect("Could not create tokio runtime.");

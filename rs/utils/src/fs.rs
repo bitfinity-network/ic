@@ -1,8 +1,14 @@
 use std::ffi::{OsStr, OsString};
-use std::{fs, fs::File, io, io::Error, io::Write, path::Path, path::PathBuf};
+use std::{fs, io, io::Error, path::Path, path::PathBuf};
 
-/// The character length of the random string used for temporary file names.
-const TMP_NAME_LEN: usize = 7;
+#[cfg(target_family = "unix")] // Otherwise, clippy complains about lack of use.
+use std::io::ErrorKind::AlreadyExists;
+
+#[cfg(target_os = "linux")]
+use thiserror::Error;
+
+#[cfg(target_family = "unix")]
+use std::io::Write;
 
 /// Represents an action that should be run when this objects runs out of scope,
 /// unless it's explicitly deactivated.
@@ -33,6 +39,7 @@ where
     action: Option<F>,
 }
 
+#[cfg(target_family = "unix")] // Otherwise, clippy complains about lack of use.
 impl<F> OnScopeExit<F>
 where
     F: FnOnce(),
@@ -77,7 +84,7 @@ pub fn write_atomically_using_tmp_file<PDst, PTmp, F>(
     action: F,
 ) -> io::Result<()>
 where
-    F: FnOnce(&mut io::BufWriter<&fs::File>) -> io::Result<()>,
+    F: FnOnce(&mut io::BufWriter<&std::fs::File>) -> io::Result<()>,
     PDst: AsRef<Path>,
     PTmp: AsRef<Path>,
 {
@@ -167,10 +174,7 @@ pub fn copy_file_sparse(from: &Path, to: &Path) -> io::Result<u64> {
     use fs::OpenOptions;
     use io::{ErrorKind, Read};
     use libc::{ftruncate64, lseek64};
-    use std::os::unix::{
-        fs::{OpenOptionsExt, PermissionsExt},
-        io::AsRawFd,
-    };
+    use std::os::unix::{fs::OpenOptionsExt, fs::PermissionsExt, io::AsRawFd};
 
     unsafe fn copy_file_range(
         fd_in: libc::c_int,
@@ -191,7 +195,7 @@ pub fn copy_file_sparse(from: &Path, to: &Path) -> io::Result<u64> {
         )
     }
 
-    let mut reader = File::open(from)?;
+    let mut reader = std::fs::File::open(from)?;
 
     let (mode, len) = {
         let metadata = reader.metadata()?;
@@ -362,7 +366,7 @@ pub fn copy_file_sparse(from: &Path, to: &Path) -> io::Result<u64> {
 #[cfg(target_family = "unix")]
 pub fn write_atomically<PDst, F>(dst: PDst, action: F) -> io::Result<()>
 where
-    F: FnOnce(&mut io::BufWriter<&fs::File>) -> io::Result<()>,
+    F: FnOnce(&mut io::BufWriter<&std::fs::File>) -> io::Result<()>,
     PDst: AsRef<Path>,
 {
     // `.parent()` returns `None` for either `/` or a prefix (e.g. 'c:\\` on
@@ -399,6 +403,7 @@ where
     path.as_ref().with_extension(extension)
 }
 
+#[cfg(any(target_family = "unix"))]
 /// Write the given string to file `dest` in a crash-safe mannger
 pub fn write_string_using_tmp_file<P>(dest: P, content: &str) -> io::Result<()>
 where
@@ -407,6 +412,7 @@ where
     write_using_tmp_file(dest, |f| f.write_all(content.as_bytes()))
 }
 
+#[cfg(any(target_family = "unix"))]
 /// Serialize given protobuf message to file `dest` in a crash-safe manner
 pub fn write_protobuf_using_tmp_file<P>(dest: P, message: &impl prost::Message) -> io::Result<()>
 where
@@ -422,11 +428,42 @@ where
     })
 }
 
+#[cfg(any(target_family = "unix"))]
+/// Create and open a file exclusively with the given name.
+///
+/// If the file already exists, attempt to remove the file and retry.
+fn create_file_exclusive_and_open<P>(f: P) -> io::Result<std::fs::File>
+where
+    P: AsRef<Path>,
+{
+    loop {
+        // Important is to use create_new, which on Unix uses O_CREATE | O_EXCL
+        // https://github.com/rust-lang/rust/blob/5ab502c6d308b0ccac8127c0464e432334755a60/library/std/src/sys/unix/fs.rs#L774
+        let file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(f.as_ref());
+
+        match file {
+            Err(ref e) if e.kind() == AlreadyExists => {
+                std::fs::remove_file(f.as_ref())?;
+            }
+            Err(e) => {
+                return Err(e);
+            }
+            Ok(f) => {
+                return Ok(f);
+            }
+        }
+    }
+}
+
+#[cfg(any(target_family = "unix"))]
 /// Write to file `dest` using `action` in a crash-safe manner
 ///
-/// A new temporary file `dest.tmp` will be created (and truncated if it
-/// already exists). The file will then be opened and `action` executed with
-/// the BufWriter to that file.
+/// A new temporary file `dest.tmp` will be created. If it already exists,
+/// it will be deleted first. The file will be opened in exclusive mode
+/// and `action` executed with the BufWriter to that file.
 ///
 /// The buffer and file will then be fsynced followed by renaming the
 /// `dest.tmp` to `dest`. Target file `dest` will be overwritten in that
@@ -438,12 +475,12 @@ where
 pub fn write_using_tmp_file<P, F>(dest: P, action: F) -> io::Result<()>
 where
     P: AsRef<Path>,
-    F: FnOnce(&mut io::BufWriter<&fs::File>) -> io::Result<()>,
+    F: FnOnce(&mut io::BufWriter<&std::fs::File>) -> io::Result<()>,
 {
     let dest_tmp = get_tmp_for_path(&dest);
 
     {
-        let file = File::create(dest_tmp.as_path())?;
+        let file = create_file_exclusive_and_open(&dest_tmp)?;
         let mut w = io::BufWriter::new(&file);
         action(&mut w)?;
         w.flush()?;
@@ -459,6 +496,9 @@ where
 
 #[cfg(target_family = "unix")]
 fn tmp_name() -> String {
+    /// The character length of the random string used for temporary file names.
+    const TMP_NAME_LEN: usize = 7;
+
     use rand::{distributions::Alphanumeric, Rng};
 
     let mut rng = rand::thread_rng();
@@ -467,6 +507,47 @@ fn tmp_name() -> String {
         .map(char::from)
         .take(TMP_NAME_LEN)
         .collect()
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Error, Clone, Debug, PartialEq, Eq)]
+pub enum CopyFileRangeAllError {
+    #[error(transparent)]
+    Nix(#[from] nix::Error),
+    #[error("zero bytes copied")]
+    WriteZero,
+}
+
+/// Copy a range of data from one file to another
+///
+/// As opposed to `nix::fcntl::copy_file_range` that it is based on, this
+/// function either copies all bytes or returns an error
+#[cfg(target_os = "linux")]
+pub fn copy_file_range_all(
+    src: &std::fs::File,
+    mut src_offset: i64,
+    dst: &std::fs::File,
+    mut dst_offset: i64,
+    len: usize,
+) -> Result<(), CopyFileRangeAllError> {
+    use std::os::unix::io::AsRawFd;
+    let mut copied_total = 0;
+    while copied_total < len {
+        let copied = nix::fcntl::copy_file_range(
+            src.as_raw_fd(),
+            Some(&mut src_offset),
+            dst.as_raw_fd(),
+            Some(&mut dst_offset),
+            len - copied_total,
+        );
+        match copied {
+            Ok(0) => return Err(CopyFileRangeAllError::WriteZero),
+            Ok(copied) => copied_total += copied,
+            Err(nix::errno::Errno::EINTR) | Err(nix::errno::Errno::EAGAIN) => continue,
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

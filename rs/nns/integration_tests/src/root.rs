@@ -3,20 +3,18 @@ use canister_test::Runtime;
 use dfn_candid::candid_one;
 use dfn_protobuf::protobuf;
 use ic_canister_client::Sender;
-use ic_nns_common::{pb::v1::NeuronId, types::ProposalId};
-use ic_nns_constants::{
-    ids::{TEST_NEURON_1_OWNER_KEYPAIR, TEST_NEURON_2_OWNER_KEYPAIR, TEST_USER1_KEYPAIR},
-    ALL_NNS_CANISTER_IDS, GOVERNANCE_CANISTER_ID, LEDGER_CANISTER_ID,
+use ic_nervous_system_common_test_keys::{
+    TEST_NEURON_1_OWNER_KEYPAIR, TEST_NEURON_2_OWNER_KEYPAIR, TEST_USER1_KEYPAIR,
 };
+use ic_nervous_system_root::{AddCanisterProposal, CanisterAction, StopOrStartCanisterProposal};
+use ic_nns_common::{pb::v1::NeuronId, types::ProposalId};
+use ic_nns_constants::{ALL_NNS_CANISTER_IDS, GOVERNANCE_CANISTER_ID, LEDGER_CANISTER_ID};
 use ic_nns_governance::pb::v1::{
     manage_neuron::{Command, NeuronIdOrSubaccount},
     manage_neuron_response::Command as CommandResponse,
     proposal::Action,
     ExecuteNnsFunction, ManageNeuron, ManageNeuronResponse, NnsFunction, Proposal, ProposalStatus,
     Vote,
-};
-use ic_nns_handler_root::common::{
-    AddNnsCanisterProposalPayload, CanisterAction, StopOrStartNnsCanisterProposalPayload,
 };
 use ic_nns_test_utils::ids::{TEST_NEURON_1_ID, TEST_NEURON_2_ID};
 use ic_nns_test_utils::{
@@ -32,7 +30,7 @@ use ic_nns_test_utils_macros::parameterized_upgrades;
 use ic_test_utilities::universal_canister::UNIVERSAL_CANISTER_WASM;
 use ledger_canister::{
     AccountBalanceArgs, AccountIdentifier, BlockHeight, LedgerCanisterInitPayload, Memo, SendArgs,
-    Tokens, TRANSACTION_FEE,
+    Tokens, DEFAULT_TRANSFER_FEE,
 };
 use std::collections::HashMap;
 
@@ -47,12 +45,12 @@ async fn add_nns_canister(runtime: &Runtime, upgrade_scenario: UpgradeTestingSce
     let name = "new_mega_important_handler".to_string();
 
     // Test adding a new canister to the NNS.
-    let proposal_payload = AddNnsCanisterProposalPayload {
+    let proposal_payload = AddCanisterProposal {
         name: name.clone(),
         wasm_module: UNIVERSAL_CANISTER_WASM.to_vec(),
         arg: vec![],
         query_allocation: Some(Nat::from(34)),
-        memory_allocation: Some(Nat::from(2771786)),
+        memory_allocation: Some(Nat::from(1234567)),
         compute_allocation: Some(Nat::from(12)),
         initial_cycles: 1 << 45,
         authz_changes: vec![],
@@ -118,14 +116,12 @@ fn test_stop_start_nns_canister() {
             let alloc = Tokens::from_tokens(1000).unwrap();
             let mut ledger_init_state = HashMap::new();
             ledger_init_state.insert(user1.get_principal_id().into(), alloc);
-            let init_args = LedgerCanisterInitPayload::new(
-                GOVERNANCE_CANISTER_ID.into(),
-                ledger_init_state,
-                None,
-                None,
-                None,
-                ALL_NNS_CANISTER_IDS.iter().map(|&x| *x).collect(),
-            );
+            let init_args = LedgerCanisterInitPayload::builder()
+                .minting_account(GOVERNANCE_CANISTER_ID.into())
+                .initial_values(ledger_init_state)
+                .send_whitelist(ALL_NNS_CANISTER_IDS.iter().map(|&x| *x).collect())
+                .build()
+                .unwrap();
 
             let nns_init_payload = NnsInitPayloadsBuilder::new()
                 .with_ledger_init_state(init_args)
@@ -143,7 +139,7 @@ fn test_stop_start_nns_canister() {
                     SendArgs {
                         memo: Memo(0),
                         amount: Tokens::from_tokens(100).unwrap(),
-                        fee: TRANSACTION_FEE,
+                        fee: DEFAULT_TRANSFER_FEE,
                         from_subaccount: None,
                         to: AccountIdentifier::new(user2.get_principal_id(), None),
                         created_at_time: None,
@@ -154,7 +150,7 @@ fn test_stop_start_nns_canister() {
                 .expect("Couldn't send funds.");
 
             // Submit a proposal to stop the ledger.
-            let payload = StopOrStartNnsCanisterProposalPayload {
+            let payload = StopOrStartCanisterProposal {
                 canister_id: LEDGER_CANISTER_ID,
                 action: CanisterAction::Stop,
             };
@@ -208,7 +204,7 @@ fn test_stop_start_nns_canister() {
                     SendArgs {
                         memo: Memo(0),
                         amount: Tokens::from_tokens(100).unwrap(),
-                        fee: TRANSACTION_FEE,
+                        fee: DEFAULT_TRANSFER_FEE,
                         from_subaccount: None,
                         to: AccountIdentifier::new(user2.get_principal_id(), None),
                         created_at_time: None,
@@ -219,7 +215,7 @@ fn test_stop_start_nns_canister() {
 
             assert!(result.unwrap_err().contains("is stopped"));
 
-            let payload = StopOrStartNnsCanisterProposalPayload {
+            let payload = StopOrStartCanisterProposal {
                 canister_id: LEDGER_CANISTER_ID,
                 action: CanisterAction::Start,
             };
@@ -273,7 +269,7 @@ fn test_stop_start_nns_canister() {
                     SendArgs {
                         memo: Memo(0),
                         amount: Tokens::from_tokens(100).unwrap(),
-                        fee: TRANSACTION_FEE,
+                        fee: DEFAULT_TRANSFER_FEE,
                         from_subaccount: None,
                         to: AccountIdentifier::new(user2.get_principal_id(), None),
                         created_at_time: None,
@@ -295,12 +291,13 @@ fn test_stop_start_nns_canister() {
                 )
                 .await?;
 
-            // The balance of the first user should have been deducted 200 ICPTs from both
+            // The balance of the first user should have been deducted 200 ICPs from both
             // transfers, minus 2 * the transaction fees.
             assert_eq!(
                 user1_balance,
                 Tokens::from_e8s(
-                    Tokens::from_tokens(800).unwrap().get_e8s() - 2 * TRANSACTION_FEE.get_e8s()
+                    Tokens::from_tokens(800).unwrap().get_e8s()
+                        - 2 * DEFAULT_TRANSFER_FEE.get_e8s()
                 )
             );
 
@@ -316,7 +313,7 @@ fn test_stop_start_nns_canister() {
                 )
                 .await?;
 
-            // The balance of the first user should have been deducted 200 ICPTs from both
+            // The balance of the first user should have been deducted 200 ICPs from both
             // transfers.
             assert_eq!(user2_balance, Tokens::from_tokens(200).unwrap());
 

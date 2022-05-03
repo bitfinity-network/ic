@@ -23,9 +23,9 @@ use ic_interfaces::{
     dkg::DkgPool,
     messaging::MessageRouting,
     registry::RegistryClient,
-    state_manager::{StateHashError, StateManager},
     validation::{ValidationError, ValidationResult},
 };
+use ic_interfaces_state_manager::{StateHashError, StateManager};
 use ic_logger::{trace, warn, ReplicaLogger};
 use ic_replicated_state::ReplicatedState;
 use ic_types::{
@@ -783,7 +783,6 @@ impl Validator {
                             notarization.into_message(),
                             format!("{:?}", e),
                         ));
-                        continue;
                     } else if verification.is_ok() {
                         if get_notarized_parent(pool_reader, &proposal).is_ok() {
                             self.metrics.observe_block(pool_reader, &proposal);
@@ -1431,8 +1430,8 @@ pub mod test {
     use ic_interfaces::messaging::XNetTransientValidationError;
     use ic_logger::replica_logger::no_op_logger;
     use ic_metrics::MetricsRegistry;
-    use ic_registry_client::fake::FakeRegistryClient;
-    use ic_registry_common::proto_registry_data_provider::ProtoRegistryDataProvider;
+    use ic_registry_client_fake::FakeRegistryClient;
+    use ic_registry_proto_data_provider::ProtoRegistryDataProvider;
     use ic_test_artifact_pool::consensus_pool::TestConsensusPool;
     use ic_test_utilities::{
         assert_changeset_matches_pattern,
@@ -1440,11 +1439,11 @@ pub mod test {
         crypto::CryptoReturningOk,
         matches_pattern,
         message_routing::MockMessageRouting,
-        registry::{add_subnet_record, SubnetRecordBuilder},
         state_manager::RefMockStateManager,
         types::ids::{node_test_id, subnet_test_id},
         FastForwardTimeSource,
     };
+    use ic_test_utilities_registry::{add_subnet_record, SubnetRecordBuilder};
     use ic_types::replica_config::ReplicaConfig;
     use std::borrow::Borrow;
     use std::sync::{Arc, RwLock};
@@ -2019,7 +2018,7 @@ pub mod test {
             state_manager
                 .get_mut()
                 .expect_get_state_at()
-                .return_const(Ok(ic_interfaces::state_manager::Labeled::new(
+                .return_const(Ok(ic_interfaces_state_manager::Labeled::new(
                     Height::new(0),
                     Arc::new(ic_test_utilities::state::get_initial_state(0, 0)),
                 )));

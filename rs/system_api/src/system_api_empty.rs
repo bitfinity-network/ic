@@ -2,6 +2,7 @@ use ic_interfaces::execution_environment::{
     HypervisorError::{self},
     HypervisorResult, SystemApi,
 };
+use ic_registry_subnet_type::SubnetType;
 use ic_replicated_state::PageIndex;
 use ic_sys::PageBytes;
 use ic_types::{Cycles, NumBytes, NumInstructions, Time};
@@ -27,6 +28,12 @@ impl SystemApi for SystemApiEmpty {
         unimplemented!("{}", MESSAGE_UNIMPLEMENTED)
     }
     fn stable_memory_size(&self) -> usize {
+        unimplemented!("{}", MESSAGE_UNIMPLEMENTED)
+    }
+    fn subnet_type(&self) -> SubnetType {
+        unimplemented!("{}", MESSAGE_UNIMPLEMENTED)
+    }
+    fn slice_instruction_limit(&self) -> NumInstructions {
         unimplemented!("{}", MESSAGE_UNIMPLEMENTED)
     }
     fn ic0_msg_caller_copy(&self, _: u32, _: u32, _: u32, _: &mut [u8]) -> HypervisorResult<()> {
@@ -104,10 +111,10 @@ impl SystemApi for SystemApiEmpty {
     ) -> HypervisorResult<()> {
         unimplemented!("{}", MESSAGE_UNIMPLEMENTED)
     }
-    fn ic0_debug_print(&self, _: u32, _: u32, _: &[u8]) {
+    fn ic0_debug_print(&self, _: u32, _: u32, _: &[u8]) -> HypervisorResult<()> {
         unimplemented!("{}", MESSAGE_UNIMPLEMENTED)
     }
-    fn ic0_trap(&self, _: u32, _: u32, _: &[u8]) -> HypervisorError {
+    fn ic0_trap(&self, _: u32, _: u32, _: &[u8]) -> HypervisorResult<()> {
         unimplemented!("{}", MESSAGE_UNIMPLEMENTED)
     }
     fn ic0_call_simple(
@@ -182,7 +189,10 @@ impl SystemApi for SystemApiEmpty {
     fn ic0_time(&self) -> HypervisorResult<Time> {
         unimplemented!("{}", MESSAGE_UNIMPLEMENTED)
     }
-    fn out_of_instructions(&self) -> HypervisorError {
+    fn out_of_instructions(
+        &self,
+        _num_instruction_left: NumInstructions,
+    ) -> Result<NumInstructions, HypervisorError> {
         unimplemented!("{}", MESSAGE_UNIMPLEMENTED)
     }
     fn update_available_memory(&mut self, _: i32, _: u32) -> HypervisorResult<i32> {

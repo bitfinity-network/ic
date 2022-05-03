@@ -37,10 +37,6 @@ use ic_test_identity::{get_pair, TEST_IDENTITY_KEYPAIR, TEST_IDENTITY_KEYPAIR_HA
 use ic_types::{messages::Blob, CanisterId, PrincipalId, UserId};
 use stats::Summary;
 
-// The default is how many boundary nodes we have in production. In production a
-// single boundary node has a single connection to a replica.
-const CONNECTIONS_PER_HOST: &str = "5";
-
 #[cfg(build = "debug")]
 fn get_logger() -> slog::Logger {
     let plain = slog_term::PlainSyncDecorator::new(std::io::stdout());
@@ -230,21 +226,16 @@ async fn main() {
                 .help("If specified, use the given pem-file instead of the default principal's pem file."),
         )
         .arg(
-            Arg::with_name("connections-per-host")
-                .long("connections-per-host")
-                .default_value(CONNECTIONS_PER_HOST)
-                .takes_value(true)
-                .help(format!("If specified, that many connections will be opened per host when sending the load. Default : {}", CONNECTIONS_PER_HOST).as_str()),
-        )
-        .arg(
             Arg::with_name("http2-only")
                 .long("http2-only")
+                .default_value("true")
                 .takes_value(true)
                 .help("If specified, sets this option when building the hyper http client."),
         )
         .arg(
             Arg::with_name("pool-max-idle-per-host")
                 .long("pool-max-idle-per-host")
+                .default_value("20000")
                 .takes_value(true)
                 .help("If specified, sets this option when building the hyper http client."),
         )
@@ -263,7 +254,7 @@ async fn main() {
             .arg("ulimit -n")
             .output()
             .expect("failed to execute process");
-        let output = String::from_utf8_lossy(&output.stdout).replace("\n", "");
+        let output = String::from_utf8_lossy(&output.stdout).replace('\n', "");
         if let Ok(num) = output.parse::<usize>() {
             // This is a somewhat arbitrary limit :-)
             if num < 4096 {
@@ -301,12 +292,6 @@ async fn main() {
 
     let evaluate_max_rps = matches.is_present("evaluate-max-rps");
 
-    let connections_per_host = matches
-        .value_of("connections-per-host")
-        .unwrap()
-        .parse::<u32>()
-        .unwrap();
-
     let principal_id = matches
         .value_of("principal-id")
         .map(|x| PrincipalId::from_str(x).unwrap());
@@ -325,16 +310,10 @@ async fn main() {
 
     let periodic_output = matches.is_present("periodic-output");
 
-    let call_payload_size = Byte::from_str(
-        matches
-            .value_of("payload-size")
-            .unwrap_or("0")
-            .trim()
-            .to_string(),
-    )
-    .expect("Could not parse the value of --payload-size");
+    let call_payload_size = Byte::from_str(matches.value_of("payload-size").unwrap_or("0").trim())
+        .expect("Could not parse the value of --payload-size");
 
-    let call_payload = hex::decode(matches.value_of("payload").unwrap_or("").to_string())
+    let call_payload = hex::decode(matches.value_of("payload").unwrap_or(""))
         .expect("Payload must be in hex format");
 
     if call_payload_size.get_bytes() > 0 && !call_payload.is_empty() {
@@ -432,13 +411,7 @@ async fn main() {
                 }
                 _ => {}
             }
-            let eng = engine::Engine::new(
-                sender.clone(),
-                sender_field,
-                &url,
-                connections_per_host,
-                http_client_config,
-            );
+            let eng = engine::Engine::new(sender.clone(), sender_field, &url, http_client_config);
 
             if !matches.is_present("no-status-check") {
                 eng.wait_for_all_agents_to_be_healthy().await;
@@ -468,10 +441,7 @@ async fn main() {
             // Make sure to save the guard, see documentation for more information
             println!(
                 "Running {:?} rps for {} seconds, req_type = {}, evaluate_max_rps = {}",
-                rps,
-                duration,
-                request_type.to_string(),
-                evaluate_max_rps,
+                rps, duration, request_type, evaluate_max_rps,
             );
 
             let facts = if evaluate_max_rps {

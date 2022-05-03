@@ -1,9 +1,6 @@
-use ic_fondue::prod_tests::pot_dsl::{par, pot, t, Pot};
+use crate::driver::pot_dsl::{par, pot, t, Pot};
 
-use crate::{
-    execution::{self, pot1_config},
-    malicious_input_test, request_signature_test,
-};
+use crate::execution;
 
 /// The pot containing general execution environment tests. As upgraded System
 /// Tests allow for the parallel execution of tests, we put all of them into one
@@ -11,15 +8,15 @@ use crate::{
 pub fn general_execution_pot() -> Pot {
     pot(
         "general_execution_pot",
-        pot1_config(),
+        execution::config_system_verified_application_subnets(),
         par(vec![
             t(
                 "request_signature_test",
-                request_signature_test::test
+                execution::request_signature_test::test
             ),
             t(
                 "malicious_input_test",
-                malicious_input_test::test
+                execution::malicious_input::test
             ),
             t(
                 "test_raw_rand_api",
@@ -72,10 +69,6 @@ pub fn general_execution_pot() -> Pot {
             t(
                 "create_canister_with_too_many_controllers_fails",
                 execution::canister_lifecycle::create_canister_with_too_many_controllers_fails
-            ),
-            t(
-                "create_canister_with_empty_settings",
-                execution::canister_lifecycle::create_canister_with_empty_settings
             ),
             t(
                 "create_canister_with_none_settings_field",
@@ -166,8 +159,8 @@ pub fn general_execution_pot() -> Pot {
                 execution::queries::query_reply_sizes
             ),
             t(
-                "mint_cycles_supported_on_system_subnet",
-                execution::nns_shielding::mint_cycles_supported_on_system_subnet
+                "mint_cycles_not_supported_on_system_subnet",
+                execution::nns_shielding::mint_cycles_not_supported_on_system_subnet
             ),
             t(
                 "mint_cycles_not_supported_on_application_subnet",
@@ -176,10 +169,6 @@ pub fn general_execution_pot() -> Pot {
             t(
                 "no_cycle_balance_limit_on_nns_subnet",
                 execution::nns_shielding::no_cycle_balance_limit_on_nns_subnet
-            ),
-            t(
-                "max_cycles_per_canister_system_subnet",
-                execution::nns_shielding::max_cycles_per_canister_system_subnet
             ),
             t(
                 "app_canister_attempt_initiating_dkg_fails",

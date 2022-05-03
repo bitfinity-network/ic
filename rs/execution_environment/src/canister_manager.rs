@@ -6,11 +6,12 @@ use crate::{
 };
 use candid::Decode;
 use ic_base_types::NumSeconds;
-use ic_cow_state::CowMemoryManager;
+use ic_config::flag_status::FlagStatus;
 use ic_cycles_account_manager::CyclesAccountManager;
+use ic_error_types::{ErrorCode, RejectCode, UserError};
 use ic_ic00_types::{
-    CanisterIdRecord, CanisterStatusResultV2, InstallCodeArgs, Method as Ic00Method,
-    SetControllerArgs, UpdateSettingsArgs,
+    CanisterIdRecord, CanisterInstallMode, CanisterStatusResultV2, CanisterStatusType,
+    InstallCodeArgs, Method as Ic00Method, SetControllerArgs, UpdateSettingsArgs,
 };
 use ic_interfaces::execution_environment::{
     CanisterOutOfCyclesError, ExecutionParameters, HypervisorError, IngressHistoryWriter,
@@ -23,17 +24,13 @@ use ic_replicated_state::{
 };
 use ic_state_layout::{CanisterLayout, CheckpointLayout, RwPolicy};
 use ic_types::{
-    canonical_error::{not_found_error, permission_denied_error, CanonicalError},
     ingress::IngressStatus,
-    messages::{
-        CanisterInstallMode, Payload, RejectContext, Response as CanisterResponse,
-        StopCanisterContext,
-    },
-    user_error::{ErrorCode, RejectCode, UserError},
-    CanisterId, CanisterStatusType, ComputeAllocation, Cycles, Height, InstallCodeContext,
-    MemoryAllocation, NumBytes, NumInstructions, PrincipalId, SubnetId, Time, UserId,
+    messages::{Payload, RejectContext, Response as CanisterResponse, StopCanisterContext},
+    CanisterId, ComputeAllocation, Cycles, Height, InvalidComputeAllocationError,
+    InvalidMemoryAllocationError, InvalidQueryAllocationError, MemoryAllocation, NumBytes,
+    NumInstructions, PrincipalId, QueryAllocation, SubnetId, Time, UserId,
 };
-use ic_utils::ic_features::cow_state_feature;
+use num_traits::cast::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::{collections::BTreeSet, convert::TryFrom, str::FromStr, sync::Arc};
@@ -63,37 +60,160 @@ pub(crate) enum StopCanisterResult {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub(crate) struct CanisterMgrConfig {
     pub(crate) subnet_memory_capacity: NumBytes,
-    pub(crate) max_cycles_per_canister: Option<Cycles>,
     pub(crate) default_provisional_cycles_balance: Cycles,
     pub(crate) default_freeze_threshold: NumSeconds,
     pub(crate) compute_capacity: u64,
     pub(crate) own_subnet_id: SubnetId,
     pub(crate) own_subnet_type: SubnetType,
     pub(crate) max_controllers: usize,
+    pub(crate) rate_limiting_of_instructions: FlagStatus,
 }
 
 impl CanisterMgrConfig {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         subnet_memory_capacity: NumBytes,
-        max_cycles_per_canister: Option<Cycles>,
         default_provisional_cycles_balance: Cycles,
         default_freeze_threshold: NumSeconds,
         own_subnet_id: SubnetId,
         own_subnet_type: SubnetType,
         max_controllers: usize,
         num_cores: usize,
+        rate_limiting_of_instructions: FlagStatus,
     ) -> Self {
         Self {
             subnet_memory_capacity,
-            max_cycles_per_canister,
             default_provisional_cycles_balance,
             default_freeze_threshold,
             own_subnet_id,
             own_subnet_type,
             max_controllers,
             compute_capacity: 100 * num_cores as u64,
+            rate_limiting_of_instructions,
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct InstallCodeContext {
+    pub sender: PrincipalId,
+    pub mode: CanisterInstallMode,
+    pub canister_id: CanisterId,
+    pub wasm_module: Vec<u8>,
+    pub arg: Vec<u8>,
+    pub compute_allocation: Option<ComputeAllocation>,
+    pub memory_allocation: Option<MemoryAllocation>,
+    pub query_allocation: QueryAllocation,
+}
+
+/// Errors that can occur when converting from (sender, [`InstallCodeArgs`]) to
+/// an [`InstallCodeContext`].
+#[derive(Debug)]
+pub enum InstallCodeContextError {
+    ComputeAllocation(InvalidComputeAllocationError),
+    MemoryAllocation(InvalidMemoryAllocationError),
+    QueryAllocation(InvalidQueryAllocationError),
+    InvalidCanisterId(String),
+}
+
+impl From<InstallCodeContextError> for UserError {
+    fn from(err: InstallCodeContextError) -> Self {
+        match err {
+            InstallCodeContextError::ComputeAllocation(err) => UserError::new(
+                ErrorCode::CanisterContractViolation,
+                format!(
+                    "ComputeAllocation expected to be in the range [{}..{}], got {}",
+                    err.min(),
+                    err.max(),
+                    err.given()
+                ),
+            ),
+            InstallCodeContextError::QueryAllocation(err) => UserError::new(
+                ErrorCode::CanisterContractViolation,
+                format!(
+                    "QueryAllocation expected to be in the range [{}..{}], got {}",
+                    err.min, err.max, err.given
+                ),
+            ),
+            InstallCodeContextError::MemoryAllocation(err) => UserError::new(
+                ErrorCode::CanisterContractViolation,
+                format!(
+                    "MemoryAllocation expected to be in the range [{}..{}], got {}",
+                    err.min, err.max, err.given
+                ),
+            ),
+            InstallCodeContextError::InvalidCanisterId(bytes) => UserError::new(
+                ErrorCode::CanisterContractViolation,
+                format!(
+                    "Specified canister id is not a valid principal id {}",
+                    hex::encode(&bytes[..])
+                ),
+            ),
+        }
+    }
+}
+
+impl From<InvalidComputeAllocationError> for InstallCodeContextError {
+    fn from(err: InvalidComputeAllocationError) -> Self {
+        Self::ComputeAllocation(err)
+    }
+}
+
+impl From<InvalidQueryAllocationError> for InstallCodeContextError {
+    fn from(err: InvalidQueryAllocationError) -> Self {
+        Self::QueryAllocation(err)
+    }
+}
+
+impl From<InvalidMemoryAllocationError> for InstallCodeContextError {
+    fn from(err: InvalidMemoryAllocationError) -> Self {
+        Self::MemoryAllocation(err)
+    }
+}
+
+impl TryFrom<(PrincipalId, InstallCodeArgs)> for InstallCodeContext {
+    type Error = InstallCodeContextError;
+
+    fn try_from(input: (PrincipalId, InstallCodeArgs)) -> Result<Self, Self::Error> {
+        let (sender, args) = input;
+        let canister_id = CanisterId::new(args.canister_id).map_err(|err| {
+            InstallCodeContextError::InvalidCanisterId(format!(
+                "Converting canister id {} failed with {}",
+                args.canister_id, err
+            ))
+        })?;
+        let compute_allocation = match args.compute_allocation {
+            Some(ca) => Some(ComputeAllocation::try_from(ca.0.to_u64().ok_or_else(
+                || {
+                    InstallCodeContextError::ComputeAllocation(InvalidComputeAllocationError::new(
+                        ca,
+                    ))
+                },
+            )?)?),
+            None => None,
+        };
+        let memory_allocation = match args.memory_allocation {
+            Some(ma) => Some(MemoryAllocation::try_from(NumBytes::from(
+                ma.0.to_u64().ok_or_else(|| {
+                    InstallCodeContextError::MemoryAllocation(InvalidMemoryAllocationError::new(ma))
+                })?,
+            ))?),
+            None => None,
+        };
+
+        // TODO(EXE-294): Query allocations are not supported and should be deleted.
+        let query_allocation = QueryAllocation::default();
+
+        Ok(InstallCodeContext {
+            sender,
+            mode: args.mode,
+            canister_id,
+            wasm_module: args.wasm_module,
+            arg: args.arg,
+            compute_allocation,
+            memory_allocation,
+            query_allocation,
+        })
     }
 }
 
@@ -132,29 +252,44 @@ impl CanisterManager {
         sender: UserId,
         method_name: &str,
         payload: &[u8],
-    ) -> Result<(), CanonicalError> {
-        fn is_sender_controller(
-            canister_id: CanisterId,
-            sender: UserId,
-            state: Arc<ReplicatedState>,
-        ) -> Result<(), CanonicalError> {
+    ) -> Result<(), UserError> {
+        let is_sender_controller = |canister_id: CanisterId| -> Result<(), UserError> {
             match state.canister_state(&canister_id) {
                 Some(canister) => {
                     if !canister.controllers().contains(&sender.get()) {
-                        Err(permission_denied_error(
-                            "Requested canister rejected the message",
+                        Err(UserError::new(
+                            ErrorCode::CanisterInvalidController,
+                            format!(
+                                "Only controllers of canister {} can call ic00 method {}",
+                                canister_id, method_name,
+                            ),
                         ))
                     } else {
                         Ok(())
                     }
                 }
-                None => Err(not_found_error("Requested canister does not exist")),
+                None => Err(UserError::new(
+                    ErrorCode::CanisterNotFound,
+                    format!("Canister {} not found", canister_id),
+                )),
             }
-        }
+        };
 
-        let rejected_canister_err = Err(permission_denied_error(
-            "Requested canister rejected the message",
-        ));
+        let failed_to_decode = |e: &dyn std::error::Error| {
+            Err(UserError::new(
+                ErrorCode::InvalidManagementPayload,
+                format!(
+                    "Failed to decode payload for ic00 method {}: {}",
+                    method_name, e
+                ),
+            ))
+        };
+        let only_canisters_allowed = || {
+            Err(UserError::new(
+                ErrorCode::CanisterRejectedMessage,
+                format!("Only canisters can call ic00 method {}", method_name),
+            ))
+        };
         // The message is targeted towards the management canister. The
         // actual type of the method will determine if the message should be
         // accepted or not.
@@ -163,13 +298,14 @@ impl CanisterManager {
             // are not allowed to send.
             Err(_)
             | Ok(Ic00Method::CreateCanister)
+            | Ok(Ic00Method::ECDSAPublicKey)
             | Ok(Ic00Method::SetupInitialDKG)
             | Ok(Ic00Method::SignWithECDSA)
-            | Ok(Ic00Method::GetMockECDSAPublicKey)
-            | Ok(Ic00Method::SignWithMockECDSA)
+            | Ok(Ic00Method::ComputeInitialEcdsaDealings)
             // "DepositCycles" can be called by anyone however as ingress message
             // cannot carry cycles, it does not make sense to allow them from users.
-            | Ok(Ic00Method::DepositCycles) => rejected_canister_err,
+            | Ok(Ic00Method::DepositCycles)
+            | Ok(Ic00Method::HttpRequest) => only_canisters_allowed(),
 
             // These methods are only valid if they are sent by the controller
             // of the canister. We assume that the canister always wants to
@@ -179,31 +315,39 @@ impl CanisterManager {
             | Ok(Ic00Method::UninstallCode)
             | Ok(Ic00Method::StopCanister)
             | Ok(Ic00Method::DeleteCanister) => match Decode!(payload, CanisterIdRecord) {
-                Err(_) => rejected_canister_err,
-                Ok(args) => is_sender_controller(args.get_canister_id(), sender, state),
+                Err(e) => failed_to_decode(&e),
+                Ok(args) => is_sender_controller(args.get_canister_id()),
             },
             Ok(Ic00Method::UpdateSettings) => match Decode!(payload, UpdateSettingsArgs) {
-                Err(_) => rejected_canister_err,
-                Ok(args) => is_sender_controller(args.get_canister_id(), sender, state),
+                Err(e) => failed_to_decode(&e),
+                Ok(args) => is_sender_controller(args.get_canister_id()),
             },
             Ok(Ic00Method::InstallCode) => match Decode!(payload, InstallCodeArgs) {
-                Err(_) => rejected_canister_err,
-                Ok(args) => is_sender_controller(args.get_canister_id(), sender, state),
+                Err(e) => failed_to_decode(&e),
+                Ok(args) => is_sender_controller(args.get_canister_id()),
             },
             Ok(Ic00Method::SetController) => match Decode!(payload, SetControllerArgs) {
-                Err(_) => rejected_canister_err,
-                Ok(args) => is_sender_controller(args.get_canister_id(), sender, state),
+                Err(e) => failed_to_decode(&e),
+                Ok(args) => is_sender_controller(args.get_canister_id()),
             },
 
             // Nobody pays for `raw_rand`, so this cannot be used via ingress messages
-            Ok(Ic00Method::RawRand) => rejected_canister_err,
+            Ok(Ic00Method::RawRand) => only_canisters_allowed(),
+
+            // Bitcoin messages require cycles, so we reject all ingress messages.
+            Ok(Ic00Method::BitcoinTestnetGetBalance)
+                | Ok(Ic00Method::BitcoinTestnetGetUtxos)
+                | Ok(Ic00Method::BitcoinTestnetSendTransaction) => only_canisters_allowed(),
 
             Ok(Ic00Method::ProvisionalCreateCanisterWithCycles)
             | Ok(Ic00Method::ProvisionalTopUpCanister) => {
                 if provisional_whitelist.contains(sender.get_ref()) {
                     Ok(())
                 } else {
-                    rejected_canister_err
+                    Err(UserError::new(
+                        ErrorCode::CanisterRejectedMessage,
+                        format!("Caller {} is not allowed to call ic00 method {}", sender, method_name)
+                    ))
                 }
             }
         }
@@ -420,7 +564,7 @@ impl CanisterManager {
         let old_canister = match state.canister_state_mut(&context.canister_id) {
             None => {
                 return (
-                    execution_parameters.instruction_limit,
+                    execution_parameters.total_instruction_limit,
                     Err(CanisterManagerError::CanisterNotFound(context.canister_id)),
                 );
             }
@@ -431,26 +575,37 @@ impl CanisterManager {
             old_canister,
             context.compute_allocation,
         ) {
-            return (execution_parameters.instruction_limit, Err(err));
+            return (execution_parameters.total_instruction_limit, Err(err));
         }
         if let Err(err) =
             self.validate_memory_allocation(memory_taken, old_canister, context.memory_allocation)
         {
-            return (execution_parameters.instruction_limit, Err(err));
+            return (execution_parameters.total_instruction_limit, Err(err));
         }
         if let Err(err) = self.validate_controller(old_canister, &context.sender) {
-            return (execution_parameters.instruction_limit, Err(err));
+            return (execution_parameters.total_instruction_limit, Err(err));
         }
         match context.mode {
             CanisterInstallMode::Install => {
                 if old_canister.execution_state.is_some() {
                     return (
-                        execution_parameters.instruction_limit,
+                        execution_parameters.total_instruction_limit,
                         Err(CanisterManagerError::CanisterNonEmpty(context.canister_id)),
                     );
                 }
             }
             CanisterInstallMode::Reinstall | CanisterInstallMode::Upgrade => {}
+        }
+
+        if old_canister.scheduler_state.install_code_debit.get() > 0
+            && self.config.rate_limiting_of_instructions == FlagStatus::Enabled
+        {
+            return (
+                execution_parameters.total_instruction_limit,
+                Err(CanisterManagerError::InstallCodeRateLimited(
+                    old_canister.system_state.canister_id,
+                )),
+            );
         }
 
         // All validation checks have passed. Reserve cycles on the old canister
@@ -467,10 +622,10 @@ impl CanisterManager {
             &mut old_canister.system_state,
             memory_usage,
             compute_allocation,
-            execution_parameters.instruction_limit,
+            execution_parameters.total_instruction_limit,
         ) {
             return (
-                execution_parameters.instruction_limit,
+                execution_parameters.total_instruction_limit,
                 Err(CanisterManagerError::InstallCodeNotEnoughCycles(err)),
             );
         }
@@ -478,6 +633,7 @@ impl CanisterManager {
         // Copy bits out of context as the calls below are going to consume it.
         let canister_id = context.canister_id;
         let mode = context.mode;
+        let instruction_limit = execution_parameters.total_instruction_limit;
 
         let (instructions_left, result) = match context.mode {
             CanisterInstallMode::Install | CanisterInstallMode::Reinstall => self.install(
@@ -496,15 +652,22 @@ impl CanisterManager {
             ),
         };
 
+        let instructions_consumed = instruction_limit - instructions_left;
+
         let result = match result {
             Ok((heap_delta, mut new_canister)) => {
                 // Refund the left over execution cycles to the new canister and
                 // replace the old canister with the new one.
-
                 let old_wasm_hash = self.get_wasm_hash(old_canister);
                 let new_wasm_hash = self.get_wasm_hash(&new_canister);
-                self.cycles_account_manager
-                    .refund_execution_cycles(&mut new_canister.system_state, instructions_left);
+                self.cycles_account_manager.refund_execution_cycles(
+                    &mut new_canister.system_state,
+                    instructions_left,
+                    instruction_limit,
+                );
+                if self.config.rate_limiting_of_instructions == FlagStatus::Enabled {
+                    new_canister.scheduler_state.install_code_debit += instructions_consumed;
+                }
                 state.put_canister_state(new_canister);
                 // We managed to create a new canister and will be dropping the
                 // older one. So we get rid of the previous heap to make sure it
@@ -524,9 +687,14 @@ impl CanisterManager {
             Err(err) => {
                 // the install / upgrade failed. Refund the left over cycles to
                 // the old canister and leave it in the state.
-
-                self.cycles_account_manager
-                    .refund_execution_cycles(&mut old_canister.system_state, instructions_left);
+                if self.config.rate_limiting_of_instructions == FlagStatus::Enabled {
+                    old_canister.scheduler_state.install_code_debit += instructions_consumed;
+                }
+                self.cycles_account_manager.refund_execution_cycles(
+                    &mut old_canister.system_state,
+                    instructions_left,
+                    instruction_limit,
+                );
                 Err(err)
             }
         };
@@ -699,11 +867,11 @@ impl CanisterManager {
             canister
                 .execution_state
                 .as_ref()
-                .map(|es| es.wasm_binary.binary.hash_sha256().to_vec()),
+                .map(|es| es.wasm_binary.binary.module_hash().to_vec()),
             *controller,
             controllers,
             canister.memory_usage(self.config.own_subnet_type),
-            canister.system_state.cycles_balance.get(),
+            canister.system_state.balance().get(),
             canister.scheduler_state.compute_allocation.as_percent(),
             Some(canister.memory_allocation().bytes().get()),
             canister.system_state.freeze_threshold.get(),
@@ -814,17 +982,6 @@ impl CanisterManager {
         Ok(())
     }
 
-    /// Deposits the amount of cycles specified from the sender to the target
-    /// `canister_id`.
-    ///
-    /// # Errors
-    ///
-    /// Returns a `CanisterManagerError` in case the canister does not exist
-    pub(crate) fn deposit_cycles(&self, canister: &mut CanisterState, cycles: Cycles) -> Cycles {
-        self.cycles_account_manager
-            .add_cycles(&mut canister.system_state, cycles)
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn install(
         &self,
@@ -849,7 +1006,7 @@ impl CanisterManager {
             Ok(execution_state) => Some(execution_state),
             Err(err) => {
                 return (
-                    execution_parameters.instruction_limit,
+                    execution_parameters.total_instruction_limit,
                     Err((canister_id, err).into()),
                 );
             }
@@ -876,7 +1033,7 @@ impl CanisterManager {
         if let MemoryAllocation::Reserved(bytes) = desired_memory_allocation {
             if bytes < new_canister.memory_usage(self.config.own_subnet_type) {
                 return (
-                    execution_parameters.instruction_limit,
+                    execution_parameters.total_instruction_limit,
                     Err(CanisterManagerError::NotEnoughMemoryAllocationGiven {
                         canister_id,
                         memory_allocation_given: desired_memory_allocation,
@@ -891,27 +1048,28 @@ impl CanisterManager {
         let mut total_heap_delta = NumBytes::from(0);
 
         // Run (start)
-        let (new_canister, instruction_limit, result) = self
+        let (new_canister, instructions_left, result) = self
             .hypervisor
             .execute_canister_start(new_canister, execution_parameters.clone());
         info!(
             self.log,
             "Executing (start) on canister {} consumed {} instructions.  {} instructions are left.",
             canister_id,
-            execution_parameters.instruction_limit - instruction_limit,
-            instruction_limit
+            execution_parameters.total_instruction_limit - instructions_left,
+            instructions_left
         );
         match result {
             Ok(heap_delta) => {
                 total_heap_delta += heap_delta;
             }
-            Err(err) => return (instruction_limit, Err((canister_id, err).into())),
+            Err(err) => return (instructions_left, Err((canister_id, err).into())),
         }
 
-        execution_parameters.instruction_limit = instruction_limit;
+        execution_parameters.total_instruction_limit = instructions_left;
+        execution_parameters.slice_instruction_limit = instructions_left;
 
         // Run canister_init
-        let (new_canister, instruction_limit, result) = self.hypervisor.execute_canister_init(
+        let (new_canister, instructions_left, result) = self.hypervisor.execute_canister_init(
             new_canister,
             context.sender,
             context.arg.as_slice(),
@@ -922,15 +1080,15 @@ impl CanisterManager {
             self.log,
             "Executing (canister_init) on canister {} consumed {} instructions.  {} instructions are left.",
             canister_id,
-            execution_parameters.instruction_limit - instruction_limit,
-            instruction_limit
+            execution_parameters.total_instruction_limit - instructions_left,
+            instructions_left
         );
         match result {
             Ok(heap_delta) => {
                 total_heap_delta += heap_delta;
-                (instruction_limit, Ok((total_heap_delta, new_canister)))
+                (instructions_left, Ok((total_heap_delta, new_canister)))
             }
-            Err(err) => (instruction_limit, Err((canister_id, err).into())),
+            Err(err) => (instructions_left, Err((canister_id, err).into())),
         }
     }
 
@@ -949,7 +1107,7 @@ impl CanisterManager {
         let new_canister = old_canister.clone();
         let mut total_heap_delta = NumBytes::from(0);
         // Call pre-upgrade hook on the canister.
-        let (mut new_canister, instructions_limit, res) =
+        let (mut new_canister, instructions_left, res) =
             self.hypervisor.execute_canister_pre_upgrade(
                 new_canister,
                 context.sender,
@@ -960,24 +1118,16 @@ impl CanisterManager {
             self.log,
             "Executing (canister_pre_upgrade) on canister {} consumed {} instructions.  {} instructions are left.",
             canister_id,
-            execution_parameters.instruction_limit - instructions_limit,
-            instructions_limit
+            execution_parameters.total_instruction_limit - instructions_left,
+            instructions_left
         );
+        execution_parameters.total_instruction_limit = instructions_left;
+        execution_parameters.slice_instruction_limit = instructions_left;
         match res {
             Ok(heap_delta) => {
                 total_heap_delta += heap_delta;
             }
-            Err(err) => return (instructions_limit, Err((canister_id, err).into())),
-        }
-
-        // Wipe the heap first
-        if cow_state_feature::is_enabled(cow_state_feature::cow_state) {
-            new_canister
-                .execution_state
-                .as_ref()
-                .unwrap()
-                .cow_mem_mgr
-                .upgrade();
+            Err(err) => return (instructions_left, Err((canister_id, err).into())),
         }
 
         // Replace the execution state of the canister with a new execution state, but
@@ -988,7 +1138,7 @@ impl CanisterManager {
             layout.raw_path(),
             canister_id,
         ) {
-            Err(err) => return (instructions_limit, Err((canister_id, err).into())),
+            Err(err) => return (instructions_left, Err((canister_id, err).into())),
             Ok(mut execution_state) => {
                 let stable_memory = match new_canister.execution_state {
                     Some(es) => es.stable_memory,
@@ -1017,7 +1167,7 @@ impl CanisterManager {
         if let MemoryAllocation::Reserved(bytes) = desired_memory_allocation {
             if bytes < new_canister.memory_usage(self.config.own_subnet_type) {
                 return (
-                    instructions_limit,
+                    instructions_left,
                     Err(CanisterManagerError::NotEnoughMemoryAllocationGiven {
                         canister_id,
                         memory_allocation_given: desired_memory_allocation,
@@ -1030,21 +1180,23 @@ impl CanisterManager {
         new_canister.system_state.memory_allocation = desired_memory_allocation;
 
         // Run (start)
-        let (new_canister, instructions_limit, result) = self
+        let (new_canister, instructions_left, result) = self
             .hypervisor
             .execute_canister_start(new_canister, execution_parameters.clone());
         info!(
             self.log,
             "Executing (start) on canister {} consumed {} instructions.  {} instructions are left.",
             canister_id,
-            execution_parameters.instruction_limit - instructions_limit,
-            instructions_limit
+            execution_parameters.total_instruction_limit - instructions_left,
+            instructions_left
         );
+        execution_parameters.total_instruction_limit = instructions_left;
+        execution_parameters.slice_instruction_limit = instructions_left;
         match result {
             Ok(heap_delta) => {
                 total_heap_delta += heap_delta;
             }
-            Err(err) => return (instructions_limit, Err((context.canister_id, err).into())),
+            Err(err) => return (instructions_left, Err((context.canister_id, err).into())),
         }
 
         // Call post-upgrade hook on the upgraded canister.
@@ -1060,14 +1212,33 @@ impl CanisterManager {
             self.log,
             "Executing (canister_post_upgrade) on canister {} consumed {} instructions.  {} instructions are left.",
             canister_id,
-            execution_parameters.instruction_limit - instructions_limit,
-            instructions_limit
+            execution_parameters.total_instruction_limit - instructions_left,
+            instructions_left
         );
         match result {
             Ok(heap_delta) => {
                 total_heap_delta += heap_delta;
             }
             Err(err) => return (instructions_left, Err((canister_id, err).into())),
+        }
+        if old_canister.system_state.queues().input_queues_stats()
+            != new_canister.system_state.queues().input_queues_stats()
+        {
+            error!(
+                self.log,
+                "Input queues changed after upgrade. Before: {:?}. After: {:?}",
+                old_canister.system_state.queues().input_queues_stats(),
+                new_canister.system_state.queues().input_queues_stats()
+            );
+            return (
+                instructions_left,
+                Err(CanisterManagerError::Hypervisor(
+                    new_canister.canister_id(),
+                    HypervisorError::ContractViolation(
+                        "Input queues changed after upgrade".to_string(),
+                    ),
+                )),
+            );
         }
 
         (instructions_left, Ok((total_heap_delta, new_canister)))
@@ -1083,7 +1254,7 @@ impl CanisterManager {
     pub(crate) fn create_canister_with_cycles(
         &self,
         sender: PrincipalId,
-        cycles_amount: Option<u64>,
+        cycles_amount: Option<u128>,
         settings: CanisterSettings,
         state: &mut ReplicatedState,
         provisional_whitelist: &ProvisionalWhitelist,
@@ -1126,6 +1297,8 @@ impl CanisterManager {
         max_number_of_canisters: u64,
         state: &mut ReplicatedState,
     ) -> Result<CanisterId, CanisterManagerError> {
+        // A value of 0 is equivalent to setting no limit.
+        // See documentation of `SubnetRecord` for the semantics of `max_number_of_canisters`.
         if max_number_of_canisters > 0 && state.num_canisters() as u64 >= max_number_of_canisters {
             return Err(CanisterManagerError::MaxNumberOfCanistersReached {
                 subnet_id: self.config.own_subnet_id,
@@ -1138,10 +1311,7 @@ impl CanisterManager {
 
         // Take the fee out of the cycles that are going to be added as the canister's
         // initial balance.
-        let mut cycles = cycles - creation_fee;
-        cycles = self
-            .cycles_account_manager
-            .check_max_cycles_can_add(Cycles::from(0), cycles);
+        let cycles = cycles - creation_fee;
 
         // Canister id available. Create the new canister.
         let mut system_state = SystemState::new_running(
@@ -1175,7 +1345,7 @@ impl CanisterManager {
     pub(crate) fn add_cycles(
         &self,
         sender: PrincipalId,
-        cycles_amount: Option<u64>,
+        cycles_amount: Option<u128>,
         canister: &mut CanisterState,
         provisional_whitelist: &ProvisionalWhitelist,
     ) -> Result<(), CanisterManagerError> {
@@ -1189,7 +1359,7 @@ impl CanisterManager {
         };
 
         self.cycles_account_manager
-            .add_cycles(&mut canister.system_state, cycles_amount);
+            .add_cycles(canister.system_state.balance_mut(), cycles_amount);
 
         Ok(())
     }
@@ -1339,7 +1509,7 @@ impl CanisterManager {
         canister
             .execution_state
             .as_ref()
-            .map(|execution_state| execution_state.wasm_binary.binary.hash_sha256())
+            .map(|execution_state| execution_state.wasm_binary.binary.module_hash())
     }
 }
 #[doc(hidden)] // pub for usage in tests
@@ -1385,6 +1555,7 @@ pub(crate) enum CanisterManagerError {
         required: Cycles,
     },
     InstallCodeNotEnoughCycles(CanisterOutOfCyclesError),
+    InstallCodeRateLimited(CanisterId),
     SubnetOutOfCanisterIds {
         allowed: u128,
     },
@@ -1511,6 +1682,12 @@ impl From<CanisterManagerError> for UserError {
                 Self::new(
                 ErrorCode::CanisterOutOfCycles,
                     format!("Canister installation failed with `{}`", err),
+                )
+            }
+            InstallCodeRateLimited(canister_id) => {
+                Self::new(
+                ErrorCode::CanisterInstallCodeRateLimited,
+                    format!("Canister {} is rate limited because it executed too many instructions in the previous install_code messages. Please retry installation after several minutes.", canister_id),
                 )
             }
             SubnetOutOfCanisterIds{ allowed } => {
@@ -1719,4 +1896,4 @@ impl TryFrom<(CanisterSettings, usize)> for ValidatedCanisterSettings {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

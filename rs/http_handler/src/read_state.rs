@@ -1,22 +1,19 @@
 //! Module that deals with requests to /api/v2/canister/.../read_state
 
 use crate::{
-    common::{cbor_response, into_cbor, make_response, make_response_on_validation_error},
-    types::{ApiReqType, RequestType},
-    HttpHandlerMetrics, ReplicaHealthStatus, UNKNOWN_LABEL,
-};
-use hyper::{Body, Response};
-use ic_crypto_tree_hash::{sparse_labeled_tree_from_paths, Label, Path};
-use ic_interfaces::{
-    crypto::IngressSigVerifier, registry::RegistryClient, state_manager::StateReader,
-};
-use ic_logger::{trace, ReplicaLogger};
-use ic_replicated_state::ReplicatedState;
-use ic_types::{
-    canonical_error::{
-        invalid_argument_error, not_found_error, permission_denied_error, resource_exhausted_error,
-        unavailable_error, CanonicalError,
+    common::{
+        cbor_response, into_cbor, make_plaintext_response, make_response_on_validation_error,
     },
+    state_reader_executor::StateReaderExecutor,
+    types::{to_legacy_request_type, ApiReqType},
+    HttpError, HttpHandlerMetrics, ReplicaHealthStatus, UNKNOWN_LABEL,
+};
+use hyper::{Body, Response, StatusCode};
+use ic_crypto_tree_hash::{sparse_labeled_tree_from_paths, Label, Path};
+use ic_interfaces::{crypto::IngressSigVerifier, registry::RegistryClient};
+use ic_logger::{trace, ReplicaLogger};
+use ic_replicated_state::{canister_state::execution_state::CustomSectionType, ReplicatedState};
+use ic_types::{
     malicious_flags::MaliciousFlags,
     messages::{
         Blob, Certificate, CertificateDelegation, HttpReadStateContent, HttpReadStateResponse,
@@ -24,7 +21,7 @@ use ic_types::{
         EXPECTED_MESSAGE_ID_LENGTH,
     },
     time::current_time,
-    UserId,
+    CanisterId, UserId,
 };
 use ic_validator::{get_authorized_canisters, CanisterIdSet};
 use std::convert::TryFrom;
@@ -42,7 +39,7 @@ pub(crate) struct ReadStateService {
     metrics: HttpHandlerMetrics,
     health_status: Arc<RwLock<ReplicaHealthStatus>>,
     delegation_from_nns: Arc<RwLock<Option<CertificateDelegation>>>,
-    state_reader: Arc<dyn StateReader<State = ReplicatedState>>,
+    state_reader_executor: StateReaderExecutor,
     validator: Arc<dyn IngressSigVerifier + Send + Sync>,
     registry_client: Arc<dyn RegistryClient>,
     malicious_flags: MaliciousFlags,
@@ -55,7 +52,7 @@ impl ReadStateService {
         metrics: HttpHandlerMetrics,
         health_status: Arc<RwLock<ReplicaHealthStatus>>,
         delegation_from_nns: Arc<RwLock<Option<CertificateDelegation>>>,
-        state_reader: Arc<dyn StateReader<State = ReplicatedState>>,
+        state_reader_executor: StateReaderExecutor,
         validator: Arc<dyn IngressSigVerifier + Send + Sync>,
         registry_client: Arc<dyn RegistryClient>,
         malicious_flags: MaliciousFlags,
@@ -65,7 +62,7 @@ impl ReadStateService {
             metrics,
             health_status,
             delegation_from_nns,
-            state_reader,
+            state_reader_executor,
             validator,
             registry_client,
             malicious_flags,
@@ -88,15 +85,17 @@ impl Service<Vec<u8>> for ReadStateService {
         self.metrics
             .requests_body_size_bytes
             .with_label_values(&[
-                RequestType::ReadState.as_str(),
-                ApiReqType::ReadState.as_str(),
+                to_legacy_request_type(ApiReqType::ReadState),
+                ApiReqType::ReadState.into(),
                 UNKNOWN_LABEL,
             ])
             .observe(body.len() as f64);
+
         if *self.health_status.read().unwrap() != ReplicaHealthStatus::Healthy {
-            let res = make_response(unavailable_error(
-                "Replica is starting. Check the /api/v2/status for more information.",
-            ));
+            let res = make_plaintext_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Replica is starting. Check the /api/v2/status for more information.".to_string(),
+            );
             return Box::pin(async move { Ok(res) });
         }
         let delegation_from_nns = self.delegation_from_nns.read().unwrap().clone();
@@ -106,51 +105,41 @@ impl Service<Vec<u8>> for ReadStateService {
         ) {
             Ok(request) => request,
             Err(e) => {
-                let res = make_response(invalid_argument_error(
-                    format!("Could not parse body as read request: {}", e).as_str(),
-                ));
+                let res = make_plaintext_response(
+                    StatusCode::BAD_REQUEST,
+                    format!("Could not parse body as read request: {}", e),
+                );
                 return Box::pin(async move { Ok(res) });
             }
         };
 
-        // Convert the message to a strongly-typed struct, making structural validations
-        // on the way.
+        // Convert the message to a strongly-typed struct.
         let request = match HttpRequest::<ReadState>::try_from(request) {
             Ok(request) => request,
             Err(e) => {
-                let res = make_response(invalid_argument_error(
-                    format!("Malformed request: {:?}", e).as_str(),
-                ));
+                let res = make_plaintext_response(
+                    StatusCode::BAD_REQUEST,
+                    format!("Malformed request: {:?}", e),
+                );
                 return Box::pin(async move { Ok(res) });
             }
         };
-        let read_state = request.content();
-
-        match get_authorized_canisters(
+        let targets = match get_authorized_canisters(
             &request,
             self.validator.as_ref(),
             current_time(),
             self.registry_client.get_latest_version(),
             &self.malicious_flags,
         ) {
-            Ok(targets) => {
-                if let Err(err) = verify_paths(
-                    self.state_reader.as_ref(),
-                    &read_state.source,
-                    &read_state.paths,
-                    &targets,
-                ) {
-                    return Box::pin(async move { Ok(make_response(err)) });
-                }
-            }
+            Ok(targets) => targets,
             Err(err) => {
                 let res = make_response_on_validation_error(request.id(), err, &self.log);
                 return Box::pin(async move { Ok(res) });
             }
-        }
+        };
 
-        // Verify that the sender has authorization to the paths requested.
-
+        // Collect requested path.
+        let read_state = request.content().clone();
         let mut paths: Vec<Path> = read_state.paths.clone();
 
         // Always add "time" to the paths even if not explicitly requested.
@@ -158,34 +147,59 @@ impl Service<Vec<u8>> for ReadStateService {
 
         let labeled_tree = sparse_labeled_tree_from_paths(&mut paths);
 
-        let res = match self.state_reader.read_certified_state(&labeled_tree) {
-            Some((_state, tree, certification)) => {
-                let signature = certification.signed.signature.signature.get().0;
-                let res = HttpReadStateResponse {
-                    certificate: Blob(into_cbor(&Certificate {
-                        tree,
-                        signature: Blob(signature),
-                        delegation: delegation_from_nns,
-                    })),
-                };
-                cbor_response(&res)
+        let state_reader_executor = self.state_reader_executor.clone();
+        Box::pin(async move {
+            // Verify authorization for requested paths.
+            if let Err(HttpError { status, message }) = verify_paths(
+                &state_reader_executor,
+                &read_state.source,
+                &read_state.paths,
+                &targets,
+            )
+            .await
+            {
+                return Ok(make_plaintext_response(status, message));
             }
-            None => make_response(unavailable_error(
-                "Certified state is not available yet. Please try again...",
-            )),
-        };
-        Box::pin(async move { Ok(res) })
+
+            let res = match state_reader_executor
+                .read_certified_state(&labeled_tree)
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => return Ok(make_plaintext_response(e.status, e.message)),
+            };
+
+            let res = match res {
+                Some((_state, tree, certification)) => {
+                    let signature = certification.signed.signature.signature.get().0;
+                    let res = HttpReadStateResponse {
+                        certificate: Blob(into_cbor(&Certificate {
+                            tree,
+                            signature: Blob(signature),
+                            delegation: delegation_from_nns,
+                        })),
+                    };
+                    cbor_response(&res)
+                }
+                None => make_plaintext_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Certified state is not available yet. Please try again...".to_string(),
+                ),
+            };
+
+            Ok(res)
+        })
     }
 }
 
 // Verifies that the `user` is authorized to retrieve the `paths` requested.
-fn verify_paths(
-    state_reader: &dyn StateReader<State = ReplicatedState>,
+async fn verify_paths(
+    state_reader_executor: &StateReaderExecutor,
     user: &UserId,
     paths: &[Path],
     targets: &CanisterIdSet,
-) -> Result<(), CanonicalError> {
-    let state = state_reader.get_latest_state().take();
+) -> Result<(), HttpError> {
+    let state = state_reader_executor.get_latest_state().await?.take();
     let mut num_request_ids = 0;
 
     // Convert the paths to slices to make it easier to match below.
@@ -200,16 +214,37 @@ fn verify_paths(
             [b"canister", _canister_id, b"controller"] => {}
             [b"canister", _canister_id, b"controllers"] => {}
             [b"canister", _canister_id, b"module_hash"] => {}
+            [b"canister", canister_id, b"metadata", name] => {
+                let name = String::from_utf8(Vec::from(*name)).map_err(|err| HttpError {
+                    status: StatusCode::BAD_REQUEST,
+                    message: format!("Could not parse the custom section name: {}.", err),
+                })?;
+
+                match CanisterId::try_from(*canister_id) {
+                    Ok(canister_id) => {
+                        can_read_canister_metadata(user, &canister_id, &name, &state)?
+                    }
+                    Err(err) => {
+                        return Err(HttpError {
+                            status: StatusCode::BAD_REQUEST,
+                            message: format!("Could not parse Canister ID: {}.", err),
+                        })
+                    }
+                }
+            }
             [b"subnet", _subnet_id, b"public_key"] => {}
             [b"subnet", _subnet_id, b"canister_ranges"] => {}
             [b"request_status", request_id] | [b"request_status", request_id, ..] => {
                 num_request_ids += 1;
 
                 if num_request_ids > MAX_READ_STATE_REQUEST_IDS {
-                    return Err(resource_exhausted_error(&format!(
-                        "Can only request up to {} request IDs.",
-                        MAX_READ_STATE_REQUEST_IDS
-                    )));
+                    return Err(HttpError {
+                        status: StatusCode::TOO_MANY_REQUESTS,
+                        message: format!(
+                            "Can only request up to {} request IDs.",
+                            MAX_READ_STATE_REQUEST_IDS
+                        ),
+                    });
                 }
 
                 // Verify that the request was signed by the same user.
@@ -219,22 +254,31 @@ fn verify_paths(
                     if let Some(ingress_user_id) = ingress_status.user_id() {
                         if let Some(receiver) = ingress_status.receiver() {
                             if ingress_user_id != *user || !targets.contains(&receiver) {
-                                return Err(permission_denied_error(
-                                    "Request IDs must be for requests signed by the caller.",
-                                ));
+                                return Err(HttpError {
+                                    status: StatusCode::FORBIDDEN,
+                                    message:
+                                        "Request IDs must be for requests signed by the caller."
+                                            .to_string(),
+                                });
                             }
                         }
                     }
                 } else {
-                    return Err(invalid_argument_error(&format!(
-                        "Request IDs must be {} bytes in length.",
-                        EXPECTED_MESSAGE_ID_LENGTH
-                    )));
+                    return Err(HttpError {
+                        status: StatusCode::BAD_REQUEST,
+                        message: format!(
+                            "Request IDs must be {} bytes in length.",
+                            EXPECTED_MESSAGE_ID_LENGTH
+                        ),
+                    });
                 }
             }
             _ => {
                 // All other paths are unsupported.
-                return Err(not_found_error("Invalid path requested."));
+                return Err(HttpError {
+                    status: StatusCode::NOT_FOUND,
+                    message: "Invalid path requested.".to_string(),
+                });
             }
         }
     }
@@ -242,10 +286,75 @@ fn verify_paths(
     Ok(())
 }
 
+fn can_read_canister_metadata(
+    user: &UserId,
+    canister_id: &CanisterId,
+    custom_section_name: &str,
+    state: &ReplicatedState,
+) -> Result<(), HttpError> {
+    let canister = state
+        .canister_states
+        .get(canister_id)
+        .ok_or_else(|| HttpError {
+            status: StatusCode::NOT_FOUND,
+            message: format!("Canister {} not found.", canister_id),
+        })?;
+
+    match &canister.execution_state {
+        Some(execution_state) => {
+            let custom_section = execution_state
+                .metadata
+                .get_custom_section(custom_section_name)
+                .ok_or_else(|| HttpError {
+                    status: StatusCode::NOT_FOUND,
+                    message: format!("Custom section {} not found.", custom_section_name),
+                })?;
+
+            // Only the controller can request this custom section.
+            if custom_section.visibility == CustomSectionType::Private
+                && !canister.system_state.controllers.contains(&user.get())
+            {
+                return Err(HttpError {
+                    status: StatusCode::FORBIDDEN,
+                    message: format!(
+                        "Custom section {} can only be requested by the controllers of the canister.",
+                        custom_section_name
+                    ),
+                });
+            }
+        }
+        None => {
+            return Err(HttpError {
+                status: StatusCode::NOT_FOUND,
+                message: format!("Canister {} has no module.", canister_id),
+            })
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod test {
-    use crate::common::test::{array, assert_cbor_ser_equal, bytes, int};
-    use ic_crypto_tree_hash::{Digest, Label, MixedHashTree};
+    use crate::{
+        common::test::{array, assert_cbor_ser_equal, bytes, int},
+        read_state::{can_read_canister_metadata, verify_paths},
+        state_reader_executor::StateReaderExecutor,
+        HttpError,
+    };
+    use hyper::StatusCode;
+    use ic_crypto_tree_hash::{Digest, Label, MixedHashTree, Path};
+    use ic_interfaces_state_manager::Labeled;
+    use ic_registry_subnet_type::SubnetType;
+    use ic_replicated_state::{BitcoinState, CanisterQueues, ReplicatedState, SystemMetadata};
+    use ic_test_utilities::{
+        mock_time,
+        state::insert_dummy_canister,
+        state_manager::MockStateManager,
+        types::ids::{canister_test_id, subnet_test_id, user_test_id},
+    };
+    use ic_types::Height;
+    use ic_validator::CanisterIdSet;
+    use std::{collections::BTreeMap, sync::Arc};
 
     #[test]
     fn encoding_read_state_tree_empty() {
@@ -301,6 +410,104 @@ mod test {
                 ]),
                 array(vec![int(3), bytes(&[4, 5, 6])]),
             ]),
+        );
+    }
+
+    #[test]
+    fn user_can_read_canister_metadata() {
+        let canister_id = canister_test_id(100);
+        let controller = user_test_id(24);
+        let non_controller = user_test_id(20);
+
+        let mut state = ReplicatedState::new_rooted_at(
+            subnet_test_id(1),
+            SubnetType::Application,
+            "Initial".into(),
+        );
+        insert_dummy_canister(&mut state, canister_id, controller.get());
+
+        let public_name = "dummy";
+        // Controller can read the public custom section
+        assert!(can_read_canister_metadata(&controller, &canister_id, public_name, &state).is_ok());
+
+        // Non-controller can read public custom section
+        assert!(
+            can_read_canister_metadata(&non_controller, &canister_id, public_name, &state).is_ok()
+        );
+
+        let private_name = "candid";
+        // Controller can read private custom section
+        assert!(
+            can_read_canister_metadata(&controller, &canister_id, private_name, &state).is_ok()
+        );
+    }
+
+    #[test]
+    fn user_cannot_read_canister_metadata() {
+        let canister_id = canister_test_id(100);
+        let controller = user_test_id(24);
+        let non_controller = user_test_id(20);
+
+        let mut state = ReplicatedState::new_rooted_at(
+            subnet_test_id(1),
+            SubnetType::Application,
+            "Initial".into(),
+        );
+        insert_dummy_canister(&mut state, canister_id, controller.get());
+
+        // Non-controller cannot read private custom section named `candid`.
+        assert_eq!(
+            can_read_canister_metadata(&non_controller, &canister_id, "candid", &state),
+            Err(HttpError {
+                status: StatusCode::FORBIDDEN,
+                message: "Custom section candid can only be requested by the controllers of the canister."
+                    .to_string()
+            })
+        );
+
+        // Non existent public custom section.
+        assert_eq!(
+            can_read_canister_metadata(&non_controller, &canister_id, "unknown-name", &state),
+            Err(HttpError {
+                status: StatusCode::NOT_FOUND,
+                message: "Custom section unknown-name not found.".to_string()
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn async_verify_path() {
+        let subnet_id = subnet_test_id(1);
+        let mut mock_state_manager = MockStateManager::new();
+        mock_state_manager
+            .expect_get_latest_state()
+            .returning(move || {
+                let mut metadata = SystemMetadata::new(subnet_id, SubnetType::Application);
+                metadata.batch_time = mock_time();
+                Labeled::new(
+                    Height::from(1),
+                    Arc::new(ReplicatedState::new_from_checkpoint(
+                        BTreeMap::new(),
+                        metadata,
+                        CanisterQueues::default(),
+                        Vec::new(),
+                        BitcoinState::default(),
+                        std::path::PathBuf::new(),
+                    )),
+                )
+            });
+
+        let state_manager = Arc::new(mock_state_manager);
+        let sre = StateReaderExecutor::new(state_manager.clone());
+        assert_eq!(
+            verify_paths(
+                &sre,
+                &user_test_id(1),
+                &[Path::from(Label::from("time"))],
+                &CanisterIdSet::All
+            )
+            .await,
+            Ok(())
         );
     }
 }

@@ -1,6 +1,6 @@
 use dfn_candid::{candid, candid_one};
 use ic_canister_client::Sender;
-use ic_nns_constants::ids::{
+use ic_nervous_system_common_test_keys::{
     TEST_NEURON_1_OWNER_PRINCIPAL, TEST_NEURON_2_OWNER_KEYPAIR, TEST_NEURON_3_OWNER_KEYPAIR,
 };
 use ic_nns_governance::pb::v1::{

@@ -1,8 +1,8 @@
 use ic_config::subnet_config::{CyclesAccountManagerConfig, SubnetConfigs};
-use ic_error_types::ErrorCode;
 use ic_registry_subnet_type::SubnetType;
-use ic_state_machine_tests::StateMachine;
-use ic_types::ic00::CanisterSettingsArgs;
+use ic_state_machine_tests::{
+    CanisterSettingsArgs, ErrorCode, PrincipalId, StateMachine, SubnetId,
+};
 use ic_types::Cycles;
 
 /// This is a canister that keeps a counter on the heap and exposes various test
@@ -129,9 +129,10 @@ fn to_int(v: Vec<u8>) -> i32 {
 /// re-install, and that the heap stays discarded after a checkpoint
 /// recovery. It's a common bug in execution to reset the heap in
 /// memory, but not on disk, which results in corrupted checkpoints.
-#[tokio::test]
-async fn test_canister_reinstall_restart() {
+#[test]
+fn test_canister_reinstall_restart() {
     let env = StateMachine::new();
+    env.set_checkpoints_enabled(true);
 
     let canister_id = env.install_canister_wat(TEST_CANISTER, vec![], None);
     let val = env.query(canister_id, "read", vec![]).unwrap().bytes();
@@ -153,9 +154,10 @@ async fn test_canister_reinstall_restart() {
 
 /// Same test as above, but checks the upgrade path when no upgrade
 /// hooks are present instead of the re-install path.
-#[tokio::test]
-async fn test_canister_upgrade_restart() {
+#[test]
+fn test_canister_upgrade_restart() {
     let env = StateMachine::new();
+    env.set_checkpoints_enabled(true);
 
     let canister_id = env.install_canister_wat(TEST_CANISTER, vec![], None);
     env.execute_ingress(canister_id, "inc", vec![]).unwrap();
@@ -177,9 +179,10 @@ async fn test_canister_upgrade_restart() {
 /// re-install, and that the stable memory stays discarded after a checkpoint
 /// recovery. It's a common bug in execution to reset a page map in memory, but
 /// not on disk, which results in corrupted checkpoints.
-#[tokio::test]
-async fn test_canister_stable_memory_reinstall_restart() {
+#[test]
+fn test_canister_stable_memory_reinstall_restart() {
     let env = StateMachine::new();
+    env.set_checkpoints_enabled(true);
 
     let canister_id = env.install_canister_wat(TEST_CANISTER, vec![], None);
     env.execute_ingress(canister_id, "inc", vec![]).unwrap();
@@ -214,9 +217,10 @@ async fn test_canister_stable_memory_reinstall_restart() {
 
 /// Same test as above, but checks the upgrade path when no upgrade
 /// hooks are present instead of the re-install path.
-#[tokio::test]
-async fn test_canister_stable_memory_upgrade_restart() {
+#[test]
+fn test_canister_stable_memory_upgrade_restart() {
     let env = StateMachine::new();
+    env.set_checkpoints_enabled(true);
 
     let canister_id = env.install_canister_wat(TEST_CANISTER, vec![], None);
     env.execute_ingress(canister_id, "inc", vec![]).unwrap();
@@ -244,11 +248,15 @@ async fn test_canister_stable_memory_upgrade_restart() {
 /// Verifies that, if a canister runs out of cycles and is automatically
 /// uninstalled by the system, then making a checkpoint doesn't crash.
 /// This was a bug in the past that caused ICSUP-2400.
-#[tokio::test]
-async fn test_canister_out_of_cycles() {
+#[test]
+fn test_canister_out_of_cycles() {
     // Start a node with a config where all computation/storage is free.
     let mut config = SubnetConfigs::default().own_subnet_config(SubnetType::System);
     let env = StateMachine::new_with_config(config.clone());
+    env.set_checkpoints_enabled(true);
+
+    let now = std::time::SystemTime::now();
+    env.set_time(now);
 
     // Install a canister. By default, it has zero cycles.
     // Note that a compute allocation is assigned.
@@ -279,14 +287,12 @@ async fn test_canister_out_of_cycles() {
     // Install a new wasm to trigger making a new checkpoint.
     env.install_canister_wat(TEST_CANISTER, vec![], None);
 
-    // We don't charge for allocation every round, so need to trigger multiple
-    // rounds until allocation charging has occured.
-    for _ in 0..(2 * CyclesAccountManagerConfig::application_subnet()
-        .duration_between_allocation_charges)
-        .as_secs()
-    {
-        let _ = env.execute_ingress(canister_id, "inc", vec![]);
-    }
+    // We don't charge for allocation periodically, we advance the state machine
+    // time to trigger allocation charging.
+    let now = now
+        + 2 * CyclesAccountManagerConfig::application_subnet().duration_between_allocation_charges;
+    env.set_time(now);
+    env.tick();
 
     // Verify the original canister still exists (but with an empty wasm module).
     assert_eq!(
@@ -299,9 +305,10 @@ async fn test_canister_out_of_cycles() {
 
 /// Verifies that incremental manifest computation correctly handles memory
 /// grow and shrink.
-#[tokio::test]
-async fn test_manifest_computation_memory_grow() {
+#[test]
+fn test_manifest_computation_memory_grow() {
     let env = StateMachine::new();
+    env.set_checkpoints_enabled(true);
 
     let canister_id = env.install_canister_wat(TEST_CANISTER, vec![], None);
     let state_hash_1 = env.await_state_hash();
@@ -322,9 +329,10 @@ async fn test_manifest_computation_memory_grow() {
 
 /// Verifies that incremental manifest computation correctly handles heap file
 /// size changes.
-#[tokio::test]
-async fn test_manifest_computation_memory_expand() {
+#[test]
+fn test_manifest_computation_memory_expand() {
     let env = StateMachine::new();
+    env.set_checkpoints_enabled(true);
 
     let canister_id = env.install_canister_wat(TEST_CANISTER, vec![], None);
     env.execute_ingress(canister_id, "inc", vec![]).unwrap();
@@ -353,4 +361,55 @@ async fn test_manifest_computation_memory_expand() {
 
     let state_hash_3 = env.await_state_hash();
     assert_ne!(state_hash_2, state_hash_3);
+}
+
+/// Verifies that the state machine automatically removes stopped canisters
+/// outside of the assigned canister range.
+#[test]
+fn automatic_stopped_canister_removal() {
+    let env = StateMachine::new();
+
+    let canister_id_1 = env.install_canister_wat(TEST_CANISTER, vec![], None);
+    let canister_id_2 = env.install_canister_wat(TEST_CANISTER, vec![], None);
+
+    let new_subnet = SubnetId::from(PrincipalId::new_subnet_test_id(404));
+    env.reroute_canister_range(canister_id_1..=canister_id_1, new_subnet);
+    env.execute_ingress(canister_id_1, "inc", vec![]).unwrap();
+    env.execute_ingress(canister_id_2, "inc", vec![]).unwrap();
+
+    env.stop_canister(canister_id_1).unwrap();
+    env.execute_ingress(canister_id_2, "inc", vec![]).unwrap();
+    let user_error = env
+        .execute_ingress(canister_id_1, "inc", vec![])
+        .unwrap_err();
+    assert_eq!(user_error.code(), ErrorCode::CanisterNotFound);
+}
+
+/// Verifies that the state machine can install gzip-compressed canister
+/// modules.
+#[test]
+fn compressed_canisters_support() {
+    let env = StateMachine::new();
+    env.set_checkpoints_enabled(true);
+
+    let test_canister_wasm = wabt::wat2wasm(TEST_CANISTER).expect("invalid WAT");
+    let compressed_wasm = {
+        let mut encoder = libflate::gzip::Encoder::new(Vec::new()).unwrap();
+        std::io::copy(&mut &test_canister_wasm[..], &mut encoder).unwrap();
+        encoder.finish().into_result().unwrap()
+    };
+    let compressed_hash = ic_crypto_sha::Sha256::hash(&compressed_wasm);
+
+    let canister_id = env.install_canister(compressed_wasm, vec![], None).unwrap();
+
+    assert_eq!(env.module_hash(canister_id), Some(compressed_hash));
+    let env = env.restart_node();
+    assert_eq!(env.module_hash(canister_id), Some(compressed_hash));
+
+    let val = env.query(canister_id, "read", vec![]).unwrap().bytes();
+    assert_eq!(to_int(val), 0);
+
+    env.execute_ingress(canister_id, "inc", vec![]).unwrap();
+    let val = env.query(canister_id, "read", vec![]).unwrap().bytes();
+    assert_eq!(to_int(val), 1);
 }

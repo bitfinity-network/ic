@@ -1,13 +1,18 @@
-# GuestOS - Main Image
+# GuestOS - Main Docker Image
 #
 # Build steps:
-# - `docker build -t dfinity/guestos-main -f Dockerfile .`
-# - `docker push dfinity/guestos-main`
+# - `docker build --pull -t dfinity/guestos-main -f Dockerfile .`
 #
 # First build stage:
 # - Download 3rd party tools
 #
-FROM dfinity/guestos-base@sha256:527d3ba8e12931e82350c1b58fe94133d9e1a8d1f6843a2d6e3354447eaddf85 as download
+
+# The base images are defined in docker-base.prod and docker-base.dev. Update
+# the references there when a new base image has been built. Note that this
+# argument MUST be given by the build script, otherwise build will fail.
+ARG BASE_IMAGE=
+
+FROM ubuntu:20.04 as download
 
 ENV TZ=UTC
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
@@ -24,8 +29,8 @@ RUN cd /tmp/ && \
 
 # Download and verify node_exporter
 RUN cd /tmp/ && \
-    curl -L -O https://github.com/prometheus/node_exporter/releases/download/v1.3.0/node_exporter-1.3.0.linux-amd64.tar.gz && \
-    echo "b16d5061d3bc3d0ad8232964071ee3ece7fc104afa817bb5f55570521756125d  node_exporter-1.3.0.linux-amd64.tar.gz" > node_exporter.sha256 && \
+    curl -L -O https://github.com/prometheus/node_exporter/releases/download/v1.3.1/node_exporter-1.3.1.linux-amd64.tar.gz && \
+    echo "68f3802c2dd3980667e4ba65ea2e1fb03f4a4ba026cca375f15a0390ff850949  node_exporter-1.3.1.linux-amd64.tar.gz" > node_exporter.sha256 && \
     shasum -c node_exporter.sha256
 
 #
@@ -33,7 +38,7 @@ RUN cd /tmp/ && \
 # - Construct the actual target image (IC-OS root filesystem)
 # - Copy downloaded archives from first build stage into the target image
 #
-FROM dfinity/guestos-base@sha256:527d3ba8e12931e82350c1b58fe94133d9e1a8d1f6843a2d6e3354447eaddf85
+FROM $BASE_IMAGE
 
 RUN mkdir -p /boot/config \
              /boot/efi \
@@ -44,7 +49,8 @@ COPY etc /etc
 RUN find /etc -type d -exec chmod 0755 {} \+ && \
     find /etc -type f -not -path "/etc/hostname" -not -path "/etc/hosts" -not -path "/etc/resolv.conf" -exec chmod 0644 {} \+ && \
     chmod 0755 /etc/systemd/system-generators/mount-generator && \
-    chmod 0440 /etc/sudoers
+    chmod 0440 /etc/sudoers && \
+    chmod 755 /etc/initramfs-tools/scripts/init-bottom/set-machine-id
 
 # Deactivate motd, it tries creating $HOME/.cache/motd.legal-displayed,
 # but we want to prohibit it from writing to user home dirs
@@ -106,7 +112,8 @@ RUN systemctl enable \
     nftables \
     systemd-networkd \
     systemd-networkd-wait-online \
-    systemd-resolved
+    systemd-resolved \
+    systemd-journal-gatewayd
 
 # Add user/group entries specified here: /usr/lib/sysusers.d/systemd.conf E.g., systemd-timesync/coredump
 RUN faketime "1970-1-1 0" systemd-sysusers
@@ -120,15 +127,16 @@ RUN echo "set dash/sh false" | debconf-communicate && dpkg-reconfigure -fnoninte
 # allowing backup read access.
 RUN addgroup --system nonconfidential && \
     addgroup --system confidential && \
-    addgroup --system vsock
+    addgroup --system vsock && \
+    addgroup --system ic-registry-local-store
 
 # User which will run the replica service.
 RUN adduser --system --disabled-password --home /var/lib/ic --group --no-create-home ic-replica && \
     adduser ic-replica backup && \
     adduser ic-replica nonconfidential && \
     adduser ic-replica confidential && \
-    adduser ic-replica vsock && \
-    adduser ic-replica sudo
+    adduser ic-replica ic-registry-local-store && \
+    adduser ic-replica vsock
 
 # Accounts to allow remote access to state bits
 
@@ -138,13 +146,15 @@ RUN chsh -s /bin/bash backup && \
     mkdir /var/lib/backup && \
     chown backup:backup /var/lib/backup && \
     usermod -d /var/lib/backup backup && \
-    adduser backup systemd-journal
+    adduser backup systemd-journal && \
+    adduser backup ic-registry-local-store
 
 # The "read-only" user account. May read everything besides crypto.
 RUN adduser --system --disabled-password --home /var/lib/readonly --shell /bin/bash readonly && \
     adduser readonly backup && \
     adduser readonly nonconfidential && \
-    adduser readonly systemd-journal
+    adduser readonly systemd-journal && \
+    adduser readonly ic-registry-local-store
 
 # The omnipotent "admin" account. May read everything and crucially can also
 # arbitrarily change system state via sudo.
@@ -152,6 +162,7 @@ RUN adduser --system --disabled-password --home /var/lib/admin --shell /bin/bash
     chown admin:staff /var/lib/admin && \
     adduser admin backup && \
     adduser admin nonconfidential && \
+    adduser admin ic-registry-local-store && \
     adduser admin systemd-journal && \
     adduser admin vsock && \
     adduser admin sudo
@@ -189,17 +200,17 @@ RUN cd /tmp/ && \
     rm /tmp/journalbeat-oss-7.5.1-linux-x86_64.tar.gz
 
 # Install node_exporter
-COPY --from=download /tmp/node_exporter-1.3.0.linux-amd64.tar.gz /tmp/node_exporter-1.3.0.linux-amd64.tar.gz
+COPY --from=download /tmp/node_exporter-1.3.1.linux-amd64.tar.gz /tmp/node_exporter-1.3.1.linux-amd64.tar.gz
 RUN cd /tmp/ && \
     mkdir -p /etc/node_exporter && \
-    tar --strip-components=1 -C /usr/local/bin/ -zvxf node_exporter-1.3.0.linux-amd64.tar.gz node_exporter-1.3.0.linux-amd64/node_exporter && \
+    tar --strip-components=1 -C /usr/local/bin/ -zvxf node_exporter-1.3.1.linux-amd64.tar.gz node_exporter-1.3.1.linux-amd64/node_exporter && \
     chown root:root /etc/node_exporter \
                     /usr/local/bin/node_exporter && \
     chmod 0755 /etc/node_exporter \
                /usr/local/bin/node_exporter && \
     chmod 0644 /etc/default/node_exporter \
                /etc/node_exporter/web.yml && \
-    rm /tmp/node_exporter-1.3.0.linux-amd64.tar.gz
+    rm /tmp/node_exporter-1.3.1.linux-amd64.tar.gz
 
 # Clear all files that may lead to indeterministic build.
 RUN apt-get clean && \
@@ -224,8 +235,3 @@ RUN find /opt -type d -exec chmod 0755 {} \+ && \
     find /opt -type f -exec chmod 0644 {} \+ && \
     chmod 0755 /opt/ic/bin/* && \
     chmod 0644 /opt/ic/share/*
-
-COPY boot /boot
-# Update POSIX permissions in /boot/
-RUN chmod 0644 /boot/extra_boot_args /boot/version.txt
-

@@ -1,4 +1,7 @@
-use std::{collections::BTreeSet, path::PathBuf};
+//! This defines the RPC service methods offered by the sandbox process
+//! (used by the controller) as well as the expected replies.
+
+use std::collections::BTreeSet;
 
 use crate::fdenum::EnumerateInnerFileDescriptors;
 use crate::protocol::structs;
@@ -6,18 +9,19 @@ use ic_interfaces::execution_environment::HypervisorResult;
 use ic_replicated_state::{
     page_map::{
         CheckpointSerialization, MappingSerialization, PageAllocatorSerialization,
-        PageDeltaSerialization, PageMapSerialization, PageSerialization,
+        PageMapSerialization,
     },
     Global, NumWasmPages,
 };
 use ic_types::{methods::WasmMethod, CanisterId};
 use serde::{Deserialize, Serialize};
 
-use super::id::{ExecId, StateId, WasmId};
+use super::{
+    id::{ExecId, MemoryId, WasmId},
+    structs::{MemoryModifications, SandboxExecInput},
+};
+use ic_replicated_state::canister_state::execution_state::WasmMetadata;
 
-/// This defines the RPC service methods offered by the sandbox process
-/// (used by the controller) as well as the expected replies.
-///
 /// Instruct sandbox process to terminate: Sandbox process should take
 /// all necessary steps for graceful termination (sync all files etc.)
 /// and quit voluntarily. It is still expected to generate a reply to
@@ -41,28 +45,18 @@ pub struct OpenWasmRequest {
     /// per sandbox instance.
     pub wasm_id: WasmId,
 
-    /// Path to the wasm file that defines the executable of the
-    /// canister.
-    /// NB:
-    /// - it would actually be preferable to transfer the code by other means
-    ///   (either as "data" or by "file descriptor passing") instead of passing
-    ///   a file name; this way, filesystem access permission to sandbox can be
-    ///   limited further
-    /// - it would actually be preferable to move the compilation into native
-    ///   code outside the sandbox itself; this way, the sandbox can be further
-    ///   constrained such that it is impossible to generate and execute custom
-    ///   code and will hamper an attackers ability to exploit wasm jailbreak
-    ///   flaws
-    pub wasm_file_path: Option<String>,
     /// Contains wasm source code as a sequence of bytes.
+    /// It would actually be preferable to move the compilation into native
+    /// code outside the sandbox itself; this way, the sandbox can be further
+    /// constrained such that it is impossible to generate and execute custom
+    /// code and will hamper an attackers ability to exploit wasm jailbreak
+    /// flaws
     pub wasm_src: Vec<u8>,
 }
 
 /// Reply to an `OpenWasmRequest`.
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct OpenWasmReply {
-    pub success: bool,
-}
+pub struct OpenWasmReply(pub HypervisorResult<()>);
 
 /// Request to close the indicated wasm object.
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -94,25 +88,6 @@ pub struct MemorySerialization {
 impl EnumerateInnerFileDescriptors for MemorySerialization {
     fn enumerate_fds<'a>(&'a mut self, fds: &mut Vec<&'a mut std::os::unix::io::RawFd>) {
         self.page_map.enumerate_fds(fds);
-    }
-}
-
-/// Represents a memory delta that can be sent to the sandbox process.
-/// Note that the page allocator is optional because it is send only if the
-/// parent state has an empty allocator and a new allocator was created for the
-/// current state.
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct MemoryDeltaSerialization {
-    pub page_delta: PageDeltaSerialization,
-    pub page_allocator: Option<PageAllocatorSerialization>,
-    pub num_wasm_pages: NumWasmPages,
-}
-
-impl EnumerateInnerFileDescriptors for MemoryDeltaSerialization {
-    fn enumerate_fds<'a>(&'a mut self, fds: &mut Vec<&'a mut std::os::unix::io::RawFd>) {
-        if let Some(page_allocator) = self.page_allocator.as_mut() {
-            page_allocator.enumerate_fds(fds)
-        }
     }
 }
 
@@ -149,91 +124,46 @@ impl EnumerateInnerFileDescriptors for PageAllocatorSerialization {
     fn enumerate_fds<'a>(&'a mut self, fds: &mut Vec<&'a mut std::os::unix::io::RawFd>) {
         match self {
             PageAllocatorSerialization::Mmap(fd) => fds.push(&mut fd.fd),
-            PageAllocatorSerialization::Empty | PageAllocatorSerialization::Heap => {}
+            PageAllocatorSerialization::Heap => {}
         }
     }
 }
 
-/// Contains information that is necessary to create an execution state in
-/// the sandbox process:
-/// - Full: contains snapshots of the Wasm and stable memories.
-/// - Delta: describes the memory delta that should be applied to the given
-///   parent state.
+/// Describe a request to open a particular memory.
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub enum StateSerialization {
-    Full {
-        globals: Vec<Global>,
-        wasm_memory: MemorySerialization,
-        stable_memory: MemorySerialization,
-    },
-    Delta {
-        parent_state_id: StateId,
-        globals: Vec<Global>,
-        wasm_memory: MemoryDeltaSerialization,
-        stable_memory: MemoryDeltaSerialization,
-    },
+pub struct OpenMemoryRequest {
+    pub memory_id: MemoryId,
+    pub memory: MemorySerialization,
 }
 
-impl EnumerateInnerFileDescriptors for StateSerialization {
+impl EnumerateInnerFileDescriptors for OpenMemoryRequest {
     fn enumerate_fds<'a>(&'a mut self, fds: &mut Vec<&'a mut std::os::unix::io::RawFd>) {
-        match self {
-            StateSerialization::Full {
-                globals: _,
-                wasm_memory,
-                stable_memory,
-            } => {
-                wasm_memory.enumerate_fds(fds);
-                stable_memory.enumerate_fds(fds);
-            }
-            StateSerialization::Delta {
-                parent_state_id: _,
-                globals: _,
-                wasm_memory,
-                stable_memory,
-            } => {
-                wasm_memory.enumerate_fds(fds);
-                stable_memory.enumerate_fds(fds);
-            }
-        }
+        self.memory.enumerate_fds(fds);
     }
 }
 
-/// Describe a request to open a particular state containing either
-/// the state path or utilize a particular state branch.
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct OpenStateRequest {
-    pub state_id: StateId,
-    pub state: StateSerialization,
-}
-
-impl EnumerateInnerFileDescriptors for OpenStateRequest {
-    fn enumerate_fds<'a>(&'a mut self, fds: &mut Vec<&'a mut std::os::unix::io::RawFd>) {
-        self.state.enumerate_fds(fds);
-    }
-}
-
-/// Ack to the controller that state was opened or failed to open. A
+/// Ack to the controller that memory was opened or failed to open. A
 /// failure to open will lead to a panic in the controller.
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct OpenStateReply {
+pub struct OpenMemoryReply {
     pub success: bool,
 }
 
-/// Request the indicated state session to be purged and dropped.
+/// Request the indicated memory to be purged and dropped.
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct CloseStateRequest {
-    pub state_id: StateId,
+pub struct CloseMemoryRequest {
+    pub memory_id: MemoryId,
 }
 
-/// Ack state session was successfully closed or not.
+/// Ack memory was successfully closed or not.
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct CloseStateReply {
+pub struct CloseMemoryReply {
     pub success: bool,
 }
 
 /// Start execution of a canister.
 #[derive(Serialize, Deserialize, Clone)]
-pub struct OpenExecutionRequest {
+pub struct StartExecutionRequest {
     /// Id of the newly created invocation of this canister. This is
     /// used to identify the running instance in callbacks as well as
     /// other operations (status queries etc.).
@@ -243,57 +173,57 @@ pub struct OpenExecutionRequest {
     /// Id of canister to run (see OpenWasm).
     pub wasm_id: WasmId,
 
-    /// State to use (see OpenState).
-    pub state_id: StateId,
+    /// Wasm memory to use (see OpenMemory).
+    pub wasm_memory_id: MemoryId,
+
+    /// Stable memory to use (see OpenMemory).
+    pub stable_memory_id: MemoryId,
 
     /// Arguments to execution (api type, caller, payload, ...).
-    pub exec_input: structs::ExecInput,
+    pub exec_input: SandboxExecInput,
 }
 
-/// Reply to an `OpenExecutionRequest`.
+/// Reply to an `StartExecutionRequest`.
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct OpenExecutionReply {
+pub struct StartExecutionReply {
     pub success: bool,
 }
 
-/// Request type
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct CloseExecutionRequest {
-    /// Id of execution previously created (see OpenExecution)
+/// Resume execution.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ResumeExecutionRequest {
+    /// Id of the previously paused execution.
     pub exec_id: ExecId,
-    /* There used to be a "commit" field in this message. The
-     * intent is that the "post-exec" state on the sandbox
-     * process is immediately formed after execution has finished,
-     * preferably using the data that is still held in the
-     * process.
-     * With the change to have _only_ the replica process perform
-     * writes, this does not work that way and there is no sense
-     * in replica telling sandbox whether to commit.
-     * This comment is only left to explain design intent, and
-     * where to possibly to put a "post-exec commit" command in
-     * case we later want to introduce such optimization again. */
 }
 
-/// Ack `CloseExecutionRequest`.
+/// Reply to an `ResumeExecutionRequest`.
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct CloseExecutionReply {
+pub struct ResumeExecutionReply {
     pub success: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CreateExecutionStateRequest {
+    pub wasm_id: WasmId,
     #[serde(with = "serde_bytes")]
     pub wasm_binary: Vec<u8>,
-    pub canister_root: PathBuf,
+    pub wasm_page_map: PageMapSerialization,
+    pub next_wasm_memory_id: MemoryId,
     pub canister_id: CanisterId,
+}
+
+impl EnumerateInnerFileDescriptors for CreateExecutionStateRequest {
+    fn enumerate_fds<'a>(&'a mut self, fds: &mut Vec<&'a mut std::os::unix::io::RawFd>) {
+        self.wasm_page_map.enumerate_fds(fds);
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CreateExecutionStateSuccessReply {
-    pub wasm_memory_pages: Vec<PageSerialization>,
-    pub wasm_memory_size: NumWasmPages,
+    pub wasm_memory_modifications: MemoryModifications,
     pub exported_globals: Vec<Global>,
     pub exported_functions: BTreeSet<WasmMethod>,
+    pub wasm_metadata: WasmMetadata,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -306,24 +236,24 @@ pub enum Request {
     Terminate(TerminateRequest),
     OpenWasm(OpenWasmRequest),
     CloseWasm(CloseWasmRequest),
-    OpenState(OpenStateRequest),
-    CloseState(CloseStateRequest),
-    OpenExecution(OpenExecutionRequest),
-    CloseExecution(CloseExecutionRequest),
+    OpenMemory(OpenMemoryRequest),
+    CloseMemory(CloseMemoryRequest),
+    StartExecution(StartExecutionRequest),
+    ResumeExecution(ResumeExecutionRequest),
     CreateExecutionState(CreateExecutionStateRequest),
 }
 
 impl EnumerateInnerFileDescriptors for Request {
     fn enumerate_fds<'a>(&'a mut self, fds: &mut Vec<&'a mut std::os::unix::io::RawFd>) {
         match self {
-            Request::OpenState(request) => request.enumerate_fds(fds),
+            Request::OpenMemory(request) => request.enumerate_fds(fds),
+            Request::CreateExecutionState(request) => request.enumerate_fds(fds),
             Request::Terminate(_)
             | Request::OpenWasm(_)
             | Request::CloseWasm(_)
-            | Request::CloseState(_)
-            | Request::OpenExecution(_)
-            | Request::CloseExecution(_)
-            | Request::CreateExecutionState(_) => {}
+            | Request::CloseMemory(_)
+            | Request::StartExecution(_)
+            | Request::ResumeExecution(_) => {}
         }
     }
 }
@@ -335,9 +265,13 @@ pub enum Reply {
     Terminate(TerminateReply),
     OpenWasm(OpenWasmReply),
     CloseWasm(CloseWasmReply),
-    OpenState(OpenStateReply),
-    CloseState(CloseStateReply),
-    OpenExecution(OpenExecutionReply),
-    CloseExecution(CloseExecutionReply),
+    OpenMemory(OpenMemoryReply),
+    CloseMemory(CloseMemoryReply),
+    StartExecution(StartExecutionReply),
+    ResumeExecution(ResumeExecutionReply),
     CreateExecutionState(CreateExecutionStateReply),
+}
+
+impl EnumerateInnerFileDescriptors for Reply {
+    fn enumerate_fds<'a>(&'a mut self, _fds: &mut Vec<&'a mut std::os::unix::io::RawFd>) {}
 }

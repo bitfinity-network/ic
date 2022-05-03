@@ -1,26 +1,29 @@
-use crate::{CheckpointError, CheckpointMetrics};
+use crate::{CheckpointError, CheckpointMetrics, PersistenceError, NUMBER_OF_CHECKPOINT_THREADS};
 use ic_base_types::CanisterId;
-use ic_cow_state::{CowMemoryManager, CowMemoryManagerImpl, MappedState};
+use ic_logger::ReplicaLogger;
 use ic_registry_subnet_type::SubnetType;
-use ic_replicated_state::canister_state::execution_state::SandboxExecutionState;
 use ic_replicated_state::Memory;
 use ic_replicated_state::{
-    canister_state::execution_state::WasmBinary, page_map::PageMap, CanisterMetrics, CanisterState,
-    ExecutionState, NumWasmPages, ReplicatedState, SchedulerState, SystemState,
+    bitcoin_state::{BitcoinState, UtxoSet},
+    canister_state::execution_state::WasmBinary,
+    page_map::PageMap,
+    CanisterMetrics, CanisterState, ExecutionState, NumWasmPages, ReplicatedState, SchedulerState,
+    SystemState,
 };
 use ic_state_layout::{
-    CanisterStateBits, CheckpointLayout, ExecutionStateBits, ReadPolicy, ReadWritePolicy, RwPolicy,
-    StateLayout,
+    BitcoinStateBits, BitcoinStateLayout, CanisterLayout, CanisterStateBits, CheckpointLayout,
+    ExecutionStateBits, ReadPolicy, RwPolicy, StateLayout,
 };
 use ic_types::Height;
-use ic_utils::ic_features::*;
 use ic_utils::thread::parallel_map;
 use std::collections::BTreeMap;
-use std::convert::{From, TryFrom};
-use std::sync::Arc;
+use std::{
+    convert::{From, TryFrom},
+    path::Path,
+};
 
 /// Creates a checkpoint of the node state using specified directory
-/// layout. Returns a new state that is equivalent the to given one
+/// layout. Returns a new state that is equivalent to the given one
 /// and a result of the operation.
 ///
 /// This function uses the provided thread-pool to parallelize expensive
@@ -33,17 +36,18 @@ pub fn make_checkpoint(
     state: &ReplicatedState,
     height: Height,
     layout: &StateLayout,
+    log: &ReplicaLogger,
     metrics: &CheckpointMetrics,
     thread_pool: &mut scoped_threadpool::Pool,
 ) -> Result<ReplicatedState, CheckpointError> {
-    let tip = layout.tip().map_err(CheckpointError::from)?;
+    let tip = layout.tip(height).map_err(CheckpointError::from)?;
 
     {
         let _timer = metrics
             .step_duration
             .with_label_values(&["serialize_to_tip"])
             .start_timer();
-        serialize_to_tip(state, &tip, thread_pool)?;
+        serialize_to_tip(log, state, &tip, thread_pool)?;
     }
 
     let cp = {
@@ -51,7 +55,7 @@ pub fn make_checkpoint(
             .step_duration
             .with_label_values(&["tip_to_checkpoint"])
             .start_timer();
-        layout.tip_to_checkpoint(tip, height, Some(thread_pool))?
+        layout.tip_to_checkpoint(tip, Some(thread_pool))?
     };
 
     let state = {
@@ -66,6 +70,7 @@ pub fn make_checkpoint(
 }
 
 fn serialize_to_tip(
+    log: &ReplicaLogger,
     state: &ReplicatedState,
     tip: &CheckpointLayout<RwPolicy>,
     thread_pool: &mut scoped_threadpool::Pool,
@@ -77,16 +82,20 @@ fn serialize_to_tip(
         .serialize((state.subnet_queues()).into())?;
 
     let results = parallel_map(thread_pool, state.canisters_iter(), |canister_state| {
-        serialize_canister_to_tip(canister_state, tip)
+        serialize_canister_to_tip(log, canister_state, tip)
     });
 
     for result in results.into_iter() {
         result?;
     }
+
+    serialize_bitcoin_state_to_tip(state.bitcoin_testnet(), &tip.bitcoin_testnet()?)?;
+
     Ok(())
 }
 
 fn serialize_canister_to_tip(
+    log: &ReplicaLogger,
     canister_state: &CanisterState,
     tip: &CheckpointLayout<RwPolicy>,
 ) -> Result<(), CheckpointError> {
@@ -97,9 +106,27 @@ fn serialize_canister_to_tip(
 
     let execution_state_bits = match &canister_state.execution_state {
         Some(execution_state) => {
-            canister_layout
-                .wasm()
-                .serialize(&execution_state.wasm_binary.binary)?;
+            let wasm_binary = &execution_state.wasm_binary.binary;
+            match wasm_binary.file() {
+                Some(path) => {
+                    let wasm = canister_layout.wasm();
+                    if !wasm.raw_path().exists() {
+                        ic_state_layout::utils::do_copy(log, path, wasm.raw_path()).map_err(
+                            |io_err| CheckpointError::IoError {
+                                path: path.to_path_buf(),
+                                message: "failed to copy Wasm file".to_string(),
+                                io_err: io_err.to_string(),
+                            },
+                        )?;
+                    }
+                }
+                None => {
+                    // Canister was installed/upgraded. Persist the new wasm binary.
+                    canister_layout
+                        .wasm()
+                        .serialize(&execution_state.wasm_binary.binary)?;
+                }
+            }
             execution_state
                 .wasm_memory
                 .page_map
@@ -109,17 +136,23 @@ fn serialize_canister_to_tip(
                 .page_map
                 .persist_and_sync_delta(&canister_layout.stable_memory_blob())?;
 
-            execution_state.cow_mem_mgr.checkpoint();
-
             Some(ExecutionStateBits {
                 exported_globals: execution_state.exported_globals.clone(),
                 heap_size: execution_state.wasm_memory.size,
                 exports: execution_state.exports.clone(),
                 last_executed_round: execution_state.last_executed_round,
+                metadata: execution_state.metadata.clone(),
             })
         }
         None => None,
     };
+    // As the long executions get aborted at the checkpoint, the `priority_credit`
+    // and the `long_execution_progress` must be zeros.
+    assert_eq!(canister_state.scheduler_state.priority_credit, 0.into());
+    assert_eq!(
+        canister_state.scheduler_state.long_execution_progress,
+        0.into()
+    );
     canister_layout
         .canister()
         .serialize(
@@ -131,7 +164,7 @@ fn serialize_canister_to_tip(
                 accumulated_priority: canister_state.scheduler_state.accumulated_priority,
                 memory_allocation: canister_state.system_state.memory_allocation,
                 freeze_threshold: canister_state.system_state.freeze_threshold,
-                cycles_balance: canister_state.system_state.cycles_balance,
+                cycles_balance: canister_state.system_state.balance(),
                 execution_state_bits,
                 status: canister_state.system_state.status.clone(),
                 scheduled_as_first: canister_state
@@ -158,10 +191,57 @@ fn serialize_canister_to_tip(
                     .map(|es| es.stable_memory.size)
                     .unwrap_or_else(|| NumWasmPages::from(0)),
                 heap_delta_debit: canister_state.scheduler_state.heap_delta_debit,
+                install_code_debit: canister_state.scheduler_state.install_code_debit,
             }
             .into(),
         )
         .map_err(CheckpointError::from)
+}
+
+fn serialize_bitcoin_state_to_tip(
+    state: &BitcoinState,
+    layout: &BitcoinStateLayout<RwPolicy>,
+) -> Result<(), CheckpointError> {
+    state
+        .utxo_set
+        .utxos_small
+        .persist_and_sync_delta(&layout.utxos_small())?;
+
+    state
+        .utxo_set
+        .utxos_medium
+        .persist_and_sync_delta(&layout.utxos_medium())?;
+
+    state
+        .utxo_set
+        .address_outpoints
+        .persist_and_sync_delta(&layout.address_outpoints())?;
+
+    layout
+        .bitcoin_state()
+        .serialize(
+            // TODO(EXC-1076): Remove unnecessary clone.
+            (&BitcoinStateBits {
+                adapter_queues: state.adapter_queues.clone(),
+                unstable_blocks: state.unstable_blocks.clone(),
+                stable_height: state.stable_height,
+                network: state.utxo_set.network,
+                utxos_large: state.utxo_set.utxos_large.clone(),
+            })
+                .into(),
+        )
+        .map_err(CheckpointError::from)
+}
+
+/// Calls [load_checkpoint] with a newly created thread pool.
+/// See [load_checkpoint] for further details.
+pub fn load_checkpoint_parallel<P: ReadPolicy + Send + Sync>(
+    checkpoint_layout: &CheckpointLayout<P>,
+    own_subnet_type: SubnetType,
+) -> Result<ReplicatedState, CheckpointError> {
+    let mut thread_pool = scoped_threadpool::Pool::new(NUMBER_OF_CHECKPOINT_THREADS);
+
+    load_checkpoint(checkpoint_layout, own_subnet_type, Some(&mut thread_pool))
 }
 
 /// loads the node state heighted with `height` using the specified
@@ -211,29 +291,32 @@ pub fn load_checkpoint<P: ReadPolicy + Send + Sync>(
         }
     }
 
+    let bitcoin_testnet = load_bitcoin_state(checkpoint_layout)?;
+
     let state = ReplicatedState::new_from_checkpoint(
         canister_states,
         metadata,
         subnet_queues,
         // Consensus queue needs to be empty at the end of every round.
         Vec::new(),
+        bitcoin_testnet,
         checkpoint_layout.raw_path().into(),
     );
 
     Ok(state)
 }
 
-fn load_canister_state_from_checkpoint<P: ReadPolicy>(
-    checkpoint_layout: &CheckpointLayout<P>,
+pub fn load_canister_state<P: ReadPolicy>(
+    canister_layout: &CanisterLayout<P>,
     canister_id: &CanisterId,
+    height: Height,
 ) -> Result<CanisterState, CheckpointError> {
     let into_checkpoint_error =
         |field: String, err: ic_protobuf::proxy::ProxyDecodeError| CheckpointError::ProtoError {
-            path: checkpoint_layout.raw_path().into(),
+            path: canister_layout.raw_path(),
             field,
             proto_err: err.to_string(),
         };
-    let canister_layout = checkpoint_layout.canister(canister_id)?;
     let canister_state_bits: CanisterStateBits =
         CanisterStateBits::try_from(canister_layout.canister().deserialize()?).map_err(|err| {
             into_checkpoint_error(
@@ -241,22 +324,17 @@ fn load_canister_state_from_checkpoint<P: ReadPolicy>(
                 err,
             )
         })?;
+
     let session_nonce = None;
 
     let execution_state = match canister_state_bits.execution_state_bits {
         Some(execution_state_bits) => {
             let wasm_memory = Memory::new(
-                PageMap::open(
-                    &canister_layout.vmemory_0(),
-                    Some(checkpoint_layout.height()),
-                )?,
+                PageMap::open(&canister_layout.vmemory_0(), Some(height))?,
                 execution_state_bits.heap_size,
             );
             let stable_memory = Memory::new(
-                PageMap::open(
-                    &canister_layout.stable_memory_blob(),
-                    Some(checkpoint_layout.height()),
-                )?,
+                PageMap::open(&canister_layout.stable_memory_blob(), Some(height))?,
                 canister_state_bits.stable_memory_size,
             );
             let wasm_binary = WasmBinary::new(canister_layout.wasm().deserialize()?);
@@ -269,12 +347,8 @@ fn load_canister_state_from_checkpoint<P: ReadPolicy>(
                 stable_memory,
                 exported_globals: execution_state_bits.exported_globals,
                 exports: execution_state_bits.exports,
+                metadata: execution_state_bits.metadata,
                 last_executed_round: execution_state_bits.last_executed_round,
-                cow_mem_mgr: Arc::new(CowMemoryManagerImpl::open_readonly(
-                    canister_layout.raw_path(),
-                )),
-                mapped_state: None,
-                sandbox_state: SandboxExecutionState::new(),
             })
         }
         None => None,
@@ -315,83 +389,70 @@ fn load_canister_state_from_checkpoint<P: ReadPolicy>(
             last_full_execution_round: canister_state_bits.last_full_execution_round,
             compute_allocation: canister_state_bits.compute_allocation,
             accumulated_priority: canister_state_bits.accumulated_priority,
+            // Longs executions get aborted at the checkpoint,
+            // so both the credit and the execution progress below are zeros.
+            priority_credit: 0.into(),
+            long_execution_progress: 0.into(),
             heap_delta_debit: canister_state_bits.heap_delta_debit,
+            install_code_debit: canister_state_bits.install_code_debit,
         },
     })
 }
 
-pub fn handle_disk_format_changes<P: ReadWritePolicy>(
-    layout: &CheckpointLayout<P>,
-    state: &ReplicatedState,
-) -> Result<bool, CheckpointError> {
-    let mut needs_reload = false;
-    for (canister, canister_state) in state.canister_states.iter() {
-        if canister_state.execution_state.is_some() {
-            let canister_layout = layout.canister(canister)?;
-            let execution_state = canister_state.execution_state.as_ref().unwrap();
-
-            let canister_base = canister_layout.raw_path();
-            let is_cow = CowMemoryManagerImpl::is_cow(&canister_base);
-            let should_upgrade =
-                !is_cow && cow_state_feature::is_enabled(cow_state_feature::cow_state);
-            let should_downgrade =
-                is_cow && !cow_state_feature::is_enabled(cow_state_feature::cow_state);
-
-            if should_upgrade {
-                let cow_mem_mgr = CowMemoryManagerImpl::open_readwrite(canister_layout.raw_path());
-
-                let mut pages_to_write = Vec::new();
-                let mapped_state = cow_mem_mgr.get_map();
-                for (idx, data) in execution_state.wasm_memory.page_map.host_pages_iter() {
-                    pages_to_write.push(idx.get());
-                    mapped_state.update_heap_page(idx.get(), data);
-                }
-                mapped_state.soft_commit(pages_to_write.as_mut_slice());
-                cow_mem_mgr.create_snapshot(execution_state.last_executed_round.get());
-            } else if should_downgrade {
-                let cow_mem_mgr = CowMemoryManagerImpl::open_readonly(canister_layout.raw_path());
-                let mapped_state = cow_mem_mgr.get_map();
-                let heap_base = mapped_state.get_heap_base();
-                let heap_len = mapped_state.get_heap_len();
-                mapped_state.make_heap_accessible();
-
-                let contents = unsafe { std::slice::from_raw_parts(heap_base, heap_len) };
-
-                let memory_path = &canister_layout.vmemory_0();
-
-                std::fs::write(memory_path, contents).map_err(|err| CheckpointError::IoError {
-                    path: memory_path.clone(),
-                    message: "Failed to overwrite file".to_string(),
-                    io_err: err.to_string(),
-                })?;
-
-                CowMemoryManagerImpl::purge(&canister_base);
-
-                // We should reload the state from disk after this format change
-                needs_reload = true;
-            }
-        }
-    }
-    Ok(needs_reload)
+fn load_canister_state_from_checkpoint<P: ReadPolicy>(
+    checkpoint_layout: &CheckpointLayout<P>,
+    canister_id: &CanisterId,
+) -> Result<CanisterState, CheckpointError> {
+    let canister_layout = checkpoint_layout.canister(canister_id)?;
+    load_canister_state::<P>(&canister_layout, canister_id, checkpoint_layout.height())
 }
 
-// This function prepares the passed in state as a mutable tip. Primarily it
-// reopens the cow state in writable mode.
-pub fn reopen_state_as_tip<P: ReadWritePolicy>(
-    layout: &CheckpointLayout<P>,
-    state: &mut ReplicatedState,
-) -> Result<(), CheckpointError> {
-    for (canister, canister_state) in state.canister_states.iter_mut() {
-        if canister_state.execution_state.is_some() {
-            let canister_layout = layout.canister(canister)?;
-            let mut execution_state = canister_state.execution_state.take().unwrap();
-            execution_state.cow_mem_mgr = Arc::new(CowMemoryManagerImpl::open_readwrite(
-                canister_layout.raw_path(),
-            ));
-            canister_state.execution_state = Some(execution_state);
-        }
+fn load_bitcoin_state<P: ReadPolicy>(
+    checkpoint_layout: &CheckpointLayout<P>,
+) -> Result<BitcoinState, CheckpointError> {
+    let layout = checkpoint_layout.bitcoin_testnet()?;
+    let height = checkpoint_layout.height();
+
+    let into_checkpoint_error =
+        |field: String, err: ic_protobuf::proxy::ProxyDecodeError| CheckpointError::ProtoError {
+            path: layout.raw_path(),
+            field,
+            proto_err: err.to_string(),
+        };
+
+    let bitcoin_state_proto = layout.bitcoin_state().deserialize_opt()?;
+
+    let bitcoin_state_bits: BitcoinStateBits =
+        BitcoinStateBits::try_from(bitcoin_state_proto.unwrap_or_default())
+            .map_err(|err| into_checkpoint_error(String::from("BitcoinStateBits"), err))?;
+
+    let utxos_small = load_or_create_pagemap(&layout.utxos_small(), Some(height))?;
+    let utxos_medium = load_or_create_pagemap(&layout.utxos_medium(), Some(height))?;
+    let address_outpoints = load_or_create_pagemap(&layout.address_outpoints(), Some(height))?;
+
+    Ok(BitcoinState {
+        adapter_queues: bitcoin_state_bits.adapter_queues,
+        unstable_blocks: bitcoin_state_bits.unstable_blocks,
+        stable_height: bitcoin_state_bits.stable_height,
+        utxo_set: UtxoSet {
+            network: bitcoin_state_bits.network,
+            utxos_small,
+            utxos_medium,
+            utxos_large: bitcoin_state_bits.utxos_large,
+            address_outpoints,
+        },
+    })
+}
+
+fn load_or_create_pagemap(
+    path: &Path,
+    height: Option<Height>,
+) -> Result<PageMap, PersistenceError> {
+    if path.exists() {
+        PageMap::open(path, height)
+    } else {
+        Ok(PageMap::default())
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -399,11 +460,12 @@ mod tests {
     use super::*;
     use crate::NUMBER_OF_CHECKPOINT_THREADS;
     use ic_base_types::NumSeconds;
+    use ic_ic00_types::CanisterStatusType;
     use ic_registry_subnet_type::SubnetType;
     use ic_replicated_state::{
-        canister_state::execution_state::WasmBinary, page_map, testing::ReplicatedStateTesting,
-        CallContextManager, CanisterStatus, ExecutionState, ExportedFunctions, NumWasmPages,
-        PageIndex,
+        canister_state::execution_state::WasmBinary, canister_state::execution_state::WasmMetadata,
+        page_map, testing::ReplicatedStateTesting, CallContextManager, CanisterStatus,
+        ExecutionState, ExportedFunctions, NumWasmPages, PageIndex,
     };
     use ic_sys::PAGE_SIZE;
     use ic_test_utilities::{
@@ -415,8 +477,8 @@ mod tests {
         with_test_replica_logger,
     };
     use ic_types::messages::StopCanisterContext;
-    use ic_types::{CanisterId, CanisterStatusType, Cycles, ExecutionRound, Height};
-    use ic_wasm_types::BinaryEncodedWasm;
+    use ic_types::{CanisterId, Cycles, ExecutionRound, Height};
+    use ic_wasm_types::CanisterModule;
     use std::collections::BTreeSet;
     use tempfile::Builder;
 
@@ -431,8 +493,8 @@ mod tests {
         scoped_threadpool::Pool::new(NUMBER_OF_CHECKPOINT_THREADS)
     }
 
-    fn empty_wasm() -> BinaryEncodedWasm {
-        BinaryEncodedWasm::new(vec![
+    fn empty_wasm() -> CanisterModule {
+        CanisterModule::new(vec![
             0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x00, 0x08, 0x04, 0x6e, 0x61, 0x6d,
             0x65, 0x02, 0x01, 0x00,
         ])
@@ -443,10 +505,7 @@ mod tests {
         let delta = &[(PageIndex::from(0), &contents)];
         let mut page_map = PageMap::new();
         page_map.update(delta);
-        Memory {
-            page_map,
-            size: NumWasmPages::from(1),
-        }
+        Memory::new(page_map, NumWasmPages::from(1))
     }
 
     fn mark_readonly(path: &std::path::Path) -> std::io::Result<()> {
@@ -456,6 +515,7 @@ mod tests {
     }
 
     fn make_checkpoint_and_get_state(
+        log: &ReplicaLogger,
         state: &ReplicatedState,
         height: Height,
         layout: &StateLayout,
@@ -464,6 +524,7 @@ mod tests {
             state,
             height,
             layout,
+            log,
             &checkpoint_metrics(),
             &mut thread_pool(),
         )
@@ -475,7 +536,7 @@ mod tests {
         with_test_replica_logger(|log| {
             let tmp = Builder::new().prefix("test").tempdir().unwrap();
             let root = tmp.path().to_path_buf();
-            let layout = StateLayout::new(log, root.clone());
+            let layout = StateLayout::new(log.clone(), root.clone());
 
             const HEIGHT: Height = Height::new(42);
             let canister_id = canister_test_id(10);
@@ -492,7 +553,7 @@ mod tests {
                 NumSeconds::from(100_000),
             ));
 
-            let _state = make_checkpoint_and_get_state(&state, HEIGHT, &layout);
+            let _state = make_checkpoint_and_get_state(&log, &state, HEIGHT, &layout);
 
             // Ensure that checkpoint data is now available via layout API.
             assert_eq!(layout.checkpoint_heights().unwrap(), vec![HEIGHT]);
@@ -534,7 +595,7 @@ mod tests {
             let tmp = Builder::new().prefix("test").tempdir().unwrap();
             let root = tmp.path().to_path_buf();
             let checkpoints_dir = root.join("checkpoints");
-            let layout = StateLayout::new(log, root.clone());
+            let layout = StateLayout::new(log.clone(), root.clone());
 
             const HEIGHT: Height = Height::new(42);
             let canister_id = canister_test_id(10);
@@ -560,6 +621,7 @@ mod tests {
                 &state,
                 HEIGHT,
                 &layout,
+                &log,
                 &checkpoint_metrics(),
                 &mut thread_pool(),
             ) {
@@ -577,13 +639,10 @@ mod tests {
         with_test_replica_logger(|log| {
             let tmp = Builder::new().prefix("test").tempdir().unwrap();
             let root = tmp.path().to_path_buf();
-            let layout = StateLayout::new(log, root.clone());
+            let layout = StateLayout::new(log.clone(), root.clone());
 
             const HEIGHT: Height = Height::new(42);
             let canister_id: CanisterId = canister_test_id(10);
-
-            let tip = layout.tip().unwrap();
-            let can_layout = tip.canister(&canister_id);
 
             let wasm = empty_wasm();
             let wasm_memory = one_page_of(1);
@@ -604,12 +663,8 @@ mod tests {
                 stable_memory,
                 exported_globals: vec![],
                 exports: ExportedFunctions::new(BTreeSet::new()),
+                metadata: WasmMetadata::default(),
                 last_executed_round: ExecutionRound::from(0),
-                cow_mem_mgr: Arc::new(CowMemoryManagerImpl::open_readwrite(
-                    can_layout.unwrap().raw_path(),
-                )),
-                mapped_state: None,
-                sandbox_state: SandboxExecutionState::new(),
             };
             canister_state.execution_state = Some(execution_state);
 
@@ -617,7 +672,7 @@ mod tests {
             let mut state =
                 ReplicatedState::new_rooted_at(subnet_test_id(1), own_subnet_type, root);
             state.put_canister_state(canister_state);
-            let _state = make_checkpoint_and_get_state(&state, HEIGHT, &layout);
+            let _state = make_checkpoint_and_get_state(&log, &state, HEIGHT, &layout);
 
             let recovered_state = load_checkpoint(
                 &layout.checkpoint(HEIGHT).unwrap(),
@@ -674,12 +729,13 @@ mod tests {
         with_test_replica_logger(|log| {
             let tmp = Builder::new().prefix("test").tempdir().unwrap();
             let root = tmp.path().to_path_buf();
-            let layout = StateLayout::new(log, root);
+            let layout = StateLayout::new(log.clone(), root);
 
             const HEIGHT: Height = Height::new(42);
             let own_subnet_type = SubnetType::Application;
 
             let _state = make_checkpoint_and_get_state(
+                &log,
                 &ReplicatedState::new_rooted_at(
                     subnet_test_id(1),
                     own_subnet_type,
@@ -728,7 +784,7 @@ mod tests {
 
             mark_readonly(&root).unwrap();
 
-            let layout = StateLayout::new(log, root);
+            let layout = StateLayout::new(log.clone(), root);
 
             let own_subnet_type = SubnetType::Application;
             const HEIGHT: Height = Height::new(42);
@@ -750,6 +806,7 @@ mod tests {
                 &state,
                 HEIGHT,
                 &layout,
+                &log,
                 &checkpoint_metrics(),
                 &mut thread_pool(),
             );
@@ -772,7 +829,7 @@ mod tests {
         with_test_replica_logger(|log| {
             let tmp = Builder::new().prefix("test").tempdir().unwrap();
             let root = tmp.path().to_path_buf();
-            let layout = StateLayout::new(log, root);
+            let layout = StateLayout::new(log.clone(), root);
 
             const HEIGHT: Height = Height::new(42);
             let canister_id: CanisterId = canister_test_id(10);
@@ -804,7 +861,7 @@ mod tests {
                 "NOT_USED".into(),
             );
             state.put_canister_state(canister_state);
-            let _state = make_checkpoint_and_get_state(&state, HEIGHT, &layout);
+            let _state = make_checkpoint_and_get_state(&log, &state, HEIGHT, &layout);
 
             let recovered_state = load_checkpoint(
                 &layout.checkpoint(HEIGHT).unwrap(),
@@ -831,7 +888,7 @@ mod tests {
         with_test_replica_logger(|log| {
             let tmp = Builder::new().prefix("test").tempdir().unwrap();
             let root = tmp.path().to_path_buf();
-            let layout = StateLayout::new(log, root);
+            let layout = StateLayout::new(log.clone(), root);
 
             const HEIGHT: Height = Height::new(42);
             let canister_id: CanisterId = canister_test_id(10);
@@ -855,7 +912,7 @@ mod tests {
                 "NOT_USED".into(),
             );
             state.put_canister_state(canister_state);
-            let _state = make_checkpoint_and_get_state(&state, HEIGHT, &layout);
+            let _state = make_checkpoint_and_get_state(&log, &state, HEIGHT, &layout);
 
             let loaded_state = load_checkpoint(
                 &layout.checkpoint(HEIGHT).unwrap(),
@@ -876,7 +933,7 @@ mod tests {
         with_test_replica_logger(|log| {
             let tmp = Builder::new().prefix("test").tempdir().unwrap();
             let root = tmp.path().to_path_buf();
-            let layout = StateLayout::new(log, root);
+            let layout = StateLayout::new(log.clone(), root);
 
             const HEIGHT: Height = Height::new(42);
             let canister_id: CanisterId = canister_test_id(10);
@@ -900,7 +957,7 @@ mod tests {
                 "NOT_USED".into(),
             );
             state.put_canister_state(canister_state);
-            let _state = make_checkpoint_and_get_state(&state, HEIGHT, &layout);
+            let _state = make_checkpoint_and_get_state(&log, &state, HEIGHT, &layout);
 
             let recovered_state = load_checkpoint(
                 &layout.checkpoint(HEIGHT).unwrap(),
@@ -921,7 +978,7 @@ mod tests {
         with_test_replica_logger(|log| {
             let tmp = Builder::new().prefix("test").tempdir().unwrap();
             let root = tmp.path().to_path_buf();
-            let layout = StateLayout::new(log, root);
+            let layout = StateLayout::new(log.clone(), root);
 
             const HEIGHT: Height = Height::new(42);
 
@@ -940,7 +997,7 @@ mod tests {
             );
 
             let original_state = state.clone();
-            let _state = make_checkpoint_and_get_state(&state, HEIGHT, &layout);
+            let _state = make_checkpoint_and_get_state(&log, &state, HEIGHT, &layout);
 
             let recovered_state = load_checkpoint(
                 &layout.checkpoint(HEIGHT).unwrap(),
@@ -952,6 +1009,91 @@ mod tests {
             assert_eq!(
                 original_state.subnet_queues(),
                 recovered_state.subnet_queues()
+            );
+        });
+    }
+
+    #[test]
+    fn can_recover_bitcoin_state() {
+        use ic_btc_types_internal::{BitcoinAdapterRequestWrapper, GetSuccessorsRequest};
+        use ic_registry_subnet_features::BitcoinFeature;
+
+        with_test_replica_logger(|log| {
+            let tmp = Builder::new().prefix("test").tempdir().unwrap();
+            let root = tmp.path().to_path_buf();
+            let layout = StateLayout::new(log.clone(), root);
+
+            const HEIGHT: Height = Height::new(42);
+
+            let own_subnet_type = SubnetType::Application;
+            let subnet_id = subnet_test_id(1);
+            let mut state =
+                ReplicatedState::new_rooted_at(subnet_id, own_subnet_type, "NOT_USED".into());
+
+            // Enable the bitcoin feature to be able to mutate its state.
+            state.metadata.own_subnet_features.bitcoin_testnet_feature =
+                Some(BitcoinFeature::Enabled);
+
+            // Make some change in the Bitcoin state to later verify that it gets recovered.
+            state
+                .push_request_bitcoin_testnet(BitcoinAdapterRequestWrapper::GetSuccessorsRequest(
+                    GetSuccessorsRequest {
+                        processed_block_hashes: vec![],
+                        anchor: vec![],
+                    },
+                ))
+                .unwrap();
+
+            let original_state = state.clone();
+            let _state = make_checkpoint_and_get_state(&log, &state, HEIGHT, &layout);
+
+            let recovered_state = load_checkpoint(
+                &layout.checkpoint(HEIGHT).unwrap(),
+                own_subnet_type,
+                Some(&mut thread_pool()),
+            )
+            .unwrap();
+
+            assert_eq!(
+                recovered_state.bitcoin_testnet(),
+                original_state.bitcoin_testnet(),
+            );
+        });
+    }
+
+    #[test]
+    fn can_recover_bitcoin_page_maps() {
+        with_test_replica_logger(|log| {
+            let tmp = Builder::new().prefix("test").tempdir().unwrap();
+            let root = tmp.path().to_path_buf();
+            let layout = StateLayout::new(log.clone(), root);
+
+            const HEIGHT: Height = Height::new(42);
+
+            let own_subnet_type = SubnetType::Application;
+            let subnet_id = subnet_test_id(1);
+            let mut state =
+                ReplicatedState::new_rooted_at(subnet_id, own_subnet_type, "NOT_USED".into());
+
+            // Make some change in the Bitcoin page maps to later verify they get recovered.
+            state.bitcoin_testnet_mut().utxo_set.utxos_small = PageMap::from(&[1, 2, 3, 4][..]);
+            state.bitcoin_testnet_mut().utxo_set.utxos_medium = PageMap::from(&[5, 6, 7, 8][..]);
+            state.bitcoin_testnet_mut().utxo_set.address_outpoints =
+                PageMap::from(&[9, 10, 11, 12][..]);
+
+            let original_state = state.clone();
+            let _state = make_checkpoint_and_get_state(&log, &state, HEIGHT, &layout);
+
+            let recovered_state = load_checkpoint(
+                &layout.checkpoint(HEIGHT).unwrap(),
+                own_subnet_type,
+                Some(&mut thread_pool()),
+            )
+            .unwrap();
+
+            assert_eq!(
+                recovered_state.bitcoin_testnet(),
+                original_state.bitcoin_testnet()
             );
         });
     }

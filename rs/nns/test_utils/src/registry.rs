@@ -9,11 +9,12 @@ use prost::Message;
 use canister_test::Canister;
 use ic_base_types::{CanisterId, PrincipalId, SubnetId};
 use ic_crypto::utils::get_node_keys_or_generate_if_missing;
-use ic_nns_common::registry::encode_or_panic;
-use ic_nns_constants::ids::{
+use ic_nervous_system_common_test_keys::{
     TEST_USER1_PRINCIPAL, TEST_USER2_PRINCIPAL, TEST_USER3_PRINCIPAL, TEST_USER4_PRINCIPAL,
     TEST_USER5_PRINCIPAL, TEST_USER6_PRINCIPAL, TEST_USER7_PRINCIPAL,
 };
+use ic_nns_common::registry::encode_or_panic;
+use ic_protobuf::registry::crypto::v1::{PublicKey, X509PublicKeyCert};
 use ic_protobuf::{
     crypto::v1::NodePublicKeys,
     registry::{
@@ -21,15 +22,14 @@ use ic_protobuf::{
         node_operator::v1::NodeOperatorRecord,
         replica_version::v1::{BlessedReplicaVersions, ReplicaVersionRecord},
         routing_table::v1::RoutingTable as RoutingTablePB,
-        subnet::v1::CatchUpPackageContents,
-        subnet::v1::{SubnetListRecord, SubnetRecord},
+        subnet::v1::{CatchUpPackageContents, SubnetListRecord, SubnetRecord},
     },
 };
 use ic_registry_keys::{
     make_blessed_replica_version_key, make_catch_up_package_contents_key, make_crypto_node_key,
-    make_crypto_threshold_signing_pubkey_key, make_node_operator_record_key, make_node_record_key,
-    make_replica_version_key, make_routing_table_record_key, make_subnet_list_record_key,
-    make_subnet_record_key,
+    make_crypto_threshold_signing_pubkey_key, make_crypto_tls_cert_key,
+    make_node_operator_record_key, make_node_record_key, make_replica_version_key,
+    make_routing_table_record_key, make_subnet_list_record_key, make_subnet_record_key,
 };
 use ic_registry_routing_table::{CanisterIdRange, RoutingTable};
 use ic_registry_subnet_type::SubnetType;
@@ -48,9 +48,9 @@ use ic_test_utilities::{
 use ic_types::p2p::build_default_gossip_config;
 use ic_types::{crypto::KeyPurpose, NodeId, ReplicaVersion};
 use on_wire::bytes;
-use registry_canister::mutations::{
-    common::decode_registry_value,
-    do_add_node::{connection_endpoint_from_string, flow_endpoint_from_string, AddNodePayload},
+use registry_canister::mutations::common::decode_registry_value;
+use registry_canister::mutations::node_management::do_add_node::{
+    connection_endpoint_from_string, flow_endpoint_from_string, AddNodePayload,
 };
 
 /// ID used in multiple tests.
@@ -84,6 +84,63 @@ pub async fn get_value<T: Message + Default>(registry: &Canister<'_>, key: &[u8]
     .unwrap_or_else(|_| T::default())
 }
 
+pub async fn get_node_record(registry: &Canister<'_>, node_id: NodeId) -> NodeRecord {
+    get_value::<NodeRecord>(registry, make_node_record_key(node_id).as_bytes()).await
+}
+
+pub async fn get_committee_signing_key(registry: &Canister<'_>, node_id: NodeId) -> PublicKey {
+    get_value::<PublicKey>(
+        registry,
+        make_crypto_node_key(node_id, KeyPurpose::CommitteeSigning).as_bytes(),
+    )
+    .await
+}
+
+pub async fn get_node_signing_key(registry: &Canister<'_>, node_id: NodeId) -> PublicKey {
+    get_value::<PublicKey>(
+        registry,
+        make_crypto_node_key(node_id, KeyPurpose::NodeSigning).as_bytes(),
+    )
+    .await
+}
+
+pub async fn get_dkg_dealing_key(registry: &Canister<'_>, node_id: NodeId) -> PublicKey {
+    get_value::<PublicKey>(
+        registry,
+        make_crypto_node_key(node_id, KeyPurpose::DkgDealingEncryption).as_bytes(),
+    )
+    .await
+}
+
+pub async fn get_transport_tls_certificate(
+    registry: &Canister<'_>,
+    node_id: NodeId,
+) -> X509PublicKeyCert {
+    get_value::<X509PublicKeyCert>(registry, make_crypto_tls_cert_key(node_id).as_bytes()).await
+}
+
+pub async fn get_idkg_dealing_encryption_key(
+    registry: &Canister<'_>,
+    node_id: NodeId,
+) -> PublicKey {
+    get_value::<PublicKey>(
+        registry,
+        make_crypto_node_key(node_id, KeyPurpose::IDkgMEGaEncryption).as_bytes(),
+    )
+    .await
+}
+
+pub async fn get_node_operator_record(
+    registry: &Canister<'_>,
+    principal_id: PrincipalId,
+) -> NodeOperatorRecord {
+    get_value::<NodeOperatorRecord>(
+        registry,
+        make_node_operator_record_key(principal_id).as_bytes(),
+    )
+    .await
+}
+
 /// Inserts a value into the registry.
 pub async fn insert_value<T: Message + Default>(registry: &Canister<'_>, key: &[u8], value: &T) {
     let response_bytes = registry
@@ -110,6 +167,19 @@ pub async fn insert_value<T: Message + Default>(registry: &Canister<'_>, key: &[
     );
 }
 
+pub fn routing_table_mutation(rt: &RoutingTable) -> RegistryMutation {
+    use ic_protobuf::registry::routing_table::v1 as pb;
+
+    let rt_pb = pb::RoutingTable::from(rt);
+    let mut buf = vec![];
+    rt_pb.encode(&mut buf).unwrap();
+    RegistryMutation {
+        mutation_type: Type::Upsert as i32,
+        key: make_routing_table_record_key().into_bytes(),
+        value: buf,
+    }
+}
+
 /// Returns a mutation that sets the initial state of the registry to be
 /// compliant with its invariants.
 pub fn invariant_compliant_mutation() -> Vec<RegistryMutation> {
@@ -117,10 +187,6 @@ pub fn invariant_compliant_mutation() -> Vec<RegistryMutation> {
     let node_pid = node_test_id(TEST_ID);
     let subnet_pid = subnet_test_id(TEST_ID);
 
-    let node_operator = NodeOperatorRecord {
-        node_allowance: 5,
-        ..Default::default()
-    };
     let connection_endpoint = ConnectionEndpoint {
         ip_addr: "128.0.0.1".to_string(),
         port: 12345,
@@ -136,10 +202,6 @@ pub fn invariant_compliant_mutation() -> Vec<RegistryMutation> {
     const VERSION_REPLICA_ID: &str = "version_42";
     const MOCK_HASH: &str = "d1bc8d3ba4afc7e109612cb73acbdddac052c93025aa1f82942edabb7deb82a1";
     let replica_version = ReplicaVersionRecord {
-        sha256_hex: MOCK_HASH.into(),
-        binary_url: "http://megaupload.com/replica_version_42_definitely_not_a_scam".to_string(),
-        node_manager_binary_url: "http://nodemanager.tar.gz".into(),
-        node_manager_sha256_hex: MOCK_HASH.into(),
         release_package_url: "http://release_package.tar.gz".into(),
         release_package_sha256_hex: MOCK_HASH.into(),
     };
@@ -161,35 +223,24 @@ pub fn invariant_compliant_mutation() -> Vec<RegistryMutation> {
 
     vec![
         insert(
-            make_subnet_list_record_key().as_bytes().to_vec(),
+            make_subnet_list_record_key().as_bytes(),
             encode_or_panic(&subnet_list),
         ),
         insert(
-            make_subnet_record_key(subnet_pid).as_bytes().to_vec(),
+            make_subnet_record_key(subnet_pid).as_bytes(),
             encode_or_panic(&system_subnet),
         ),
+        routing_table_mutation(&RoutingTable::default()),
         insert(
-            make_routing_table_record_key().as_bytes().to_vec(),
-            encode_or_panic(&RoutingTablePB::default()),
-        ),
-        insert(
-            make_node_operator_record_key(node_operator_pid.get())
-                .as_bytes()
-                .to_vec(),
-            encode_or_panic(&node_operator),
-        ),
-        insert(
-            make_node_record_key(node_pid).as_bytes().to_vec(),
+            make_node_record_key(node_pid).as_bytes(),
             encode_or_panic(&node),
         ),
         insert(
-            make_replica_version_key(VERSION_REPLICA_ID)
-                .as_bytes()
-                .to_vec(),
+            make_replica_version_key(VERSION_REPLICA_ID).as_bytes(),
             encode_or_panic(&replica_version),
         ),
         insert(
-            make_blessed_replica_version_key().as_bytes().to_vec(),
+            make_blessed_replica_version_key().as_bytes(),
             encode_or_panic(&blessed_replica_version),
         ),
     ]
@@ -250,10 +301,6 @@ pub fn initial_mutations_for_a_multinode_nns_subnet() -> Vec<RegistryMutation> {
     const VERSION_REPLICA_ID: &str = "version_42";
     const MOCK_HASH: &str = "d1bc8d3ba4afc7e109612cb73acbdddac052c93025aa1f82942edabb7deb82a1";
     let replica_version = ReplicaVersionRecord {
-        sha256_hex: MOCK_HASH.into(),
-        binary_url: "http://megaupload.com/replica_version_42_definitely_not_a_scam".to_string(),
-        node_manager_binary_url: "http://nodemanager.tar.gz".into(),
-        node_manager_sha256_hex: MOCK_HASH.into(),
         release_package_url: "http://release_package.tar.gz".into(),
         release_package_sha256_hex: MOCK_HASH.into(),
     };
@@ -280,34 +327,33 @@ pub fn initial_mutations_for_a_multinode_nns_subnet() -> Vec<RegistryMutation> {
         ..Default::default()
     };
 
-    let routing_table = RoutingTable::new(btreemap! {
+    let routing_table = RoutingTable::try_from(btreemap! {
         CanisterIdRange {
            start: CanisterId::from(0),
            end: CanisterId::from(u64::MAX),
         } => nns_subnet_id,
-    });
+    })
+    .unwrap();
 
     let mut mutations = vec![
         insert(
-            make_subnet_list_record_key().as_bytes().to_vec(),
+            make_subnet_list_record_key().as_bytes(),
             encode_or_panic(&subnet_list),
         ),
         insert(
-            make_subnet_record_key(nns_subnet_id).as_bytes().to_vec(),
+            make_subnet_record_key(nns_subnet_id).as_bytes(),
             encode_or_panic(&system_subnet),
         ),
         insert(
-            make_routing_table_record_key().as_bytes().to_vec(),
+            make_routing_table_record_key().as_bytes(),
             encode_or_panic(&RoutingTablePB::try_from(routing_table).unwrap()),
         ),
         insert(
-            make_replica_version_key(VERSION_REPLICA_ID)
-                .as_bytes()
-                .to_vec(),
+            make_replica_version_key(VERSION_REPLICA_ID).as_bytes(),
             encode_or_panic(&replica_version),
         ),
         insert(
-            make_blessed_replica_version_key().as_bytes().to_vec(),
+            make_blessed_replica_version_key().as_bytes(),
             encode_or_panic(&blessed_replica_version),
         ),
     ];
@@ -317,8 +363,7 @@ pub fn initial_mutations_for_a_multinode_nns_subnet() -> Vec<RegistryMutation> {
             make_node_operator_record_key(
                 PrincipalId::try_from(&nor.node_operator_principal_id).unwrap(),
             )
-            .as_bytes()
-            .to_vec(),
+            .as_bytes(),
             encode_or_panic(nor),
         ));
     }
@@ -333,7 +378,7 @@ pub fn initial_mutations_for_a_multinode_nns_subnet() -> Vec<RegistryMutation> {
         (nr7_pid, nr7),
     ] {
         mutations.push(insert(
-            make_node_record_key(*pid).as_bytes().to_vec(),
+            make_node_record_key(*pid).as_bytes(),
             encode_or_panic(nr),
         ));
     }
@@ -423,14 +468,8 @@ pub fn prepare_registry_with_two_node_sets(
                 node_operator_id: PrincipalId::new_user_test_id(999).to_vec(),
                 ..Default::default()
             };
-            mutations.push(insert(
-                &node_key.as_bytes().to_vec(),
-                encode_or_panic(&node_record),
-            ));
-            node_mutations.push(insert(
-                &node_key.as_bytes().to_vec(),
-                encode_or_panic(&node_record),
-            ));
+            mutations.push(insert(node_key.as_bytes(), encode_or_panic(&node_record)));
+            node_mutations.push(insert(node_key.as_bytes(), encode_or_panic(&node_record)));
             node_id
         })
         .collect();
@@ -438,13 +477,9 @@ pub fn prepare_registry_with_two_node_sets(
     let nodes_in_subnet2_ids = &node_ids[..num_nodes_in_subnet2];
 
     let replica_version = ReplicaVersion::default();
-    let replica_version_record = ReplicaVersionRecord {
-        binary_url: "http://testurl.com/version_1.0".to_string(),
-        sha256_hex: "f0e4c2f76c58916ec258f246851bea091d14d4247a2fc3e18694461b1816e13b".to_string(),
-        ..Default::default()
-    };
+    let replica_version_record = ReplicaVersionRecord::default();
     mutations.push(insert(
-        &make_replica_version_key(&replica_version.to_string()),
+        &make_replica_version_key(&replica_version),
         encode_or_panic(&replica_version_record),
     ));
 
@@ -466,9 +501,7 @@ pub fn prepare_registry_with_two_node_sets(
     ));
 
     mutations.push(insert(
-        make_crypto_threshold_signing_pubkey_key(subnet_id)
-            .as_bytes()
-            .to_vec(),
+        make_crypto_threshold_signing_pubkey_key(subnet_id).as_bytes(),
         encode_or_panic(&vec![]),
     ));
 
@@ -495,9 +528,7 @@ pub fn prepare_registry_with_two_node_sets(
         ));
 
         mutations.push(insert(
-            make_crypto_threshold_signing_pubkey_key(subnet2_id)
-                .as_bytes()
-                .to_vec(),
+            make_crypto_threshold_signing_pubkey_key(subnet2_id).as_bytes(),
             encode_or_panic(&vec![]),
         ));
 
@@ -543,12 +574,15 @@ pub fn prepare_add_node_payload() -> (AddNodePayload, NodePublicKeys, NodeId) {
     let ni_dkg_dealing_encryption_pk =
         encode_or_panic(&node_pks.dkg_dealing_encryption_pk.clone().unwrap());
     let transport_tls_cert = encode_or_panic(&node_pks.tls_certificate.clone().unwrap());
+    let idkg_dealing_encryption_pk =
+        encode_or_panic(&node_pks.idkg_dealing_encryption_pk.clone().unwrap());
 
     let payload = AddNodePayload {
         node_signing_pk,
         committee_signing_pk,
         ni_dkg_dealing_encryption_pk,
         transport_tls_cert,
+        idkg_dealing_encryption_pk: Some(idkg_dealing_encryption_pk),
         xnet_endpoint: "128.0.0.1:1234".to_string(),
         http_endpoint: "128.0.0.1:8123".to_string(),
         p2p_flow_endpoints: vec!["123,128.0.0.1:10000".to_string()],

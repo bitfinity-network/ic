@@ -20,30 +20,32 @@ impl sandbox_service::SandboxService for DummySandboxService {
     }
     fn open_wasm(&self, _req: sbxsvc::OpenWasmRequest) -> rpc::Call<sbxsvc::OpenWasmReply> {
         println!("Sandbox: Received 'open_wasm' request");
-        rpc::Call::new_resolved(Ok(sbxsvc::OpenWasmReply { success: true }))
+        rpc::Call::new_resolved(Ok(sbxsvc::OpenWasmReply(Ok(()))))
     }
     fn close_wasm(&self, _req: sbxsvc::CloseWasmRequest) -> rpc::Call<sbxsvc::CloseWasmReply> {
         unimplemented!();
     }
-    fn open_state(&self, _req: sbxsvc::OpenStateRequest) -> rpc::Call<sbxsvc::OpenStateReply> {
+    fn open_memory(&self, _req: sbxsvc::OpenMemoryRequest) -> rpc::Call<sbxsvc::OpenMemoryReply> {
         unimplemented!();
     }
-    fn close_state(&self, _req: sbxsvc::CloseStateRequest) -> rpc::Call<sbxsvc::CloseStateReply> {
-        unimplemented!();
-    }
-    fn open_execution(
+    fn close_memory(
         &self,
-        _req: sbxsvc::OpenExecutionRequest,
-    ) -> rpc::Call<sbxsvc::OpenExecutionReply> {
+        _req: sbxsvc::CloseMemoryRequest,
+    ) -> rpc::Call<sbxsvc::CloseMemoryReply> {
         unimplemented!();
     }
-    fn close_execution(
+    fn start_execution(
         &self,
-        _req: sbxsvc::CloseExecutionRequest,
-    ) -> rpc::Call<sbxsvc::CloseExecutionReply> {
+        _req: sbxsvc::StartExecutionRequest,
+    ) -> rpc::Call<sbxsvc::StartExecutionReply> {
         unimplemented!();
     }
-
+    fn resume_execution(
+        &self,
+        _req: sbxsvc::ResumeExecutionRequest,
+    ) -> rpc::Call<sbxsvc::ResumeExecutionReply> {
+        unimplemented!()
+    }
     fn create_execution_state(
         &self,
         _req: sbxsvc::CreateExecutionStateRequest,

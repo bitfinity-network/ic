@@ -14,6 +14,7 @@
 //! All [`Artifact`] sub-types must also implement [`ChunkableArtifact`] trait
 //! defined in the chunkable module.
 use crate::{
+    canister_http::CanisterHttpResponseShare,
     consensus::{certification::CertificationMessageHash, ConsensusMessageHash},
     crypto::{CryptoHash, CryptoHashOf},
     filetree_sync::{FileTreeSyncArtifact, FileTreeSyncId},
@@ -72,6 +73,7 @@ pub enum ArtifactId {
     ConsensusMessage(ConsensusMessageId),
     IngressMessage(IngressMessageId),
     CertificationMessage(CertificationMessageId),
+    CanisterHttpMessage(CanisterHttpResponseId),
     DkgMessage(DkgMessageId),
     EcdsaMessage(EcdsaMessageId),
     FileTreeSync(FileTreeSyncId),
@@ -83,12 +85,13 @@ pub enum ArtifactId {
 /// or filters.
 #[derive(EnumIter, TryInto, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ArtifactTag {
-    ConsensusArtifact,
-    IngressArtifact,
+    CanisterHttpArtifact,
     CertificationArtifact,
+    ConsensusArtifact,
     DkgArtifact,
     EcdsaArtifact,
     FileTreeSyncArtifact,
+    IngressArtifact,
     StateSyncArtifact,
 }
 
@@ -98,12 +101,13 @@ impl std::fmt::Display for ArtifactTag {
             f,
             "{}",
             match self {
-                ArtifactTag::ConsensusArtifact => "Consensus",
-                ArtifactTag::IngressArtifact => "Ingress",
+                ArtifactTag::CanisterHttpArtifact => "CanisterHttp",
                 ArtifactTag::CertificationArtifact => "Certification",
+                ArtifactTag::ConsensusArtifact => "Consensus",
                 ArtifactTag::DkgArtifact => "DKG",
                 ArtifactTag::EcdsaArtifact => "ECDSA",
                 ArtifactTag::FileTreeSyncArtifact => "FileTreeSync",
+                ArtifactTag::IngressArtifact => "Ingress",
                 ArtifactTag::StateSyncArtifact => "StateSync",
             }
         )
@@ -113,12 +117,13 @@ impl std::fmt::Display for ArtifactTag {
 impl From<&ArtifactId> for ArtifactTag {
     fn from(id: &ArtifactId) -> ArtifactTag {
         match id {
-            ArtifactId::ConsensusMessage(_) => ArtifactTag::ConsensusArtifact,
-            ArtifactId::IngressMessage(_) => ArtifactTag::IngressArtifact,
+            ArtifactId::CanisterHttpMessage(_) => ArtifactTag::CanisterHttpArtifact,
             ArtifactId::CertificationMessage(_) => ArtifactTag::CertificationArtifact,
+            ArtifactId::ConsensusMessage(_) => ArtifactTag::ConsensusArtifact,
             ArtifactId::DkgMessage(_) => ArtifactTag::DkgArtifact,
             ArtifactId::EcdsaMessage(_) => ArtifactTag::EcdsaArtifact,
             ArtifactId::FileTreeSync(_) => ArtifactTag::FileTreeSyncArtifact,
+            ArtifactId::IngressMessage(_) => ArtifactTag::IngressArtifact,
             ArtifactId::StateSync(_) => ArtifactTag::StateSyncArtifact,
         }
     }
@@ -462,6 +467,11 @@ pub struct DkgMessageAttribute {
 
 pub type EcdsaMessageId = EcdsaMessageHash;
 
+// -----------------------------------------------------------------------------
+// CanisterHttp artifacts
+
+pub type CanisterHttpResponseId = CryptoHashOf<CanisterHttpResponseShare>;
+
 // ------------------------------------------------------------------------------
 // StateSync artifacts.
 
@@ -575,7 +585,7 @@ impl TryFrom<pb::ArtifactFilter> for ArtifactFilter {
             )),
             certification_filter: try_from_option_field(
                 filter.certification_message_filter,
-                "ArtifactFilter.ingress_filter",
+                "ArtifactFilter.certification_message_filter",
             )?,
             state_sync_filter: try_from_option_field(
                 filter.state_sync_filter,

@@ -2,6 +2,8 @@
 
 use super::*;
 use ic_config::crypto::CryptoConfig;
+use ic_test_utilities::crypto::empty_fake_registry;
+use ic_test_utilities::types::ids::node_test_id;
 
 fn store_public_keys(crypto_root: &Path, node_pks: &NodePublicKeys) {
     public_key_store::store_node_public_keys(crypto_root, node_pks).unwrap();
@@ -12,6 +14,7 @@ fn should_generate_all_keys_for_new_node() {
     CryptoConfig::run_with_temp_config(|config| {
         let (node_pks, _node_id) = get_node_keys_or_generate_if_missing(&config.crypto_root);
         assert!(all_node_keys_are_present(&node_pks));
+        assert_eq!(node_pks.version, 1);
         let result = check_keys_locally(&config.crypto_root);
         assert!(result.is_ok());
         let maybe_pks = result.unwrap();
@@ -39,23 +42,199 @@ fn should_generate_all_keys_for_a_node_without_public_keys() {
 }
 
 #[test]
+fn should_correctly_generate_node_signing_key() {
+    CryptoConfig::run_with_temp_config(|config| {
+        let (node_pks, _node_id) = get_node_keys_or_generate_if_missing(&config.crypto_root);
+        let nspk = node_pks.node_signing_pk.expect("missing key");
+        assert_eq!(nspk.version, 0);
+        assert_eq!(nspk.algorithm, AlgorithmIdProto::Ed25519 as i32);
+        assert!(!nspk.key_value.is_empty());
+        assert!(nspk.proof_data.is_none());
+    })
+}
+
+#[test]
+fn should_correctly_generate_committee_signing_key() {
+    CryptoConfig::run_with_temp_config(|config| {
+        let (node_pks, _node_id) = get_node_keys_or_generate_if_missing(&config.crypto_root);
+        let cspk = node_pks.committee_signing_pk.expect("missing key");
+        assert_eq!(cspk.version, 0);
+        assert_eq!(cspk.algorithm, AlgorithmIdProto::MultiBls12381 as i32);
+        assert!(!cspk.key_value.is_empty());
+        assert!(cspk.proof_data.is_some());
+        assert!(!cspk.proof_data.unwrap().is_empty());
+    })
+}
+
+#[test]
+fn should_correctly_generate_dkg_dealing_encryption_key() {
+    CryptoConfig::run_with_temp_config(|config| {
+        let (node_pks, _node_id) = get_node_keys_or_generate_if_missing(&config.crypto_root);
+        let ni_dkg_de_pk = node_pks.dkg_dealing_encryption_pk.expect("missing key");
+        assert_eq!(ni_dkg_de_pk.version, 0);
+        assert_eq!(
+            ni_dkg_de_pk.algorithm,
+            AlgorithmIdProto::Groth20Bls12381 as i32
+        );
+        assert!(!ni_dkg_de_pk.key_value.is_empty());
+        assert!(ni_dkg_de_pk.proof_data.is_some());
+        assert!(!ni_dkg_de_pk.proof_data.unwrap().is_empty());
+    })
+}
+
+#[test]
+fn should_correctly_generate_tls_certificate() {
+    CryptoConfig::run_with_temp_config(|config| {
+        let (node_pks, _node_id) = get_node_keys_or_generate_if_missing(&config.crypto_root);
+        assert!(node_pks.tls_certificate.is_some());
+        assert!(!node_pks.tls_certificate.unwrap().certificate_der.is_empty());
+    })
+}
+
+#[test]
+fn should_correctly_generate_idkg_dealing_encryption_key() {
+    CryptoConfig::run_with_temp_config(|config| {
+        let public_key = generate_idkg_dealing_encryption_keys(&config.crypto_root);
+        assert_eq!(public_key.version, 0);
+        assert_eq!(public_key.algorithm, AlgorithmIdProto::MegaSecp256k1 as i32);
+        assert!(!public_key.key_value.is_empty());
+        assert!(public_key.proof_data.is_none());
+    })
+}
+
+#[test]
+fn should_correctly_generate_idkg_keys_if_other_keys_already_present_with_version_0_and_not_regenerate_others(
+) {
+    CryptoConfig::run_with_temp_config(|config| {
+        let (npks_before, node_id_1) = {
+            let (npks, node_id) = get_node_keys_or_generate_if_missing(&config.crypto_root);
+            assert!(all_node_keys_are_present(&npks));
+            assert_eq!(npks.version, 1);
+            let npks_version_0_without_idkg_dealing_encryption_key = NodePublicKeys {
+                version: 0,
+                idkg_dealing_encryption_pk: None,
+                ..npks
+            };
+            store_public_keys(
+                &config.crypto_root,
+                &npks_version_0_without_idkg_dealing_encryption_key,
+            );
+            assert_eq!(
+                read_public_keys(&config.crypto_root).unwrap(),
+                npks_version_0_without_idkg_dealing_encryption_key
+            );
+            (npks_version_0_without_idkg_dealing_encryption_key, node_id)
+        };
+
+        let (npks_after, node_id_2) = get_node_keys_or_generate_if_missing(&config.crypto_root);
+        // Ensure keys have version 1 and are correctly stored
+        assert_eq!(npks_after.version, 1);
+        assert!(all_node_keys_are_present(&npks_after));
+        assert_eq!(read_public_keys(&config.crypto_root).unwrap(), npks_after);
+
+        // Ensure I-DKG key is present and generated correctly
+        assert!(npks_after.idkg_dealing_encryption_pk.is_some());
+        if let Some(idkg_pk) = npks_after.idkg_dealing_encryption_pk {
+            assert_eq!(idkg_pk.version, 0);
+            assert_eq!(idkg_pk.algorithm, AlgorithmIdProto::MegaSecp256k1 as i32);
+            assert!(!idkg_pk.key_value.is_empty());
+            assert!(idkg_pk.proof_data.is_none());
+        }
+
+        // Ensure node ID and pre-existing key material is unchanged
+        assert_eq!(node_id_1, node_id_2);
+        assert_eq!(npks_before.node_signing_pk, npks_after.node_signing_pk);
+        assert_eq!(
+            npks_before.committee_signing_pk,
+            npks_after.committee_signing_pk
+        );
+        assert_eq!(
+            npks_before.dkg_dealing_encryption_pk,
+            npks_after.dkg_dealing_encryption_pk
+        );
+        assert_eq!(npks_before.tls_certificate, npks_after.tls_certificate);
+    })
+}
+
+#[test]
+fn should_correctly_generate_idkg_keys_if_other_keys_already_present_with_version_1_and_not_regenerate_others(
+) {
+    CryptoConfig::run_with_temp_config(|config| {
+        let (npks_before, node_id_1) = {
+            let (npks, node_id) = get_node_keys_or_generate_if_missing(&config.crypto_root);
+            assert!(all_node_keys_are_present(&npks));
+            assert_eq!(npks.version, 1);
+            let npks_version_1_without_idkg_dealing_encryption_key = NodePublicKeys {
+                idkg_dealing_encryption_pk: None,
+                ..npks
+            };
+            store_public_keys(
+                &config.crypto_root,
+                &npks_version_1_without_idkg_dealing_encryption_key,
+            );
+            assert_eq!(
+                read_public_keys(&config.crypto_root).unwrap(),
+                npks_version_1_without_idkg_dealing_encryption_key
+            );
+            (npks_version_1_without_idkg_dealing_encryption_key, node_id)
+        };
+
+        let (npks_after, node_id_2) = get_node_keys_or_generate_if_missing(&config.crypto_root);
+        // Ensure keys have version 1 and are correctly stored
+        assert_eq!(npks_after.version, 1);
+        assert!(all_node_keys_are_present(&npks_after));
+        assert_eq!(read_public_keys(&config.crypto_root).unwrap(), npks_after);
+
+        // Ensure I-DKG key is present and generated correctly
+        assert!(npks_after.idkg_dealing_encryption_pk.is_some());
+        if let Some(idkg_pk) = npks_after.idkg_dealing_encryption_pk {
+            assert_eq!(idkg_pk.version, 0);
+            assert_eq!(idkg_pk.algorithm, AlgorithmIdProto::MegaSecp256k1 as i32);
+            assert!(!idkg_pk.key_value.is_empty());
+            assert!(idkg_pk.proof_data.is_none());
+        }
+
+        // Ensure node ID and pre-existing key material is unchanged
+        assert_eq!(node_id_1, node_id_2);
+        assert_eq!(npks_before.node_signing_pk, npks_after.node_signing_pk);
+        assert_eq!(
+            npks_before.committee_signing_pk,
+            npks_after.committee_signing_pk
+        );
+        assert_eq!(
+            npks_before.dkg_dealing_encryption_pk,
+            npks_after.dkg_dealing_encryption_pk
+        );
+        assert_eq!(npks_before.tls_certificate, npks_after.tls_certificate);
+    })
+}
+
+#[test]
 #[should_panic(expected = "inconsistent key material")]
 fn should_panic_if_node_has_inconsistent_keys() {
-    CryptoConfig::run_with_temp_config(|config| {
-        let _node_signing_pk = Some(generate_node_signing_keys(&config.crypto_root));
-        let different_crypto_root = config.crypto_root.join("different_subdir");
-        let different_node_signing_pk = Some(generate_node_signing_keys(&different_crypto_root));
-
-        // Store different_node_signing_pk in `config.crypto_root`.
-        store_public_keys(
-            &config.crypto_root,
-            &NodePublicKeys {
-                node_signing_pk: different_node_signing_pk,
-                ..Default::default()
-            },
+    let (temp_crypto, _node_keys) = TempCryptoComponent::new_with_node_keys_generation(
+        empty_fake_registry(),
+        node_test_id(1),
+        NodeKeysToGenerate::only_node_signing_key(),
+    );
+    let different_node_signing_pk = {
+        let (_temp_crypto2, node_keys2) = TempCryptoComponent::new_with_node_keys_generation(
+            empty_fake_registry(),
+            node_test_id(2),
+            NodeKeysToGenerate::only_node_signing_key(),
         );
-        let (_node_pks, _node_id) = get_node_keys_or_generate_if_missing(&config.crypto_root);
-    })
+        node_keys2.node_signing_pk
+    };
+
+    // Store different_node_signing_pk in temp_crypto's crypto_root.
+    store_public_keys(
+        temp_crypto.temp_dir_path(),
+        &NodePublicKeys {
+            node_signing_pk: different_node_signing_pk,
+            ..Default::default()
+        },
+    );
+    let (_node_pks, _node_id) = get_node_keys_or_generate_if_missing(temp_crypto.temp_dir_path());
 }
 
 #[test]
@@ -79,51 +258,212 @@ fn check_keys_locally_returns_none_if_no_public_keys_are_present() {
 }
 
 #[test]
-fn should_fail_check_keys_locally_if_no_matching_secret_key_is_present() {
-    CryptoConfig::run_with_temp_config(|config| {
-        let node_signing_pk = Some(generate_node_signing_keys(&config.crypto_root));
-        let different_crypto_root = config.crypto_root.join("different_subdir");
-        let different_node_signing_pk = Some(generate_node_signing_keys(&different_crypto_root));
-
-        // Fail the check if `different_node_signing_pk` is stored.
-        store_public_keys(
-            &config.crypto_root,
-            &NodePublicKeys {
-                node_signing_pk: different_node_signing_pk,
-                ..Default::default()
-            },
+fn should_fail_check_keys_locally_if_no_matching_node_signing_secret_key_is_present() {
+    let (temp_crypto, node_keys) = TempCryptoComponent::new_with_node_keys_generation(
+        empty_fake_registry(),
+        node_test_id(1),
+        NodeKeysToGenerate::only_node_signing_key(),
+    );
+    let crypto_root = temp_crypto.temp_dir_path();
+    let different_node_signing_pk = {
+        let (_temp_crypto2, node_keys2) = TempCryptoComponent::new_with_node_keys_generation(
+            empty_fake_registry(),
+            node_test_id(2),
+            NodeKeysToGenerate::only_node_signing_key(),
         );
-        let result = check_keys_locally(&config.crypto_root);
-        assert!(result.is_err());
+        node_keys2.node_signing_pk
+    };
+    assert_ne!(node_keys.node_signing_pk, different_node_signing_pk);
+    store_public_keys(
+        crypto_root,
+        &NodePublicKeys {
+            node_signing_pk: different_node_signing_pk,
+            ..node_keys
+        },
+    );
 
-        // Succeed the check if node_signing_pk is stored.
-        store_public_keys(
-            &config.crypto_root,
-            &NodePublicKeys {
-                node_signing_pk,
-                ..Default::default()
-            },
+    let result = check_keys_locally(crypto_root);
+
+    assert!(matches!(
+        result,
+        Err(CryptoError::SecretKeyNotFound { algorithm, .. })
+        if algorithm == AlgorithmId::Ed25519
+    ));
+}
+
+#[test]
+fn should_fail_check_keys_locally_if_no_matching_committee_signing_secret_key_is_present() {
+    let (temp_crypto, node_keys) = TempCryptoComponent::new_with_node_keys_generation(
+        empty_fake_registry(),
+        node_test_id(1),
+        NodeKeysToGenerate::all(),
+    );
+    let crypto_root = temp_crypto.temp_dir_path();
+    let different_committee_signing_pk = {
+        let (_temp_crypto2, node_keys2) = TempCryptoComponent::new_with_node_keys_generation(
+            empty_fake_registry(),
+            node_test_id(2),
+            NodeKeysToGenerate::only_committee_signing_key(),
         );
-        let result = check_keys_locally(&config.crypto_root);
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_some());
-    })
+        node_keys2.committee_signing_pk
+    };
+    assert_ne!(
+        node_keys.committee_signing_pk,
+        different_committee_signing_pk
+    );
+    store_public_keys(
+        crypto_root,
+        &NodePublicKeys {
+            committee_signing_pk: different_committee_signing_pk,
+            ..node_keys
+        },
+    );
+
+    let result = check_keys_locally(crypto_root);
+
+    assert!(matches!(
+        result,
+        Err(CryptoError::SecretKeyNotFound { algorithm, .. })
+        if algorithm == AlgorithmId::MultiBls12_381
+    ));
+}
+
+#[test]
+fn should_fail_check_keys_locally_if_no_matching_dkg_dealing_encryption_secret_key_is_present() {
+    let (temp_crypto, node_keys) = TempCryptoComponent::new_with_node_keys_generation(
+        empty_fake_registry(),
+        node_test_id(1),
+        NodeKeysToGenerate::all(),
+    );
+    let crypto_root = temp_crypto.temp_dir_path();
+    let different_dkg_dealing_enc_pk = {
+        let (_temp_crypto2, node_keys2) = TempCryptoComponent::new_with_node_keys_generation(
+            empty_fake_registry(),
+            node_test_id(2),
+            NodeKeysToGenerate::only_dkg_dealing_encryption_key(),
+        );
+        node_keys2.dkg_dealing_encryption_pk
+    };
+    assert_ne!(
+        node_keys.dkg_dealing_encryption_pk,
+        different_dkg_dealing_enc_pk
+    );
+    store_public_keys(
+        crypto_root,
+        &NodePublicKeys {
+            dkg_dealing_encryption_pk: different_dkg_dealing_enc_pk,
+            ..node_keys
+        },
+    );
+
+    let result = check_keys_locally(crypto_root);
+
+    assert!(matches!(
+        result,
+        Err(CryptoError::SecretKeyNotFound { algorithm, .. })
+        if algorithm == AlgorithmId::Groth20_Bls12_381
+    ));
+}
+
+#[test]
+fn should_fail_check_keys_locally_if_no_matching_idkg_dealing_encryption_secret_key_is_present() {
+    let (temp_crypto, node_keys) = TempCryptoComponent::new_with_node_keys_generation(
+        empty_fake_registry(),
+        node_test_id(1),
+        NodeKeysToGenerate::all(),
+    );
+    let crypto_root = temp_crypto.temp_dir_path();
+    let different_idkg_dealing_enc_pk = {
+        let (_temp_crypto2, node_keys2) = TempCryptoComponent::new_with_node_keys_generation(
+            empty_fake_registry(),
+            node_test_id(2),
+            NodeKeysToGenerate::only_idkg_dealing_encryption_key(),
+        );
+        node_keys2.idkg_dealing_encryption_pk
+    };
+    assert_ne!(
+        node_keys.idkg_dealing_encryption_pk,
+        different_idkg_dealing_enc_pk
+    );
+    store_public_keys(
+        crypto_root,
+        &NodePublicKeys {
+            idkg_dealing_encryption_pk: different_idkg_dealing_enc_pk,
+            ..node_keys
+        },
+    );
+
+    let result = check_keys_locally(crypto_root);
+
+    assert!(matches!(
+        result,
+        Err(CryptoError::SecretKeyNotFound { algorithm, .. })
+        if algorithm == AlgorithmId::MegaSecp256k1
+    ));
+}
+
+#[test]
+fn should_fail_check_keys_locally_if_no_matching_tls_secret_key_is_present() {
+    let (temp_crypto, node_keys) = TempCryptoComponent::new_with_node_keys_generation(
+        empty_fake_registry(),
+        node_test_id(1),
+        NodeKeysToGenerate::all(),
+    );
+    let crypto_root = temp_crypto.temp_dir_path();
+    let different_tls_cert = {
+        let (_temp_crypto2, node_keys2) = TempCryptoComponent::new_with_node_keys_generation(
+            empty_fake_registry(),
+            node_test_id(2),
+            NodeKeysToGenerate::only_tls_key_and_cert(),
+        );
+        node_keys2.tls_certificate
+    };
+    assert_ne!(node_keys.tls_certificate, different_tls_cert);
+    store_public_keys(
+        crypto_root,
+        &NodePublicKeys {
+            tls_certificate: different_tls_cert,
+            ..node_keys
+        },
+    );
+
+    let result = check_keys_locally(crypto_root);
+
+    assert!(matches!(
+        result,
+        Err(CryptoError::TlsSecretKeyNotFound { .. })
+    ));
 }
 
 #[test]
 fn should_succeed_check_keys_locally_if_all_keys_are_present() {
-    CryptoConfig::run_with_temp_config(|config| {
-        let node_signing_pk = Some(generate_node_signing_keys(&config.crypto_root));
-        store_public_keys(
-            &config.crypto_root,
-            &NodePublicKeys {
-                node_signing_pk,
-                ..Default::default()
-            },
-        );
-        let result = check_keys_locally(&config.crypto_root);
-        assert!(result.is_ok());
-    })
+    let (temp_crypto, node_keys) = TempCryptoComponent::new_with_node_keys_generation(
+        empty_fake_registry(),
+        node_test_id(1),
+        NodeKeysToGenerate::all(),
+    );
+    let crypto_root = temp_crypto.temp_dir_path();
+    store_public_keys(crypto_root, &node_keys);
+
+    let result = check_keys_locally(crypto_root);
+
+    assert!(matches!(result, Ok(Some(_))));
+}
+
+#[test]
+fn should_succeed_check_keys_locally_if_all_keys_except_idkg_dealing_enc_key_are_present() {
+    let (temp_crypto, node_keys) = TempCryptoComponent::new_with_node_keys_generation(
+        empty_fake_registry(),
+        node_test_id(1),
+        NodeKeysToGenerate::all_except_idkg_dealing_encryption_key(),
+    );
+    assert!(node_keys.idkg_dealing_encryption_pk.is_none());
+    let crypto_root = temp_crypto.temp_dir_path();
+    store_public_keys(crypto_root, &node_keys);
+
+    let result = check_keys_locally(crypto_root);
+
+    assert!(matches!(result, Ok(Some(_))));
 }
 
 mod tls {
@@ -201,47 +541,10 @@ mod tls {
     }
 }
 
-mod committee_signing {
-    use super::super::generate_committee_signing_keys;
-    use ic_config::crypto::CryptoConfig;
-    use ic_protobuf::registry::crypto::v1::AlgorithmId as AlgorithmIdProto;
-
-    #[test]
-    fn should_generate_committee_signing_key_with_version_0() {
-        CryptoConfig::run_with_temp_config(|config| {
-            let public_key = generate_committee_signing_keys(&config.crypto_root);
-            assert_eq!(public_key.version, 0);
-        })
-    }
-
-    #[test]
-    fn should_generate_committee_signing_key_with_correct_algorithm() {
-        CryptoConfig::run_with_temp_config(|config| {
-            let public_key = generate_committee_signing_keys(&config.crypto_root);
-            assert_eq!(public_key.algorithm, AlgorithmIdProto::MultiBls12381 as i32);
-        })
-    }
-
-    #[test]
-    fn should_generate_committee_signing_key_with_non_empty_key_value() {
-        CryptoConfig::run_with_temp_config(|config| {
-            let public_key = generate_committee_signing_keys(&config.crypto_root);
-            assert!(!public_key.key_value.is_empty());
-        })
-    }
-
-    #[test]
-    fn should_generate_committee_signing_key_with_proof_data() {
-        CryptoConfig::run_with_temp_config(|config| {
-            let public_key = generate_committee_signing_keys(&config.crypto_root);
-            assert!(public_key.proof_data.is_some());
-        })
-    }
-}
-
 fn all_node_keys_are_present(node_pks: &NodePublicKeys) -> bool {
     node_pks.node_signing_pk.is_some()
         && node_pks.committee_signing_pk.is_some()
         && node_pks.tls_certificate.is_some()
         && node_pks.dkg_dealing_encryption_pk.is_some()
+        && node_pks.idkg_dealing_encryption_pk.is_some()
 }

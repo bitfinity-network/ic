@@ -1,13 +1,13 @@
 use crate::types::ids::subnet_test_id;
 use ic_crypto_sha::Sha256;
 use ic_crypto_tree_hash::{LabeledTree, MixedHashTree};
-use ic_interfaces::{
-    certified_stream_store::{CertifiedStreamStore, DecodeStreamError, EncodeStreamError},
-    state_manager::{
-        CertificationMask, CertificationScope, Labeled, PermanentStateHashError::*, StateHashError,
-        StateManager, StateManagerError, StateManagerResult, StateReader,
-        TransientStateHashError::*, CERT_ANY, CERT_CERTIFIED, CERT_UNCERTIFIED,
-    },
+use ic_interfaces::certified_stream_store::{
+    CertifiedStreamStore, DecodeStreamError, EncodeStreamError,
+};
+use ic_interfaces_state_manager::{
+    CertificationMask, CertificationScope, Labeled, PermanentStateHashError::*, StateHashError,
+    StateManager, StateManagerError, StateManagerResult, StateReader, TransientStateHashError::*,
+    CERT_ANY, CERT_CERTIFIED, CERT_UNCERTIFIED,
 };
 use ic_registry_subnet_type::SubnetType;
 use ic_replicated_state::ReplicatedState;
@@ -19,9 +19,13 @@ use ic_types::{
     xnet::{CertifiedStreamSlice, StreamIndex, StreamSlice},
     CryptoHashOfPartialState, CryptoHashOfState, Height, RegistryVersion, SubnetId,
 };
+use std::collections::VecDeque;
 use std::sync::{Arc, RwLock};
 
+use ic_types::messages::RequestOrResponse;
+use ic_types::xnet::{StreamHeader, StreamIndexedQueue};
 use mockall::*;
+use serde::{Deserialize, Serialize};
 
 mock! {
     pub StateManager {}
@@ -358,6 +362,60 @@ impl StateReader for FakeStateManager {
     }
 }
 
+// Local helper to enable serialization and deserialization of
+// ic_types::xnet::StreamIndexedQueue for testing
+#[derive(Serialize, Deserialize)]
+struct SerializableStreamIndexedQueue {
+    begin: StreamIndex,
+    queue: VecDeque<RequestOrResponse>,
+}
+
+impl From<&StreamIndexedQueue<RequestOrResponse>> for SerializableStreamIndexedQueue {
+    fn from(q: &StreamIndexedQueue<RequestOrResponse>) -> Self {
+        SerializableStreamIndexedQueue {
+            begin: q.begin(),
+            queue: q.iter().map(|(_, msg)| msg.clone()).collect(),
+        }
+    }
+}
+
+impl From<SerializableStreamIndexedQueue> for StreamIndexedQueue<RequestOrResponse> {
+    fn from(q: SerializableStreamIndexedQueue) -> StreamIndexedQueue<RequestOrResponse> {
+        let mut queue = StreamIndexedQueue::with_begin(q.begin);
+        q.queue.iter().for_each(|entry| queue.push(entry.clone()));
+        queue
+    }
+}
+
+// Local helper to enable serialization and deserialization of
+// ic_types::xnet::StreamSlice for testing
+#[derive(Serialize, Deserialize)]
+struct SerializableStreamSlice {
+    header: StreamHeader,
+    messages: Option<SerializableStreamIndexedQueue>,
+}
+
+impl From<StreamSlice> for SerializableStreamSlice {
+    fn from(slice: StreamSlice) -> Self {
+        SerializableStreamSlice {
+            header: slice.header().clone(),
+            messages: slice.messages().map(|messages| messages.into()),
+        }
+    }
+}
+
+impl From<SerializableStreamSlice> for StreamSlice {
+    fn from(slice: SerializableStreamSlice) -> StreamSlice {
+        StreamSlice::new(
+            slice.header,
+            slice
+                .messages
+                .map(|messages| messages.into())
+                .unwrap_or_default(),
+        )
+    }
+}
+
 impl CertifiedStreamStore for FakeStateManager {
     /// Behaves similarly to `StateManager::encode_certified_stream_slice()`,
     /// except the slice is encoded directly as CBOR, with no witness or
@@ -375,8 +433,9 @@ impl CertifiedStreamStore for FakeStateManager {
         byte_limit: Option<usize>,
     ) -> Result<CertifiedStreamSlice, EncodeStreamError> {
         use ic_types::{
-            consensus::{certification::CertificationContent, ThresholdSignature},
+            consensus::certification::CertificationContent,
             crypto::{CombinedThresholdSig, CombinedThresholdSigOf, Signed},
+            signature::ThresholdSignature,
         };
 
         let state = self.get_latest_state();
@@ -398,7 +457,7 @@ impl CertifiedStreamStore for FakeStateManager {
             // If `byte_limit == 0 && msg_limit > 0`, return exactly 1 message.
             msg_limit = Some(1);
         }
-        let slice = stream.slice(begin_index, msg_limit);
+        let slice: SerializableStreamSlice = stream.slice(begin_index, msg_limit).into();
 
         Ok(CertifiedStreamSlice {
             payload: serde_cbor::to_vec(&slice).expect("failed to serialize stream slice"),
@@ -438,6 +497,7 @@ impl CertifiedStreamStore for FakeStateManager {
     ) -> Result<StreamSlice, DecodeStreamError> {
         serde_cbor::from_slice(&certified_slice.payload[..])
             .map_err(|err| DecodeStreamError::SerializationError(err.to_string()))
+            .map(|slice: SerializableStreamSlice| slice.into())
     }
 
     fn subnets_with_certified_streams(&self) -> Vec<SubnetId> {

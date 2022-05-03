@@ -1,20 +1,18 @@
 use super::SessionNonce;
-use crate::{num_bytes_try_from, page_map::PageAllocatorDelta, NumWasmPages, PageIndex, PageMap};
-use ic_config::embedders::PersistenceType;
-use ic_cow_state::{CowMemoryManager, CowMemoryManagerImpl, MappedState, MappedStateImpl};
-use ic_interfaces::execution_environment::HypervisorResult;
+use crate::{num_bytes_try_from, NumWasmPages, PageMap};
 use ic_protobuf::{
     proxy::{try_from_option_field, ProxyDecodeError},
     state::canister_state_bits::v1 as pb,
 };
-use ic_sys::PageBytes;
 use ic_types::{methods::WasmMethod, ExecutionRound, NumBytes};
-use ic_utils::ic_features::cow_state_feature;
-use ic_wasm_types::BinaryEncodedWasm;
+use ic_wasm_types::CanisterModule;
+use maplit::btreemap;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::hash::{Hash, Hasher};
 use std::{
     collections::BTreeSet,
-    convert::TryFrom,
+    convert::{From, TryFrom},
     iter::FromIterator,
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -52,7 +50,7 @@ impl std::fmt::Debug for EmbedderCache {
 }
 
 /// An enum representing the possible values of a global variable.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum Global {
     I32(i32),
     I64(i64),
@@ -67,6 +65,30 @@ impl Global {
             Global::I64(_) => "i64",
             Global::F32(_) => "f32",
             Global::F64(_) => "f64",
+        }
+    }
+}
+
+impl Hash for Global {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let bytes = match self {
+            Global::I32(val) => val.to_le_bytes().to_vec(),
+            Global::I64(val) => val.to_le_bytes().to_vec(),
+            Global::F32(val) => val.to_le_bytes().to_vec(),
+            Global::F64(val) => val.to_le_bytes().to_vec(),
+        };
+        bytes.hash(state)
+    }
+}
+
+impl PartialEq<Global> for Global {
+    fn eq(&self, other: &Global) -> bool {
+        match (self, other) {
+            (Global::I32(val), Global::I32(other_val)) => val == other_val,
+            (Global::I64(val), Global::I64(other_val)) => val == other_val,
+            (Global::F32(val), Global::F32(other_val)) => val == other_val,
+            (Global::F64(val), Global::F64(other_val)) => val == other_val,
+            _ => false,
         }
     }
 }
@@ -160,21 +182,21 @@ impl TryFrom<Vec<pb::WasmMethod>> for ExportedFunctions {
 /// Represent a wasm binary.
 #[derive(debug_stub_derive::DebugStub)]
 pub struct WasmBinary {
-    /// The raw wasm binary (after validation). Remains immutable after
+    /// The raw canister module provided by the user. Remains immutable after
     /// creating a WasmBinary object.
-    pub binary: BinaryEncodedWasm,
+    pub binary: CanisterModule,
 
     /// Cached compiled representation of the binary. Lower layers will assign
     /// to this field to create a compiled representation of the wasm, and
     /// ensure that this happens only once.
-    pub embedder_cache: std::sync::Mutex<Option<EmbedderCache>>,
+    pub embedder_cache: Arc<std::sync::Mutex<Option<EmbedderCache>>>,
 }
 
 impl WasmBinary {
-    pub fn new(binary: BinaryEncodedWasm) -> Arc<Self> {
+    pub fn new(binary: CanisterModule) -> Arc<Self> {
         Arc::new(WasmBinary {
             binary,
-            embedder_cache: std::sync::Mutex::new(None),
+            embedder_cache: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -184,7 +206,7 @@ impl WasmBinary {
 }
 
 /// Represents a canister's wasm or stable memory.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct Memory {
     /// The contents of this memory.
     pub page_map: PageMap,
@@ -194,11 +216,19 @@ pub struct Memory {
     /// that will be reflected in this field, but the `page_map` will remain
     /// empty until data is written to the memory.
     pub size: NumWasmPages,
+
+    /// Contains either a handle to the execution state in the sandbox process
+    /// or information that is necessary to constructs the state remotely.
+    pub sandbox_memory: Arc<Mutex<SandboxMemory>>,
 }
 
 impl Memory {
     pub fn new(page_map: PageMap, size: NumWasmPages) -> Self {
-        Memory { page_map, size }
+        Memory {
+            page_map,
+            size,
+            sandbox_memory: SandboxMemory::new(),
+        }
     }
 }
 
@@ -207,89 +237,64 @@ impl Default for Memory {
         Self {
             page_map: PageMap::default(),
             size: NumWasmPages::from(0),
+            sandbox_memory: SandboxMemory::new(),
         }
     }
 }
 
-/// Describes how to synchronize a local execution state in the replica process
-/// with the remote state in the sandbox process. `Full` means that the whole
-/// state needs to be sent to the sandbox process. `Delta` means that the state
-/// can be derived from the given parent state by applying dirty pages and
-/// possibly constructing a new page allocator (if it was empty before).
-/// Note that the dirty pages are represented by their indicies for efficiency.
-/// Their contents will be fetched during the actual synchronization.
-#[derive(Debug)]
-pub enum SandboxExecutionStateSynchronization {
-    Full,
-    Delta {
-        parent_state_handle: SandboxExecutionStateHandle,
-        wasm_memory_pages: Vec<PageIndex>,
-        wasm_memory_page_allocator: PageAllocatorDelta,
-        stable_memory_pages: Vec<PageIndex>,
-        stable_memory_page_allocator: PageAllocatorDelta,
-    },
+impl PartialEq for Memory {
+    fn eq(&self, other: &Self) -> bool {
+        // Skip the sandbox memory since it is not relevant for equality.
+        self.page_map == other.page_map && self.size == other.size
+    }
 }
 
 /// Represents the synchronisation status of the local execution state
 /// in the replica process and the remote execution state in the sandbox
 /// process. If the states are in sync, then it stores the id of the
-/// state in the sandbox process. Otherwise, it stores information on
-/// how to synchronize the states.
+/// state in the sandbox process. Otherwise, it indicates that the snapshot
+/// of the state needs to be sent to the sandbox process.
 #[derive(Debug)]
-pub enum SandboxExecutionState {
-    Synced(SandboxExecutionStateHandle),
-    Unsynced(SandboxExecutionStateSynchronization),
+pub enum SandboxMemory {
+    Synced(SandboxMemoryHandle),
+    Unsynced,
 }
 
-impl SandboxExecutionState {
+impl SandboxMemory {
     pub fn new() -> Arc<Mutex<Self>> {
-        Arc::new(Mutex::new(SandboxExecutionState::Unsynced(
-            SandboxExecutionStateSynchronization::Full,
-        )))
+        Arc::new(Mutex::new(SandboxMemory::Unsynced))
     }
 
-    pub fn delta(
-        parent_state_handle: SandboxExecutionStateHandle,
-        wasm_memory_delta: (Vec<PageIndex>, PageAllocatorDelta),
-        stable_memory_delta: (Vec<PageIndex>, PageAllocatorDelta),
-    ) -> Arc<Mutex<Self>> {
-        Arc::new(Mutex::new(SandboxExecutionState::Unsynced(
-            SandboxExecutionStateSynchronization::Delta {
-                parent_state_handle,
-                wasm_memory_pages: wasm_memory_delta.0,
-                wasm_memory_page_allocator: wasm_memory_delta.1,
-                stable_memory_pages: stable_memory_delta.0,
-                stable_memory_page_allocator: stable_memory_delta.1,
-            },
-        )))
+    pub fn synced(handle: SandboxMemoryHandle) -> Arc<Mutex<Self>> {
+        Arc::new(Mutex::new(SandboxMemory::Synced(handle)))
     }
 }
 
-/// The owner of the sandbox execution state. It's destructor must close
-/// the corresponding execution state in the sandbox process.
-pub trait SandboxExecutionStateOwner: std::fmt::Debug + Send + Sync {
+/// The owner of the sandbox memory. It's destructor must close the
+/// corresponding memory in the sandbox process.
+pub trait SandboxMemoryOwner: std::fmt::Debug + Send + Sync {
     fn get_id(&self) -> usize;
 }
 
-/// A handle to the sandbox execution state that keeps the corresponding
-/// execution state in the sandbox process open. It is cloneable and may be
-/// shared between multiple execution states.
+/// A handle to the sandbox memory that keeps the corresponding memory in the
+/// sandbox process open. It is cloneable and may be shared between multiple
+/// copies of memory.
 #[derive(Debug)]
-pub struct SandboxExecutionStateHandle(Arc<dyn SandboxExecutionStateOwner>);
+pub struct SandboxMemoryHandle(Arc<dyn SandboxMemoryOwner>);
 
-impl Clone for SandboxExecutionStateHandle {
+impl Clone for SandboxMemoryHandle {
     fn clone(&self) -> Self {
         Self(Arc::clone(&self.0))
     }
 }
 
-impl SandboxExecutionStateHandle {
-    pub fn new(id: Arc<dyn SandboxExecutionStateOwner>) -> Self {
+impl SandboxMemoryHandle {
+    pub fn new(id: Arc<dyn SandboxMemoryOwner>) -> Self {
         Self(id)
     }
 
-    /// Returns a raw id of the execution state in the sandbox process,
-    /// which can be converted to sandbox `StateId` using `StateId::from()`.
+    /// Returns a raw id of the memory in the sandbox process, which can be
+    /// converted to sandbox `MemoryId` using `MemoryId::from()`.
     pub fn get_id(&self) -> usize {
         self.0.get_id()
     }
@@ -345,19 +350,12 @@ pub struct ExecutionState {
     /// A set of the functions that a Wasm module exports.
     pub exports: ExportedFunctions,
 
+    /// Metadata extracted from the Wasm module.
+    pub metadata: WasmMetadata,
+
     /// Round number at which canister executed
     /// update type operation.
     pub last_executed_round: ExecutionRound,
-
-    /// The persistent cow memory of the canister.
-    pub cow_mem_mgr: Arc<CowMemoryManagerImpl>,
-
-    /// Mapped state of the current execution
-    pub mapped_state: Option<Arc<MappedStateImpl>>,
-
-    /// Contains either a handle to the execution state in the sandbox process
-    /// or information that is necessary to constructs the state remotely.
-    pub sandbox_state: Arc<Mutex<SandboxExecutionState>>,
 }
 
 // We have to implement it by hand as embedder_cache can not be compared for
@@ -383,56 +381,25 @@ impl ExecutionState {
     /// The state will be created with empty stable memory, but may have wasm
     /// memory from data sections in the wasm module.
     pub fn new(
-        wasm_binary: BinaryEncodedWasm,
         canister_root: PathBuf,
+        wasm_binary: Arc<WasmBinary>,
         exports: ExportedFunctions,
-        wasm_memory_pages: &[(PageIndex, PageBytes)],
-    ) -> HypervisorResult<Self> {
-        let mut wasm_memory = Memory::default();
-        wasm_memory.page_map.update(
-            &wasm_memory_pages
-                .iter()
-                .map(|(index, bytes)| (*index, bytes as &PageBytes))
-                .collect::<Vec<(PageIndex, &PageBytes)>>(),
-        );
-
-        let cow_mem_mgr = Arc::new(CowMemoryManagerImpl::open_readwrite(canister_root.clone()));
-        if cow_state_feature::is_enabled(cow_state_feature::cow_state) {
-            let mapped_state = cow_mem_mgr.get_map();
-            let mut updated_pages = Vec::new();
-
-            for i in wasm_memory.page_map.host_pages_iter() {
-                let page_idx = i.0;
-                updated_pages.push(page_idx.get());
-                mapped_state
-                    .update_heap_page(page_idx.get(), wasm_memory.page_map.get_page(page_idx));
-            }
-            mapped_state.soft_commit(&updated_pages);
-        }
-        let mapped_state = if cow_mem_mgr.is_valid() {
-            Some(Arc::new(cow_mem_mgr.get_map()))
-        } else {
-            None
-        };
-        let session_nonce = None;
-
-        let wasm_binary = WasmBinary::new(wasm_binary);
-
-        let execution_state = ExecutionState {
+        wasm_memory: Memory,
+        stable_memory: Memory,
+        exported_globals: Vec<Global>,
+        wasm_metadata: WasmMetadata,
+    ) -> Self {
+        Self {
             canister_root,
-            session_nonce,
+            session_nonce: None,
             wasm_binary,
             exports,
             wasm_memory,
-            stable_memory: Memory::default(),
-            exported_globals: vec![],
+            stable_memory,
+            exported_globals,
+            metadata: wasm_metadata,
             last_executed_round: ExecutionRound::from(0),
-            cow_mem_mgr,
-            mapped_state,
-            sandbox_state: SandboxExecutionState::new(),
-        };
-
-        Ok(execution_state)
+        }
     }
 
     // Checks whether the given method is exported by the Wasm module or not.
@@ -457,13 +424,151 @@ impl ExecutionState {
     pub fn num_wasm_globals(&self) -> usize {
         self.exported_globals.len()
     }
+}
 
-    /// Returns the persistence type associated with this state.
-    pub fn persistence_type(&self) -> PersistenceType {
-        if self.cow_mem_mgr.is_valid() {
-            PersistenceType::Pagemap
-        } else {
-            PersistenceType::Sigsegv
+/// An enum that represents the possible visibility levels a custom section
+/// defined in the wasm module can have.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum CustomSectionType {
+    Public,
+    Private,
+}
+
+impl From<&CustomSectionType> for pb::CustomSectionType {
+    fn from(item: &CustomSectionType) -> Self {
+        match item {
+            CustomSectionType::Public => pb::CustomSectionType::Public,
+            CustomSectionType::Private => pb::CustomSectionType::Private,
         }
+    }
+}
+
+impl TryFrom<pb::CustomSectionType> for CustomSectionType {
+    type Error = ProxyDecodeError;
+    fn try_from(item: pb::CustomSectionType) -> Result<Self, Self::Error> {
+        match item {
+            pb::CustomSectionType::Public => Ok(CustomSectionType::Public),
+            pb::CustomSectionType::Private => Ok(CustomSectionType::Private),
+            pb::CustomSectionType::Unspecified => Err(ProxyDecodeError::ValueOutOfRange {
+                typ: "CustomSectionType::Unspecified",
+                err: "Encountered error while decoding CustomSection type".to_string(),
+            }),
+        }
+    }
+}
+
+/// Represents the data a custom section holds.
+#[derive(Debug, PartialEq, Eq, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CustomSection {
+    pub visibility: CustomSectionType,
+    pub content: Vec<u8>,
+}
+
+impl CustomSection {
+    pub fn new(visibility: CustomSectionType, content: Vec<u8>) -> Self {
+        Self {
+            visibility,
+            content,
+        }
+    }
+}
+
+impl From<&CustomSection> for pb::WasmCustomSection {
+    fn from(item: &CustomSection) -> Self {
+        Self {
+            visibility: pb::CustomSectionType::from(&item.visibility).into(),
+            content: item.content.clone(),
+        }
+    }
+}
+
+impl TryFrom<pb::WasmCustomSection> for CustomSection {
+    type Error = ProxyDecodeError;
+    fn try_from(item: pb::WasmCustomSection) -> Result<Self, Self::Error> {
+        let visibility = CustomSectionType::try_from(
+            pb::CustomSectionType::from_i32(item.visibility).unwrap_or_default(),
+        )?;
+        Ok(Self {
+            visibility,
+            content: item.content,
+        })
+    }
+}
+
+/// A struct that holds all the custom sections exported by the Wasm module.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct WasmMetadata {
+    /// Arc is used to make cheap clones of this during snapshots.
+    #[serde(serialize_with = "ic_utils::serde_arc::serialize_arc")]
+    #[serde(deserialize_with = "ic_utils::serde_arc::deserialize_arc")]
+    custom_sections: Arc<BTreeMap<String, CustomSection>>,
+}
+
+impl WasmMetadata {
+    pub fn new(custom_sections: BTreeMap<String, CustomSection>) -> Self {
+        Self {
+            custom_sections: Arc::new(custom_sections),
+        }
+    }
+
+    /// Get the custom sections exported by the Wasm module.
+    pub fn custom_sections(&self) -> &BTreeMap<String, CustomSection> {
+        &self.custom_sections
+    }
+
+    /// Returns the custom section associated with the provided name.
+    pub fn get_custom_section(&self, custom_section_name: &str) -> Option<&CustomSection> {
+        self.custom_sections.get(custom_section_name)
+    }
+}
+
+impl Default for WasmMetadata {
+    fn default() -> Self {
+        Self {
+            custom_sections: Arc::new(btreemap![]),
+        }
+    }
+}
+
+impl From<&WasmMetadata> for pb::WasmMetadata {
+    fn from(item: &WasmMetadata) -> Self {
+        let custom_sections = item
+            .custom_sections
+            .iter()
+            .map(|(name, custom_section)| {
+                (name.clone(), pb::WasmCustomSection::from(custom_section))
+            })
+            .collect();
+        Self { custom_sections }
+    }
+}
+
+impl FromIterator<(std::string::String, CustomSection)> for WasmMetadata {
+    fn from_iter<T>(iter: T) -> WasmMetadata
+    where
+        T: IntoIterator<Item = (String, CustomSection)>,
+    {
+        WasmMetadata {
+            custom_sections: Arc::new(BTreeMap::from_iter(iter)),
+        }
+    }
+}
+
+impl TryFrom<pb::WasmMetadata> for WasmMetadata {
+    type Error = ProxyDecodeError;
+    fn try_from(item: pb::WasmMetadata) -> Result<Self, Self::Error> {
+        let custom_sections = item
+            .custom_sections
+            .into_iter()
+            .map(
+                |(name, custom_section)| match CustomSection::try_from(custom_section) {
+                    Ok(custom_section) => Ok((name, custom_section)),
+                    Err(err) => Err(err),
+                },
+            )
+            .collect::<Result<_, _>>()?;
+        Ok(WasmMetadata {
+            custom_sections: Arc::new(custom_sections),
+        })
     }
 }

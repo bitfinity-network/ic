@@ -11,27 +11,14 @@ mod page_bytes;
 pub use heap::{HeapBasedPage, HeapBasedPageAllocator};
 
 mod heap;
-// MmapBasedPageAllocator currenly uses memfd_create that is
-// available only on linux.
-#[cfg(target_os = "linux")]
-pub mod mmap;
+mod mmap;
 
-#[cfg(target_os = "linux")]
 mod default_implementation {
     pub use super::mmap::{MmapBasedPage, MmapBasedPageAllocator};
-    use super::{HeapBasedPage, HeapBasedPageAllocator};
     // Exported publicly for benchmarking.
-    // TODO(EXC-658): Use mmap-based page allocator after fixing
-    // the OOM with inter-canister query calls.
-    pub type DefaultPageImpl = HeapBasedPage;
-    pub type DefaultPageAllocatorImpl = HeapBasedPageAllocator;
-}
-#[cfg(not(target_os = "linux"))]
-mod default_implementation {
-    use super::{HeapBasedPage, HeapBasedPageAllocator};
-    // Exported publicly for benchmarking.
-    pub type DefaultPageImpl = HeapBasedPage;
-    pub type DefaultPageAllocatorImpl = HeapBasedPageAllocator;
+    // TODO(EXC-883): Re-enable with sandboxing after fixing crashes.
+    pub type DefaultPageImpl = MmapBasedPage;
+    pub type DefaultPageAllocatorImpl = MmapBasedPageAllocator;
 }
 pub use default_implementation::*;
 
@@ -60,8 +47,8 @@ impl Page {
     /// The given `page_allocator` must be the same as the one used for
     /// allocating this page. It serves as a witness that the content of the
     /// page is still valid.
-    pub(super) fn contents<'a>(&'a self, page_allocator: &'a PageAllocator) -> &'a PageBytes {
-        (self.0).contents(page_allocator.inner_ref())
+    pub(super) fn contents(&self) -> &PageBytes {
+        self.0.contents()
     }
 }
 
@@ -84,35 +71,23 @@ impl Clone for Page {
 ///
 /// It is parameterized by the implementation type with the default value to
 /// enable easy switching between heap-based and mmap-based implementations.
-pub(super) struct PageAllocator<A: PageAllocatorInner = DefaultPageAllocatorImpl>(Option<Arc<A>>);
+pub(super) struct PageAllocator<A: PageAllocatorInner = DefaultPageAllocatorImpl>(Arc<A>);
 
 /// We have to implement `Clone` manually because `#[derive(Clone)]` is confused
 /// by the generic parameter even though it is wrapped in `Arc`.
 impl Clone for PageAllocator {
     fn clone(&self) -> PageAllocator {
-        PageAllocator(self.0.as_ref().map(|inner| Arc::clone(inner)))
+        PageAllocator(Arc::clone(&self.0))
     }
 }
 
-impl Default for PageAllocator {
-    fn default() -> PageAllocator {
-        PageAllocator(None)
+impl<A: PageAllocatorInner> Default for PageAllocator<A> {
+    fn default() -> PageAllocator<A> {
+        PageAllocator(Arc::new(A::default()))
     }
 }
 
 impl<A: PageAllocatorInner> PageAllocator<A> {
-    /// Ensures that the page allocator is initialized.
-    pub(super) fn ensure_initialized(&mut self) -> (InitializationWitness, PageAllocatorDelta) {
-        let delta = match self.0 {
-            None => {
-                self.0 = Some(Arc::new(A::default()));
-                PageAllocatorDelta::Created
-            }
-            Some(_) => PageAllocatorDelta::Unchanged,
-        };
-        (InitializationWitness(()), delta)
-    }
-
     /// Allocates multiple pages with the given contents.
     ///
     /// The provided page count must match exactly the number of items in the
@@ -123,29 +98,20 @@ impl<A: PageAllocatorInner> PageAllocator<A> {
     /// provide the corresponding witness.
     pub(super) fn allocate(
         &self,
-        _initialized: InitializationWitness,
         pages: &[(PageIndex, &PageBytes)],
     ) -> Vec<(PageIndex, Page<A::PageInner>)> {
-        self.inner_ref().allocate(pages)
+        A::allocate(&self.0, pages)
     }
 
     /// Returns a serialization-friendly representation of the page allocator.
     pub(super) fn serialize(&self) -> PageAllocatorSerialization {
-        match &self.0 {
-            None => PageAllocatorSerialization::Empty,
-            Some(inner) => inner.serialize(),
-        }
+        self.0.serialize()
     }
 
     /// Creates a page allocator from the given serialization-friendly
     /// representation.
     pub(super) fn deserialize(page_allocator: PageAllocatorSerialization) -> Self {
-        match page_allocator {
-            PageAllocatorSerialization::Empty => PageAllocator(None),
-            PageAllocatorSerialization::Heap | PageAllocatorSerialization::Mmap(..) => {
-                PageAllocator(Some(Arc::new(A::deserialize(page_allocator))))
-            }
-        }
+        Self(Arc::new(A::deserialize(page_allocator)))
     }
 
     /// Returns a serialization-friendly representation of the given page-delta.
@@ -154,15 +120,7 @@ impl<A: PageAllocatorInner> PageAllocator<A> {
     where
         I: IntoIterator<Item = (PageIndex, &'a Page<A::PageInner>)>,
     {
-        match &self.0 {
-            None => {
-                // Since the page allocator doesn't exist, there cannot be any pages allocated
-                // with it.
-                assert!(page_delta.into_iter().next().is_none());
-                PageDeltaSerialization::Empty
-            }
-            Some(inner) => inner.serialize_page_delta(page_delta),
-        }
+        self.0.serialize_page_delta(page_delta)
     }
 
     /// Creates a page-delta from the given serialization-friendly
@@ -171,45 +129,17 @@ impl<A: PageAllocatorInner> PageAllocator<A> {
         &self,
         page_delta: PageDeltaSerialization,
     ) -> Vec<(PageIndex, Page<A::PageInner>)> {
-        match page_delta {
-            PageDeltaSerialization::Empty => vec![],
-            _ => self.inner_ref().deserialize_page_delta(page_delta),
-        }
+        A::deserialize_page_delta(&self.0, page_delta)
     }
-
-    /// Returns a reference to the actual implementation assuming that it is
-    /// initialized. It doesn't require the initialization witness because
-    /// `Page` uses it to perform runtime check of validity of the page
-    /// allocator.
-    fn inner_ref(&self) -> &A {
-        self.0.as_ref().unwrap().as_ref()
-    }
-}
-
-/// A helper to ensure that the caller of `allocate_initialized()` does not
-/// forget to call `ensure_initialized()`.
-pub(super) struct InitializationWitness(());
-
-/// Indicates whether the page allocator was created or not. It is used for
-/// synchronization with the sandbox process.
-#[derive(Debug)]
-pub enum PageAllocatorDelta {
-    Unchanged,
-    Created,
 }
 
 /// Exported publicly for benchmarking.
 pub trait PageInner: Debug {
     type PageAllocatorInner;
 
-    fn contents<'a>(&'a self, _page_allocator: &'a Self::PageAllocatorInner) -> &'a PageBytes;
+    fn contents(&self) -> &PageBytes;
 
-    fn copy_from_slice<'a>(
-        &'a mut self,
-        offset: usize,
-        slice: &[u8],
-        _page_allocator: &'a Self::PageAllocatorInner,
-    );
+    fn copy_from_slice(&mut self, offset: usize, slice: &[u8]);
 }
 
 /// Exported publicly for benchmarking.
@@ -218,7 +148,7 @@ pub trait PageAllocatorInner: Debug + Default {
 
     /// See the comments of the corresponding method in `PageAllocator`.
     fn allocate(
-        &self,
+        page_allocator: &Arc<Self>,
         pages: &[(PageIndex, &PageBytes)],
     ) -> Vec<(PageIndex, Page<Self::PageInner>)>;
 
@@ -235,7 +165,7 @@ pub trait PageAllocatorInner: Debug + Default {
 
     /// See the comments of the corresponding method in `PageAllocator`.
     fn deserialize_page_delta(
-        &self,
+        page_allocator: &Arc<Self>,
         page_delta: PageDeltaSerialization,
     ) -> Vec<(PageIndex, Page<Self::PageInner>)>;
 }
@@ -283,7 +213,6 @@ pub fn allocated_pages_count() -> usize {
 ///   with the given file descriptor.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum PageAllocatorSerialization {
-    Empty,
     Heap,
     Mmap(FileDescriptor),
 }
@@ -296,12 +225,44 @@ pub struct PageSerialization {
     pub bytes: PageBytes,
 }
 
+/// Information for validating page contents.
+///
+/// If the page contains only zeros, then both fields are zeros.  Otherwise,
+/// the fields specify any non-zero two-byte word within the page by the
+/// word's index and value.
+///
+/// The mmap-based page allocator frees physical memory by punching holes in the
+/// backing file. A subsequent access to an already a freed page (both in the
+/// sandbox and the replica processes) does not cause a segmentation fault.
+/// Instead, the page silently becomes a zero page. That is dangerous and may
+/// cause silent data corruption.  That's why we use this validation to catch
+/// use-after-free bugs.
+///
+/// This validation is also useful for checking that the page transfer between
+/// the sandbox and the replica processes works properly.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default)]
+pub struct PageValidation {
+    // The index of a non-zero two-byte word in the page.
+    // It is zero if no such word exists.
+    pub non_zero_word_index: u16,
+    // The value of a non-zero two-byte word specified by the index above.
+    // It is zero if no such word exists.
+    pub non_zero_word_value: u16,
+}
+
+/// Serialization-friendly representation of an mmap-based page.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct MmapPageSerialization {
+    pub page_index: PageIndex,
+    pub file_offset: FileOffset,
+    pub validation: PageValidation,
+}
+
 /// Serialization-friendly representation of `PageDelta`.
 ///
 /// It contains sufficient information to reconstruct the page-delta
 /// in another process. Note that pages are created using a page allocator,
 /// so the three cases here correspond to the three cases in `PageAllocator`:
-/// - `Empty`: the page delta is empty and the page allocator doesn't exist.
 /// - `Heap`: the pages are allocated on the Rust heap and can be sent to
 ///   another process only by copying the bytes.
 /// - `Mmap`: the pages are backed by the file owned by the page allocator. Each
@@ -310,12 +271,20 @@ pub struct PageSerialization {
 ///   offsets of all pages are smaller than the length of the file.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum PageDeltaSerialization {
-    Empty,
     Heap(Vec<PageSerialization>),
     Mmap {
         file_len: FileOffset,
-        pages: Vec<(PageIndex, FileOffset)>,
+        pages: Vec<MmapPageSerialization>,
     },
+}
+
+impl PageDeltaSerialization {
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::Heap(pages) => pages.is_empty(),
+            Self::Mmap { file_len, pages } => *file_len == 0 && pages.is_empty(),
+        }
+    }
 }
 
 #[cfg(test)]

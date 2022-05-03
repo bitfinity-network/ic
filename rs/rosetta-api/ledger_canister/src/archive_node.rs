@@ -1,11 +1,13 @@
-use ledger_canister::{
-    metrics_encoder::MetricsEncoder, BlockHeight, BlockRes, EncodedBlock, GetBlocksArgs,
-    IterBlocksArgs,
-};
-
-use dfn_core::api::stable_memory_size_in_pages;
+use candid::candid_method;
+use dfn_candid::candid_one;
+use dfn_core::api::{print, stable_memory_size_in_pages};
 use dfn_core::{over_init, stable, BytesS};
 use dfn_protobuf::protobuf;
+use ic_metrics_encoder::MetricsEncoder;
+use ledger_canister::{
+    BlockHeight, BlockRange, BlockRes, CandidBlock, EncodedBlock, GetBlocksArgs, GetBlocksError,
+    GetBlocksResult, IterBlocksArgs, MAX_BLOCKS_PER_REQUEST,
+};
 use serde::{Deserialize, Serialize};
 use std::sync::RwLock;
 
@@ -21,7 +23,7 @@ struct ArchiveNodeState {
     pub block_height_offset: u64,
     pub blocks: Vec<EncodedBlock>,
     pub total_block_size: usize,
-    pub ledger_canister_id: ic_types::CanisterId,
+    pub ledger_canister_id: ic_base_types::CanisterId,
     #[serde(skip)]
     pub last_upgrade_timestamp: u64,
 }
@@ -30,7 +32,7 @@ const DEFAULT_MAX_MEMORY_SIZE: usize = 1024 * 1024 * 1024;
 
 impl ArchiveNodeState {
     pub fn new(
-        archive_main_canister_id: ic_types::CanisterId,
+        archive_main_canister_id: ic_base_types::CanisterId,
         block_height_offset: u64,
         max_memory_size_bytes: Option<usize>,
     ) -> Self {
@@ -43,14 +45,6 @@ impl ArchiveNodeState {
             last_upgrade_timestamp: 0,
         }
     }
-}
-
-// Helper to print messages in cyan
-fn print<S: std::convert::AsRef<str>>(s: S)
-where
-    yansi::Paint<S>: std::string::ToString,
-{
-    dfn_core::api::print(yansi::Paint::cyan(s).to_string());
 }
 
 // Append the Blocks to the internal Vec
@@ -95,7 +89,7 @@ fn remaining_capacity() -> usize {
 }
 
 fn init(
-    archive_main_canister_id: ic_types::CanisterId,
+    archive_main_canister_id: ic_base_types::CanisterId,
     block_height_offset: u64,
     max_memory_size_bytes: Option<usize>,
 ) {
@@ -168,6 +162,7 @@ fn iter_blocks_() {
     dfn_core::over(protobuf, |IterBlocksArgs { start, length }| {
         let archive_state = ARCHIVE_STATE.read().unwrap();
         let blocks = &archive_state.blocks;
+        let length = length.min(MAX_BLOCKS_PER_REQUEST);
         ledger_canister::iter_blocks(blocks, start, length)
     });
 }
@@ -180,15 +175,61 @@ fn get_blocks_() {
         let archive_state = ARCHIVE_STATE.read().unwrap();
         let blocks = &archive_state.blocks;
         let from_offset = archive_state.block_height_offset;
+        let length = length.min(MAX_BLOCKS_PER_REQUEST);
         ledger_canister::get_blocks(blocks, from_offset, start, length)
     });
+}
+
+#[candid_method(query, rename = "get_blocks")]
+fn get_blocks(GetBlocksArgs { start, length }: GetBlocksArgs) -> GetBlocksResult {
+    use ledger_canister::range_utils;
+
+    let archive_state = ARCHIVE_STATE.read().unwrap();
+    let blocks = &archive_state.blocks;
+
+    let block_range = range_utils::make_range(archive_state.block_height_offset, blocks.len());
+
+    if start < block_range.start {
+        return Err(GetBlocksError::BadFirstBlockIndex {
+            requested_index: start,
+            first_valid_index: block_range.start,
+        });
+    }
+
+    let requested_range = range_utils::make_range(start, length);
+    let effective_range = range_utils::intersect(
+        &block_range,
+        &range_utils::head(&requested_range, MAX_BLOCKS_PER_REQUEST),
+    );
+
+    let mut candid_blocks: Vec<CandidBlock> =
+        Vec::with_capacity(range_utils::range_len(&effective_range) as usize);
+
+    for i in effective_range {
+        let encoded_block = &blocks[(i - block_range.start) as usize];
+        let candid_block =
+            CandidBlock::from(encoded_block.decode().expect("failed to decode a block"));
+        candid_blocks.push(candid_block);
+    }
+
+    Ok(BlockRange {
+        blocks: candid_blocks,
+    })
+}
+
+/// Get multiple Blocks by BlockHeight and length. If the query is outside the
+/// range stored in the Node the result is an error.
+#[export_name = "canister_query get_blocks"]
+fn get_blocks_candid_() {
+    dfn_core::over(candid_one, get_blocks);
 }
 
 #[export_name = "canister_post_upgrade"]
 fn post_upgrade() {
     over_init(|_: BytesS| {
+        let bytes = stable::get();
         let mut state = ARCHIVE_STATE.write().unwrap();
-        *state = serde_cbor::from_reader(&mut stable::StableReader::new())
+        *state = ciborium::de::from_reader(std::io::Cursor::new(&bytes))
             .expect("Decoding stable memory failed");
         state.last_upgrade_timestamp = dfn_core::api::time_nanos();
     });
@@ -196,8 +237,6 @@ fn post_upgrade() {
 
 #[export_name = "canister_pre_upgrade"]
 fn pre_upgrade() {
-    use std::io::Write;
-
     dfn_core::setup::START.call_once(|| {
         dfn_core::printer::hook();
     });
@@ -206,9 +245,7 @@ fn pre_upgrade() {
         .read()
         // This should never happen, but it's better to be safe than sorry
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut writer = stable::StableWriter::new();
-    serde_cbor::to_writer(&mut writer, &*archive_state).unwrap();
-    writer.flush().unwrap();
+    ciborium::ser::into_writer(&*archive_state, stable::StableWriter::new()).unwrap();
 }
 
 fn encode_metrics(w: &mut MetricsEncoder<Vec<u8>>) -> std::io::Result<()> {
@@ -254,5 +291,29 @@ fn encode_metrics(w: &mut MetricsEncoder<Vec<u8>>) -> std::io::Result<()> {
 
 #[export_name = "canister_query http_request"]
 fn http_request() {
-    ledger_canister::http_request::serve_metrics(encode_metrics);
+    dfn_http_metrics::serve_metrics(encode_metrics);
+}
+
+#[export_name = "canister_query __get_candid_interface_tmp_hack"]
+fn get_canidid_interface() {
+    dfn_core::over(candid_one, |()| -> &'static str {
+        include_str!("../ledger_archive.did")
+    })
+}
+
+#[test]
+fn check_archive_candid_interface_compatibility() {
+    use candid::utils::CandidSource;
+
+    candid::export_service!();
+
+    let actual_interface = __export_service();
+    let expected_interface_path =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("ledger_archive.did");
+
+    candid::utils::service_compatible(
+        CandidSource::Text(&actual_interface),
+        CandidSource::File(&expected_interface_path),
+    )
+    .expect("ledger archive canister interface is not compatible with the ledger_archive.did file");
 }

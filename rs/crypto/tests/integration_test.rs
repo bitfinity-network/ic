@@ -5,18 +5,24 @@ use ic_crypto::utils::{
     get_node_keys_or_generate_if_missing, NodeKeysToGenerate, TempCryptoComponent,
 };
 use ic_crypto::CryptoComponent;
+use ic_crypto_internal_csp_test_utils::remote_csp_vault::{
+    get_temp_file_path, start_new_remote_csp_vault_server_for_test,
+};
 use ic_crypto_test_utils::tls::x509_certificates::generate_ed25519_cert;
-use ic_interfaces::crypto::KeyManager;
+use ic_interfaces::crypto::{KeyManager, PublicKeyRegistrationStatus};
 use ic_logger::replica_logger::no_op_logger;
 use ic_protobuf::crypto::v1::NodePublicKeys;
+use ic_protobuf::registry::crypto::v1::AlgorithmId as AlgorithmIdProto;
 use ic_protobuf::registry::crypto::v1::PublicKey;
 use ic_protobuf::registry::crypto::v1::X509PublicKeyCert;
-use ic_registry_client::fake::FakeRegistryClient;
-use ic_registry_common::proto_registry_data_provider::ProtoRegistryDataProvider;
+use ic_registry_client_fake::FakeRegistryClient;
+use ic_registry_proto_data_provider::ProtoRegistryDataProvider;
+use ic_test_utilities::crypto::temp_dir::temp_dir;
 use ic_test_utilities::types::ids::node_test_id;
 use ic_types::crypto::{AlgorithmId, CryptoError, KeyPurpose};
 use ic_types::RegistryVersion;
 use std::sync::Arc;
+use strum::IntoEnumIterator;
 
 mod keygen_utils;
 
@@ -34,6 +40,37 @@ fn should_successfully_construct_crypto_component_with_default_config() {
             no_op_logger(),
         );
     })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn should_successfully_construct_crypto_component_with_remote_csp_vault() {
+    let socket_path = start_new_remote_csp_vault_server_for_test();
+    let temp_dir = temp_dir(); // temp dir with correct permissions
+    let crypto_root = temp_dir.path().to_path_buf();
+    let config = CryptoConfig::new_with_unix_socket_vault(crypto_root, socket_path);
+    let registry_client = FakeRegistryClient::new(Arc::new(ProtoRegistryDataProvider::new()));
+    CryptoComponent::new_with_fake_node_id(
+        &config,
+        Arc::new(registry_client),
+        node_test_id(42),
+        no_op_logger(),
+    );
+}
+
+#[test]
+#[should_panic(expected = "Could not connect to CspVault at socket")]
+fn should_not_construct_crypto_component_if_remote_csp_vault_is_missing() {
+    let socket_path = get_temp_file_path(); // no CSP vault server is running
+    let temp_dir = temp_dir(); // temp dir with correct permissions
+    let crypto_root = temp_dir.path().to_path_buf();
+    let config = CryptoConfig::new_with_unix_socket_vault(crypto_root, socket_path);
+    let registry_client = FakeRegistryClient::new(Arc::new(ProtoRegistryDataProvider::new()));
+    CryptoComponent::new_with_fake_node_id(
+        &config,
+        Arc::new(registry_client),
+        node_test_id(42),
+        no_op_logger(),
+    );
 }
 
 #[test]
@@ -113,6 +150,7 @@ fn all_node_keys_are_present(node_pks: &NodePublicKeys) -> bool {
         && node_pks.committee_signing_pk.is_some()
         && node_pks.tls_certificate.is_some()
         && node_pks.dkg_dealing_encryption_pk.is_some()
+        && node_pks.idkg_dealing_encryption_pk.is_some()
 }
 
 #[test]
@@ -123,7 +161,9 @@ fn should_fail_check_keys_with_registry_if_no_keys_are_present_in_registry() {
 
     let result = crypto.get().check_keys_with_registry(REG_V1);
 
-    assert!(result.is_err());
+    assert!(
+        matches!(result, Err(CryptoError::PublicKeyNotFound { key_purpose, .. }) if key_purpose == KeyPurpose::NodeSigning)
+    );
 }
 
 #[test]
@@ -190,6 +230,36 @@ fn should_fail_check_keys_with_registry_if_dkg_dealing_encryption_key_is_missing
 }
 
 #[test]
+fn should_fail_check_keys_with_registry_if_idkg_dealing_encryption_key_is_missing_in_registry_and_pubkey_store(
+) {
+    let crypto = TestKeygenCrypto::builder()
+        .with_node_keys_to_generate(NodeKeysToGenerate::all_except_idkg_dealing_encryption_key())
+        .add_generated_node_signing_key_to_registry()
+        .add_generated_committee_signing_key_to_registry()
+        .add_generated_dkg_dealing_enc_key_to_registry()
+        .add_generated_tls_cert_to_registry()
+        .build(NODE_ID, REG_V1);
+    let idkg_dealing_encryption_pk_in_public_key_store =
+        crypto.get().node_public_keys().idkg_dealing_encryption_pk;
+    assert!(idkg_dealing_encryption_pk_in_public_key_store.is_none());
+
+    let result = crypto.get().check_keys_with_registry(REG_V1);
+
+    ///////////////////////////////////////////////////////////////////////////
+    // TODO: use this assert once iDKG key rollout is finished and the iDKG
+    // key checks are no longer conditional
+    ///////////////////////////////////////////////////////////////////////////
+    // assert!(
+    //     matches!(result, Err(CryptoError::PublicKeyNotFound { key_purpose, .. }) if key_purpose == KeyPurpose::IDkgMEGaEncryption)
+    // );
+    ///////////////////////////////////////////////////////////////////////////
+    assert!(matches!(
+        result,
+        Ok(PublicKeyRegistrationStatus::AllKeysRegistered)
+    ));
+}
+
+#[test]
 fn should_fail_check_keys_with_registry_if_tls_cert_is_missing_in_registry() {
     let crypto = TestKeygenCrypto::builder()
         .with_node_keys_to_generate(NodeKeysToGenerate::all())
@@ -210,11 +280,12 @@ fn should_fail_check_keys_with_registry_if_tls_cert_is_missing_in_registry() {
 }
 
 #[test]
-fn should_fail_check_keys_with_registry_if_cert_is_malformed() {
+fn should_fail_check_keys_with_registry_if_tls_cert_is_malformed() {
     let node_keys_to_generate = NodeKeysToGenerate {
         generate_node_signing_keys: true,
         generate_committee_signing_keys: true,
         generate_dkg_dealing_encryption_keys: true,
+        generate_idkg_dealing_encryption_keys: true,
         generate_tls_keys_and_certificate: false,
     };
     let malformed_cert = X509PublicKeyCert {
@@ -226,6 +297,7 @@ fn should_fail_check_keys_with_registry_if_cert_is_malformed() {
         .add_generated_node_signing_key_to_registry()
         .add_generated_committee_signing_key_to_registry()
         .add_generated_dkg_dealing_enc_key_to_registry()
+        .add_generated_idkg_dealing_enc_key_to_registry()
         .build(NODE_ID, REG_V1);
 
     let result = crypto.get().check_keys_with_registry(REG_V1);
@@ -233,7 +305,7 @@ fn should_fail_check_keys_with_registry_if_cert_is_malformed() {
     assert!(matches!(
         result,
         Err(CryptoError::MalformedPublicKey {
-            algorithm: AlgorithmId::Ed25519,
+            algorithm: AlgorithmId::Tls,
             key_bytes: None,
             internal_error
         })
@@ -546,18 +618,227 @@ fn should_fail_check_keys_with_registry_if_tls_cert_secret_key_is_missing() {
 }
 
 #[test]
-fn should_succeed_check_keys_with_registry_if_all_keys_are_present() {
+fn should_fail_check_keys_with_registry_if_idkg_dealing_encryption_pubkey_algorithm_is_unsupported()
+{
+    let idkg_dealing_enc_pubkey_with_unsupported_algorithm = {
+        let mut key = well_formed_idkg_dealing_encryption_pk();
+        key.algorithm = AlgorithmIdProto::Tls as i32;
+        key
+    };
     let crypto = TestKeygenCrypto::builder()
         .with_node_keys_to_generate(NodeKeysToGenerate::all())
         .add_generated_node_signing_key_to_registry()
         .add_generated_committee_signing_key_to_registry()
         .add_generated_dkg_dealing_enc_key_to_registry()
         .add_generated_tls_cert_to_registry()
+        .with_idkg_dealing_enc_key_in_registry(idkg_dealing_enc_pubkey_with_unsupported_algorithm)
         .build(NODE_ID, REG_V1);
 
     let result = crypto.get().check_keys_with_registry(REG_V1);
 
-    assert!(result.is_ok());
+    ///////////////////////////////////////////////////////////////////////////
+    // TODO: use this assert once iDKG key rollout is finished and the iDKG
+    // key checks are no longer conditional
+    ///////////////////////////////////////////////////////////////////////////
+    // assert!(
+    //     matches!(result, Err(CryptoError::MalformedPublicKey { algorithm, internal_error, ..})
+    //         if algorithm == AlgorithmId::MegaSecp256k1
+    //         && internal_error.contains("unsupported algorithm")
+    //     )
+    // );
+    ///////////////////////////////////////////////////////////////////////////
+    assert!(matches!(
+        result,
+        Ok(PublicKeyRegistrationStatus::AllKeysRegistered)
+    ));
+}
+
+#[test]
+fn should_fail_check_keys_with_registry_if_idkg_dealing_encryption_pubkey_is_malformed() {
+    let malformed_idkg_dealing_enc_pubkey = {
+        let mut key = well_formed_idkg_dealing_encryption_pk();
+        key.key_value = b"malformed key".to_vec();
+        key
+    };
+    let crypto = TestKeygenCrypto::builder()
+        .with_node_keys_to_generate(NodeKeysToGenerate::all())
+        .add_generated_node_signing_key_to_registry()
+        .add_generated_committee_signing_key_to_registry()
+        .add_generated_dkg_dealing_enc_key_to_registry()
+        .add_generated_tls_cert_to_registry()
+        .with_idkg_dealing_enc_key_in_registry(malformed_idkg_dealing_enc_pubkey)
+        .build(NODE_ID, REG_V1);
+
+    let result = crypto.get().check_keys_with_registry(REG_V1);
+
+    ///////////////////////////////////////////////////////////////////////////
+    // TODO: use this assert once iDKG key rollout is finished and the iDKG
+    // key checks are no longer conditional
+    ///////////////////////////////////////////////////////////////////////////
+    // assert!(
+    //     matches!(result, Err(CryptoError::MalformedPublicKey { algorithm, internal_error, ..})
+    //         if algorithm == AlgorithmId::MegaSecp256k1
+    //         && internal_error.contains("malformed")
+    //     )
+    // );
+    ///////////////////////////////////////////////////////////////////////////
+    assert!(matches!(
+        result,
+        Ok(PublicKeyRegistrationStatus::AllKeysRegistered)
+    ));
+}
+
+#[test]
+fn should_fail_check_keys_with_registry_if_idkg_dealing_encryption_secret_key_is_missing() {
+    let idkg_dealing_enc_pubkey_with_without_secret_part_in_store =
+        well_formed_idkg_dealing_encryption_pk();
+    let crypto = TestKeygenCrypto::builder()
+        .with_node_keys_to_generate(NodeKeysToGenerate::all())
+        .add_generated_node_signing_key_to_registry()
+        .add_generated_committee_signing_key_to_registry()
+        .add_generated_dkg_dealing_enc_key_to_registry()
+        .add_generated_tls_cert_to_registry()
+        .with_idkg_dealing_enc_key_in_registry(
+            idkg_dealing_enc_pubkey_with_without_secret_part_in_store,
+        )
+        .build(NODE_ID, REG_V1);
+
+    let result = crypto.get().check_keys_with_registry(REG_V1);
+
+    ///////////////////////////////////////////////////////////////////////////
+    // TODO: use this assert once iDKG key rollout is finished and the iDKG
+    // key checks are no longer conditional
+    ///////////////////////////////////////////////////////////////////////////
+    // assert!(
+    //     matches!(result, Err(CryptoError::SecretKeyNotFound { algorithm, ..}) if algorithm == AlgorithmId::MegaSecp256k1)
+    // );
+    ///////////////////////////////////////////////////////////////////////////
+    assert!(matches!(
+        result,
+        Ok(PublicKeyRegistrationStatus::AllKeysRegistered)
+    ));
+}
+
+#[test]
+fn should_succeed_check_keys_with_registry_if_all_keys_are_present() {
+    let crypto = TestKeygenCrypto::builder()
+        .with_node_keys_to_generate(NodeKeysToGenerate::all())
+        .add_generated_node_signing_key_to_registry()
+        .add_generated_committee_signing_key_to_registry()
+        .add_generated_dkg_dealing_enc_key_to_registry()
+        .add_generated_idkg_dealing_enc_key_to_registry()
+        .add_generated_tls_cert_to_registry()
+        .build(NODE_ID, REG_V1);
+
+    let result = crypto.get().check_keys_with_registry(REG_V1);
+
+    assert!(matches!(
+        result,
+        Ok(PublicKeyRegistrationStatus::AllKeysRegistered)
+    ));
+}
+
+#[test]
+fn should_succeed_check_keys_with_registry_if_idkg_key_requires_registration() {
+    // I-DKG key requires registration if it is not in the registry but in the public key store
+    let crypto = TestKeygenCrypto::builder()
+        .with_node_keys_to_generate(NodeKeysToGenerate::all())
+        .add_generated_node_signing_key_to_registry()
+        .add_generated_committee_signing_key_to_registry()
+        .add_generated_dkg_dealing_enc_key_to_registry()
+        .add_generated_tls_cert_to_registry()
+        // explicitly not adding the I-DKG dealing encryption key to the registry
+        .build(NODE_ID, REG_V1);
+    let idkg_dealing_encryption_pk_in_public_key_store =
+        crypto.get().node_public_keys().idkg_dealing_encryption_pk;
+    assert!(idkg_dealing_encryption_pk_in_public_key_store.is_some());
+
+    let result = crypto.get().check_keys_with_registry(REG_V1);
+
+    assert!(matches!(
+        result,
+        Ok(PublicKeyRegistrationStatus::IDkgDealingEncPubkeyNeedsRegistration(key))
+          if key == idkg_dealing_encryption_pk_in_public_key_store.unwrap()
+    ));
+}
+
+/// If this test fails it means that one of AlgorithmId and AlgorithmIdProto structs was updated but not the other.
+/// Ensure the structs are consistent and then update the test below.
+#[test]
+fn algorithm_id_should_match_algorithm_id_proto() {
+    let algorithm_id_variants = 17;
+    assert_eq!(AlgorithmId::iter().count(), algorithm_id_variants);
+
+    for i in 0..algorithm_id_variants {
+        assert!(AlgorithmIdProto::from_i32(i as i32).is_some());
+    }
+    assert!(AlgorithmIdProto::from_i32(algorithm_id_variants as i32).is_none());
+
+    assert_eq!(
+        AlgorithmId::Placeholder as i32,
+        AlgorithmIdProto::Unspecified as i32
+    );
+    assert_eq!(
+        AlgorithmId::MultiBls12_381 as i32,
+        AlgorithmIdProto::MultiBls12381 as i32
+    );
+    assert_eq!(
+        AlgorithmId::ThresBls12_381 as i32,
+        AlgorithmIdProto::ThresBls12381 as i32
+    );
+    assert_eq!(
+        AlgorithmId::SchnorrSecp256k1 as i32,
+        AlgorithmIdProto::SchnorrSecp256k1 as i32
+    );
+    assert_eq!(
+        AlgorithmId::StaticDhSecp256k1 as i32,
+        AlgorithmIdProto::StaticDhSecp256k1 as i32
+    );
+    assert_eq!(
+        AlgorithmId::HashSha256 as i32,
+        AlgorithmIdProto::HashSha256 as i32
+    );
+    assert_eq!(AlgorithmId::Tls as i32, AlgorithmIdProto::Tls as i32);
+    assert_eq!(
+        AlgorithmId::Ed25519 as i32,
+        AlgorithmIdProto::Ed25519 as i32
+    );
+    assert_eq!(
+        AlgorithmId::Secp256k1 as i32,
+        AlgorithmIdProto::Secp256k1 as i32
+    );
+    assert_eq!(
+        AlgorithmId::Groth20_Bls12_381 as i32,
+        AlgorithmIdProto::Groth20Bls12381 as i32
+    );
+    assert_eq!(
+        AlgorithmId::NiDkg_Groth20_Bls12_381 as i32,
+        AlgorithmIdProto::NidkgGroth20Bls12381 as i32
+    );
+    assert_eq!(
+        AlgorithmId::EcdsaP256 as i32,
+        AlgorithmIdProto::EcdsaP256 as i32
+    );
+    assert_eq!(
+        AlgorithmId::EcdsaSecp256k1 as i32,
+        AlgorithmIdProto::EcdsaSecp256k1 as i32
+    );
+    assert_eq!(
+        AlgorithmId::IcCanisterSignature as i32,
+        AlgorithmIdProto::IcCanisterSignature as i32
+    );
+    assert_eq!(
+        AlgorithmId::RsaSha256 as i32,
+        AlgorithmIdProto::RsaSha256 as i32
+    );
+    assert_eq!(
+        AlgorithmId::ThresholdEcdsaSecp256k1 as i32,
+        AlgorithmIdProto::ThresholdEcdsaSecp256k1 as i32
+    );
+    assert_eq!(
+        AlgorithmId::MegaSecp256k1 as i32,
+        AlgorithmIdProto::MegaSecp256k1 as i32
+    );
 }
 
 fn well_formed_dkg_dealing_encryption_pk() -> PublicKey {
@@ -567,12 +848,19 @@ fn well_formed_dkg_dealing_encryption_pk() -> PublicKey {
     let (_temp_crypto, node_pubkeys) = TempCryptoComponent::new_with_node_keys_generation(
         Arc::clone(&dummy_registry_client) as Arc<_>,
         dummy_node_id,
-        NodeKeysToGenerate {
-            generate_node_signing_keys: false,
-            generate_committee_signing_keys: false,
-            generate_dkg_dealing_encryption_keys: true,
-            generate_tls_keys_and_certificate: false,
-        },
+        NodeKeysToGenerate::only_dkg_dealing_encryption_key(),
     );
     node_pubkeys.dkg_dealing_encryption_pk.unwrap()
+}
+
+fn well_formed_idkg_dealing_encryption_pk() -> PublicKey {
+    let dummy_node_id = node_test_id(NODE_ID);
+    let dummy_data_provider = Arc::new(ProtoRegistryDataProvider::new());
+    let dummy_registry_client = Arc::new(FakeRegistryClient::new(dummy_data_provider));
+    let (_temp_crypto, node_pubkeys) = TempCryptoComponent::new_with_node_keys_generation(
+        Arc::clone(&dummy_registry_client) as Arc<_>,
+        dummy_node_id,
+        NodeKeysToGenerate::only_idkg_dealing_encryption_key(),
+    );
+    node_pubkeys.idkg_dealing_encryption_pk.unwrap()
 }

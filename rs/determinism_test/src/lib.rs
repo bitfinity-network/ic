@@ -1,25 +1,22 @@
 mod setup;
 
 use ic_ic00_types::{
-    CanisterIdRecord, InstallCodeArgs, Method as Ic00Method, Payload,
+    CanisterIdRecord, CanisterInstallMode, InstallCodeArgs, Method as Ic00Method, Payload,
     ProvisionalCreateCanisterWithCyclesArgs, IC_00,
 };
-use ic_interfaces::{
-    execution_environment::IngressHistoryReader,
-    messaging::MessageRouting,
-    state_manager::{
-        PermanentStateHashError::*, StateHashError, StateManager, StateReader,
-        TransientStateHashError::*,
-    },
+use ic_interfaces::{execution_environment::IngressHistoryReader, messaging::MessageRouting};
+use ic_interfaces_state_manager::{
+    PermanentStateHashError::*, StateHashError, StateManager, StateReader,
+    TransientStateHashError::*,
 };
 use ic_messaging::MessageRoutingImpl;
 use ic_state_manager::StateManagerImpl;
 use ic_test_utilities::types::messages::SignedIngressBuilder;
 use ic_types::{
     artifact::SignedIngress,
-    batch::{Batch, BatchPayload, IngressPayload, SelfValidatingPayload, XNetPayload},
+    batch::{Batch, BatchPayload, IngressPayload},
     ingress::{IngressStatus, WasmResult},
-    messages::{CanisterInstallMode, MessageId},
+    messages::MessageId,
     time::UNIX_EPOCH,
     CanisterId, CryptoHashOfState, Randomness, RegistryVersion,
 };
@@ -33,12 +30,10 @@ fn build_batch(message_routing: &dyn MessageRouting, msgs: Vec<SignedIngress>) -
         requires_full_state_hash: false,
         payload: BatchPayload {
             ingress: IngressPayload::from(msgs),
-            xnet: XNetPayload {
-                stream_slices: Default::default(),
-            },
-            self_validating: SelfValidatingPayload::default(),
+            ..BatchPayload::default()
         },
         randomness: Randomness::from([0; 32]),
+        ecdsa_subnet_public_key: None,
         registry_version: RegistryVersion::from(1),
         time: UNIX_EPOCH,
         consensus_responses: vec![],
@@ -51,12 +46,10 @@ fn build_batch_with_full_state_hash(message_routing: &dyn MessageRouting) -> Bat
         requires_full_state_hash: true,
         payload: BatchPayload {
             ingress: IngressPayload::from(vec![]),
-            xnet: XNetPayload {
-                stream_slices: Default::default(),
-            },
-            self_validating: SelfValidatingPayload::default(),
+            ..BatchPayload::default()
         },
         randomness: Randomness::from([0; 32]),
+        ecdsa_subnet_public_key: None,
         registry_version: RegistryVersion::from(1),
         time: UNIX_EPOCH,
         consensus_responses: vec![],
@@ -85,6 +78,9 @@ fn wait_for_ingress_message(
                 WasmResult::Reply(bytes) => return bytes,
             },
             IngressStatus::Failed { error, .. } => panic!("{:?}", error),
+            IngressStatus::Done { .. } => {
+                panic!("The call has completed but the reply/reject data has been pruned.")
+            }
             IngressStatus::Received { .. }
             | IngressStatus::Processing { .. }
             | IngressStatus::Unknown => sleep(Duration::from_millis(5)),
@@ -201,6 +197,9 @@ fn install_canister(
                 break;
             }
             IngressStatus::Failed { error, .. } => panic!("{:?}", error),
+            IngressStatus::Done { .. } => {
+                panic!("The call has completed but the reply/reject data has been pruned.")
+            }
             IngressStatus::Received { .. }
             | IngressStatus::Processing { .. }
             | IngressStatus::Unknown => sleep(Duration::from_millis(5)),

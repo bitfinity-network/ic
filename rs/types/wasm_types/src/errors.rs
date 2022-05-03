@@ -30,6 +30,8 @@ pub enum WasmValidationError {
     ParityDeserializeError(ParityWasmError),
     /// wasmtime::Module::validate() failed
     WasmtimeValidation(String),
+    /// Failed to decode the canister module.
+    DecodingError(String),
     /// Module contains an invalid function signature
     InvalidFunctionSignature(String),
     /// Module contains an invalid import section
@@ -38,10 +40,14 @@ pub enum WasmValidationError {
     InvalidExportSection(String),
     /// Module contains an invalid data section
     InvalidDataSection(String),
+    /// Module contains an invalid custom section
+    InvalidCustomSection(String),
     /// Module contains too many globals.
     TooManyGlobals { defined: usize, allowed: usize },
     /// Module contains too many functions.
     TooManyFunctions { defined: usize, allowed: usize },
+    /// Module contains too many custom sections.
+    TooManyCustomSections { defined: usize, allowed: usize },
     /// Module defines an invalid index for a local function.
     InvalidFunctionIndex { index: usize, import_count: usize },
 }
@@ -55,6 +61,9 @@ impl std::fmt::Display for WasmValidationError {
             Self::WasmtimeValidation(err) => {
                 write!(f, "Wasmtime failed to validate wasm module {}", err)
             }
+            Self::DecodingError(err) => {
+                write!(f, "Failed to decode wasm module: {}", err)
+            }
             Self::InvalidFunctionSignature(err) => {
                 write!(f, "Wasm module has an invalid function signature. {}", err)
             }
@@ -67,6 +76,9 @@ impl std::fmt::Display for WasmValidationError {
             Self::InvalidDataSection(err) => {
                 write!(f, "Wasm module has an invalid data section. {}", err)
             }
+            Self::InvalidCustomSection(err) => {
+                write!(f, "Wasm module has an invalid custom section. {}", err)
+            }
             Self::TooManyGlobals { defined, allowed } => write!(
                 f,
                 "Wasm module defined {} globals which exceeds the maximum number allowed {}.",
@@ -75,6 +87,11 @@ impl std::fmt::Display for WasmValidationError {
             Self::TooManyFunctions { defined, allowed } => write!(
                 f,
                 "Wasm module defined {} functions which exceeds the maximum number allowed {}.",
+                defined, allowed
+            ),
+            Self::TooManyCustomSections { defined, allowed } => write!(
+                f,
+                "Wasm module defined {} custom sections which exceeds the maximum number allowed {}.",
                 defined, allowed
             ),
             Self::InvalidFunctionIndex {
@@ -105,6 +122,7 @@ pub enum WasmInstrumentationError {
         offset: usize,
         len: usize,
     },
+    InvalidExport(String),
 }
 
 impl std::fmt::Display for WasmInstrumentationError {
@@ -126,6 +144,9 @@ impl std::fmt::Display for WasmInstrumentationError {
                 "Wasm module has invalid data segment of {} bytes at {}",
                 len, offset
             ),
+            Self::InvalidExport(err) => {
+                write!(f, "Failed to export: {}", err)
+            }
         }
     }
 }

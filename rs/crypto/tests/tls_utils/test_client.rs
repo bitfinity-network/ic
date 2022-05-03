@@ -4,7 +4,7 @@ use ic_crypto::utils::TempCryptoComponent;
 use ic_crypto_tls_interfaces::TlsPublicKeyCert;
 use ic_crypto_tls_interfaces::{TlsClientHandshakeError, TlsHandshake, TlsReadHalf, TlsWriteHalf};
 use ic_protobuf::registry::crypto::v1::X509PublicKeyCert;
-use ic_registry_client::fake::FakeRegistryClient;
+use ic_registry_client_fake::FakeRegistryClient;
 use ic_types::NodeId;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -77,7 +77,7 @@ impl Client {
 
         let tls_stream = self
             .crypto
-            .perform_tls_client_handshake_with_rustls(tcp_stream, self.server_node_id, REG_V1)
+            .perform_tls_client_handshake(tcp_stream, self.server_node_id, REG_V1)
             .await?;
         let (mut rh, mut wh) = tls_stream.split();
 

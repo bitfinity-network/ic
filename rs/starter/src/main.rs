@@ -20,17 +20,21 @@
 //!   - serves metrics at localhost:18080 instead of dumping them at stdout
 
 use anyhow::Result;
+use clap::Parser;
 use ic_config::{
+    adapters::AdaptersConfig,
     artifact_pool::ArtifactPoolTomlConfig,
     consensus::ConsensusConfig,
     crypto::CryptoConfig,
     execution_environment::Config as HypervisorConfig,
+    flag_status::FlagStatus,
     http_handler,
     http_handler::PortConfig,
     logger::Config as LoggerConfig,
     metrics::{Config as MetricsConfig, Exporter},
     registry_client::{Config as RegistryClientConfig, DataProviderConfig},
     state_manager::Config as StateManagerConfig,
+    transport::{TransportConfig, TransportFlowConfig},
     ConfigOptional as ReplicaConfig,
 };
 use ic_logger::LoggerImpl;
@@ -39,13 +43,10 @@ use ic_prep_lib::{
     node::{NodeConfiguration, NodeIndex},
     subnet_configuration::SubnetConfig,
 };
+use ic_protobuf::registry::subnet::v1::SubnetFeatures;
 use ic_registry_provisional_whitelist::ProvisionalWhitelist;
 use ic_registry_subnet_type::SubnetType;
-use ic_types::{
-    registry::connection_endpoint::ConnectionEndpoint,
-    transport::{TransportConfig, TransportFlowConfig},
-    Height,
-};
+use ic_types::{registry::connection_endpoint::ConnectionEndpoint, Height};
 use serde::{Deserialize, Serialize};
 use slog::info;
 use std::{
@@ -55,7 +56,6 @@ use std::{
     time::Duration,
 };
 use std::{io, os::unix::process::CommandExt, path::PathBuf, process::Command};
-use structopt::StructOpt;
 use tempfile::TempDir;
 
 const NODE_INDEX: NodeIndex = 100;
@@ -65,7 +65,7 @@ fn main() -> Result<()> {
     let logger = LoggerImpl::new(&LoggerConfig::default(), "starter_slog".to_string());
     let log = logger.root.new(slog::o!("Application" => "starter"));
 
-    let config = CliArgs::from_args().validate()?;
+    let config = CliArgs::parse().validate()?;
     info!(log, "ic-starter. Configuration: {:?}", config);
     let config_path = config.state_dir.join("ic.json5");
     if config_path.as_path().exists() {
@@ -97,6 +97,8 @@ fn main() -> Result<()> {
                 p2p_start_flow_tag: 0,
                 prometheus_metrics: vec![],
                 node_operator_principal_id: None,
+                no_idkg_key: false,
+                secret_key_store: None,
             },
         );
 
@@ -115,11 +117,11 @@ fn main() -> Result<()> {
                 config.initial_notary_delay,
                 config.dkg_interval_length,
                 None,
-                SubnetType::System,
+                config.subnet_type,
                 None,
                 None,
                 None,
-                None,
+                Some(config.subnet_features),
                 None,
                 vec![],
                 vec![],
@@ -134,12 +136,8 @@ fn main() -> Result<()> {
             /* target_dir= */ config.state_dir.as_path(),
             topology_config,
             /* replica_version_id= */ None,
-            /* replica_donwload_url= */ None,
-            /* replica_hash */ None,
             /* generate_subnet_records= */ true, // see note above
             /* nns_subnet_index= */ Some(0),
-            /* nodemanager_download_url= */ None,
-            /* nodemanager_sha256_hex */ None,
             /* release_package_url= */ None,
             /* release_package_sha256_hex */ None,
             config.provisional_whitelist,
@@ -183,8 +181,8 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, StructOpt)]
-#[structopt(name = "ic-starter", about = "Starter.")]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Parser)]
+#[clap(name = "ic-starter", about = "Starter.", version)]
 struct CliArgs {
     /// Path the to replica binary.
     ///
@@ -192,17 +190,17 @@ struct CliArgs {
     /// expected that a config will be found for '--bin replica'. In other
     /// words, it is expected that the starter is invoked from the rs/
     /// directory.
-    #[structopt(long = "replica-path", parse(from_os_str))]
+    #[clap(long = "replica-path", parse(from_os_str))]
     replica_path: Option<PathBuf>,
 
     /// Version of the replica binary.
-    #[structopt(long = "replica-version", default_value = "0.8.0")]
+    #[clap(long = "replica-version", default_value = "0.8.0")]
     replica_version: String,
 
     /// Path to the cargo binary. Not optional because there is a default value.
     ///
     /// Unused if --replica-path is present
-    #[structopt(long = "cargo", default_value = "cargo")]
+    #[clap(long = "cargo", default_value = "cargo")]
     cargo_bin: String,
 
     /// Options to pass to cargo, such as "--release". Not optional because
@@ -212,13 +210,13 @@ struct CliArgs {
     /// instance: cargo run ic-starter -- '--cargo-opts=--release --quiet'
     ///
     /// Unused if --replica-path is present
-    #[structopt(long = "cargo-opts", default_value = "")]
+    #[clap(long = "cargo-opts", default_value = "")]
     cargo_opts: String,
 
     /// Path to the directory containing all state for this replica. (default: a
     /// temp directory that will be deleted immediately when the replica
     /// stops).
-    #[structopt(long = "state-dir", parse(from_os_str))]
+    #[clap(long = "state-dir", parse(from_os_str))]
     state_dir: Option<PathBuf>,
 
     /// The http port of the public API.
@@ -227,14 +225,14 @@ struct CliArgs {
     /// used.
     ///
     /// This argument is incompatible with --http-port-file.
-    #[structopt(long = "http-port")]
+    #[clap(long = "http-port")]
     http_port: Option<u16>,
 
     /// The http listening address of the public API.
     ///
     /// If not specified, and if --http-port-file is empty, then 127.0.0.1:8080
     /// will be used.
-    #[structopt(long = "http-listen-addr")]
+    #[clap(long = "http-listen-addr")]
     http_listen_addr: Option<SocketAddr>,
 
     /// The file where the chosen port of the public api will be written to.
@@ -242,54 +240,72 @@ struct CliArgs {
     /// at start time.
     ///
     /// This argument is incompatible with --http-port.
-    #[structopt(long = "http-port-file", parse(from_os_str))]
+    #[clap(long = "http-port-file", parse(from_os_str))]
     http_port_file: Option<PathBuf>,
 
     /// Arg to control whitelist for creating funds which is either set to "*"
     /// or "".
-    #[structopt(short = "-c", long = "create-funds-whitelist")]
+    #[clap(short = 'c', long = "create-funds-whitelist")]
     provisional_whitelist: Option<String>,
 
     /// Run replica with the provided log level. Default is Warning
-    #[structopt(long = "log-level",
+    #[clap(long = "log-level",
                 possible_values = &["critical", "error", "warning", "info", "debug", "trace"],
-                case_insensitive = true)]
+                ignore_case = true)]
     log_level: Option<String>,
 
     /// Metrics port. Default is None, i.e. periodically dump metrics on stdout.
-    #[structopt(long = "metrics-port")]
+    #[clap(long = "metrics-port")]
     metrics_port: Option<u16>,
 
     /// Metrics address. Use this in preference to metrics-port
-    #[structopt(long = "metrics-addr")]
+    #[clap(long = "metrics-addr")]
     metrics_addr: Option<SocketAddr>,
 
     /// Unit delay for blockmaker (in milliseconds).
     /// If running integration tests locally (e.g. ic-ref-test),
     /// setting this to 100ms results in faster execution (and higher
     /// CPU consumption).
-    #[structopt(long = "unit-delay-millis")]
+    #[clap(long = "unit-delay-millis")]
     unit_delay_millis: Option<u64>,
 
     /// Initial delay for notary (in milliseconds).
     /// If running integration tests locally (e.g. ic-ref-test),
     /// setting this to 100ms results in faster execution (and higher
     /// CPU consumption).
-    #[structopt(long = "initial-notary-delay-millis")]
+    #[clap(long = "initial-notary-delay-millis")]
     initial_notary_delay_millis: Option<u64>,
 
     /// DKG interval length (in number of blocks).
-    #[structopt(long = "dkg-interval-length")]
+    #[clap(long = "dkg-interval-length")]
     dkg_interval_length: Option<u64>,
 
     /// Whether or not to detect and warn of starvations in consensus.
-    #[structopt(long = "detect-consensus-starvation")]
+    #[clap(long = "detect-consensus-starvation")]
     detect_consensus_starvation: Option<bool>,
 
     /// The backend DB used by Consensus, can be rocksdb or lmdb.
-    #[structopt(long = "consensus-pool-backend",
+    #[clap(long = "consensus-pool-backend",
                 possible_values = &["lmdb", "rocksdb"])]
     consensus_pool_backend: Option<String>,
+
+    /// Subnet features
+    #[clap(long = "subnet-features",
+                possible_values = &["ecdsa_signatures", "canister_sandboxing", "http_requests", "bitcoin_testnet_feature"],multiple_values(true))]
+    subnet_features: Vec<String>,
+
+    /// Subnet type
+    #[clap(long = "subnet-type",
+                possible_values = &["application", "verified_application", "system"])]
+    subnet_type: Option<String>,
+
+    /// Unix Domain Socket for Bitcoin testnet
+    #[clap(long = "bitcoin-testnet-uds-path")]
+    bitcoin_testnet_uds_path: Option<PathBuf>,
+
+    /// Unix Domain Socket for canister http adapter
+    #[clap(long = "canister-http-uds-path")]
+    canister_http_uds_path: Option<PathBuf>,
 }
 
 impl CliArgs {
@@ -309,7 +325,7 @@ impl CliArgs {
         let cargo_opts = self.cargo_opts;
 
         // check whether state_dir exists; create it if needed.
-        let (state_dir, state_dir_holder) = if self.state_dir.is_none() {
+        let (state_dir, _state_dir_holder) = if self.state_dir.is_none() {
             let maybe_dir = tempfile::tempdir();
             if maybe_dir.is_err() {
                 return Err(io::Error::new(
@@ -442,6 +458,18 @@ impl CliArgs {
         let unit_delay = self.unit_delay_millis.map(Duration::from_millis);
         let initial_notary_delay = self.initial_notary_delay_millis.map(Duration::from_millis);
 
+        let subnet_type = match self.subnet_type.as_deref() {
+            Some("application") => SubnetType::Application,
+            Some("verified_application") => SubnetType::VerifiedApplication,
+            Some("system") | None => SubnetType::System,
+            Some(s) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("Invalid subnet_type: {}", s),
+                ))
+            }
+        };
+
         Ok(ValidatedConfig {
             replica_path,
             replica_version,
@@ -457,13 +485,34 @@ impl CliArgs {
             crypto_root,
             state_manager_root,
             registry_local_store_path,
-            state_dir_holder,
+            _state_dir_holder,
             unit_delay,
             initial_notary_delay,
             dkg_interval_length: self.dkg_interval_length.map(Height::from),
             detect_consensus_starvation: self.detect_consensus_starvation,
             consensus_pool_backend: self.consensus_pool_backend,
+            subnet_features: to_subnet_features(&self.subnet_features),
+            subnet_type,
+            bitcoin_testnet_uds_path: self.bitcoin_testnet_uds_path,
+            canister_http_uds_path: self.canister_http_uds_path,
         })
+    }
+}
+
+fn to_subnet_features(features: &[String]) -> SubnetFeatures {
+    let ecdsa_signatures = features.iter().any(|s| s.as_str() == "ecdsa_signatures");
+    let canister_sandboxing = features.iter().any(|s| s.as_str() == "canister_sandboxing");
+    let http_requests = features.iter().any(|s| s.as_str() == "http_requests");
+    let bitcoin_testnet_feature = features
+        .iter()
+        .find(|s| s.as_str() == "bitcoin_testnet_feature")
+        .map(|_| 2); // BitcoinFeature::Enabled
+
+    SubnetFeatures {
+        ecdsa_signatures,
+        canister_sandboxing,
+        http_requests,
+        bitcoin_testnet_feature,
     }
 }
 
@@ -488,9 +537,13 @@ struct ValidatedConfig {
     dkg_interval_length: Option<Height>,
     detect_consensus_starvation: Option<bool>,
     consensus_pool_backend: Option<String>,
+    subnet_features: SubnetFeatures,
+    subnet_type: SubnetType,
+    bitcoin_testnet_uds_path: Option<PathBuf>,
+    canister_http_uds_path: Option<PathBuf>,
 
     // Not intended to ever be read: role is to keep the temp dir from being deleted.
-    state_dir_holder: Option<TempDir>,
+    _state_dir_holder: Option<TempDir>,
 }
 
 impl ValidatedConfig {
@@ -536,10 +589,27 @@ impl ValidatedConfig {
             }],
         });
 
-        let hypervisor_config = HypervisorConfig::default();
+        let hypervisor_config = HypervisorConfig {
+            canister_sandboxing_flag: if self.subnet_features.canister_sandboxing {
+                FlagStatus::Enabled
+            } else {
+                FlagStatus::Disabled
+            },
+            rate_limiting_of_debug_prints: FlagStatus::Disabled,
+            rate_limiting_of_heap_delta: FlagStatus::Disabled,
+            rate_limiting_of_instructions: FlagStatus::Disabled,
+            ..HypervisorConfig::default()
+        };
+
         let hypervisor = Some(hypervisor_config);
 
         let consensus = self.detect_consensus_starvation.map(ConsensusConfig::new);
+
+        let adapters_config = Some(AdaptersConfig {
+            bitcoin_testnet_uds_path: self.bitcoin_testnet_uds_path.clone(),
+            canister_http_uds_path: self.canister_http_uds_path.clone(),
+            ..AdaptersConfig::default()
+        });
 
         ReplicaConfig {
             registry_client,
@@ -552,6 +622,7 @@ impl ValidatedConfig {
             consensus,
             crypto,
             logger,
+            adapters_config,
             ..ReplicaConfig::default()
         }
     }

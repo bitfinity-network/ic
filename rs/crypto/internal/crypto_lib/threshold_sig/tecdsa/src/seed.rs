@@ -1,7 +1,12 @@
 use crate::expand_message_xmd;
-use rand_core::{CryptoRng, RngCore, SeedableRng};
+use core::fmt::{self, Debug};
+use rand::{CryptoRng, RngCore, SeedableRng};
 use std::convert::TryInto;
+use zeroize::Zeroize;
 
+/// The internal length of a Seed
+///
+/// This must not exceed 8160 bytes due to limitations of XMD
 const SEED_LEN: usize = 32;
 
 /// A Seed is a cryptovariable
@@ -12,13 +17,22 @@ const SEED_LEN: usize = 32;
 /// multiple unrelated Seeds from a single source Seed.
 ///
 /// It is not possible to extract the value of a Seed.
+#[derive(Clone, Zeroize)]
+#[zeroize(drop)]
 pub struct Seed {
     value: [u8; SEED_LEN],
 }
 
+impl Debug for Seed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Seed - REDACTED")
+    }
+}
+
 impl Seed {
     fn new(input: &[u8], domain_separator: &str) -> Self {
-        let derived = expand_message_xmd(input, domain_separator.as_bytes(), SEED_LEN);
+        let derived = expand_message_xmd(input, domain_separator.as_bytes(), SEED_LEN)
+            .expect("Unable to derive SEED_LEN bytes from XMD");
         Self {
             value: derived.try_into().expect("Unexpected size"),
         }

@@ -1,16 +1,20 @@
-# Certifying Service Worker
+# DFINITY Service Worker
 
-Certified fun guaranteed.
+Service worker which transforms browser asset request to the IC to canister calls and verifies the asset certification.
 
 ## Build
 
-**TESTED**
+| Usage                  | Folder    | Command             | Note                                              |
+|------------------------|-----------|---------------------|---------------------------------------------------|
+| dev build for testnets | dist-dev  | `npm run build-dev` | - sets `FORCE_FETCH_ROOT_KEY=1`<br>- not minified |
+| prod build for mainnet | dist-prod | `npm run build`     | - uses IC root key<br>- minified                  |
 
-From the root of this repo, `npm install && npm build`. The output should be in a `dist/` folder next to this file.
+### Prerequisites
+
+* Node.js 17
+* npm 8.5
 
 ### Build With `FORCE_FETCH_ROOT_KEY`
-
-**PARTIALLY TESTED**
 
 By setting the `FORCE_FETCH_ROOT_KEY=1` environment variable prior to building, the service worker will
 always fetch the root key of the network before doing the validation.
@@ -20,30 +24,24 @@ the agent and, for security reasons, should not be fetched by the agent.
 
 ## Develop
 
-**TESTED**
+To start the local development instance:
 
-You will need to build the the repo first (see Build section above).
+1. Run `npm install`
+2. Run `npm start`
 
-Start a replica on the port 8080 (doesn't have to be `dfx start` or a proxy, can be a plain replica).
+This will start serving the files built using `npm run build-dev` on http://localhost:8080. Any path that don't match a file instead will be sent to https://ic0.app.
+Note that for the service worker to correctly relay the canister call to a canister there must be a query parameter `canisterId=<canisterId>`.
+The service worker can be tested against any mainnet canister.
 
-Start a watch mode webpack build with `npm run build -- --watch`.
+For example:
+* Internet Identity: http://localhost:8080/?canisterId=rdmx6-jaaaa-aaaaa-aaadq-cai
+* DSCVR: http://localhost:8080/?canisterId=h5aet-waaaa-aaaab-qaamq-cai
 
-To start the local development instance: `npm start`. This will start serving the files built. Any path that don't match a file instead will be sent to localhost:8000.
-
-It's important to not use `webpack-dev-server` (even if it's available) as it is not fully compatible with Service Workers.
-
-## Commit
-
-You may find it useful to install a pre-commit hook that formats the code.  See: `.husky/pre-commit`
-
-## Deploy
-
-There is no CI for the service worker, so please ensure that any changes are tested thoroughly before deployment.  Changes MUST be tested manually on all supported browsers.  Selenium tests are being developed to ease some, but not all, of this work.
-
-**TESTED**
-
-- Build and copy the artefacts into ansible territory: `npm run deploy`
-
-**UTESTED AND UNDOCUMENTED**
-
-- The rest of the deployment process
+## Release
+1. Create MR that updates `version` in `package.json`
+2. Test the built artifact using testnet boundary node VMs
+   1. TODO https://dfinity.atlassian.net/browse/L2-442
+3. Merge MR to master
+4. Tag the commit on `master` with `service-worker_v${version}`
+5. Verify that the desired version has been pushed to NPM: https://www.npmjs.com/package/@dfinity/service-worker
+6. Create an MR for the boundary nodes team that updates the `sw_version` and `sw_sha256` in `ic-os/boundary-guestos/rootfs/Dockerfile`

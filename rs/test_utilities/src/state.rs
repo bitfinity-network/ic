@@ -7,11 +7,14 @@ use crate::{
     },
 };
 use ic_base_types::NumSeconds;
-use ic_cow_state::CowMemoryManagerImpl;
+use ic_btc_types_internal::BitcoinAdapterRequestWrapper;
+use ic_ic00_types::CanisterStatusType;
+use ic_registry_routing_table::{CanisterIdRange, RoutingTable};
+use ic_registry_subnet_features::SubnetFeatures;
 use ic_registry_subnet_type::SubnetType;
 use ic_replicated_state::{
     canister_state::{
-        execution_state::{SandboxExecutionState, WasmBinary},
+        execution_state::{CustomSection, CustomSectionType, WasmBinary, WasmMetadata},
         testing::new_canister_queues_for_test,
         QUEUE_INDEX_NONE,
     },
@@ -21,13 +24,15 @@ use ic_replicated_state::{
     CallContext, CallOrigin, CanisterState, CanisterStatus, ExecutionState, ExportedFunctions,
     InputQueueType, Memory, NumWasmPages, ReplicatedState, SchedulerState, SystemState,
 };
+use ic_types::messages::CallbackId;
+use ic_types::methods::{Callback, WasmClosure};
 use ic_types::{
     messages::{Ingress, Request, RequestOrResponse},
-    xnet::{QueueId, StreamIndex, StreamIndexedQueue},
-    CanisterId, CanisterStatusType, ComputeAllocation, Cycles, ExecutionRound, MemoryAllocation,
-    NumBytes, PrincipalId, QueueIndex, SubnetId, Time,
+    xnet::{QueueId, StreamHeader, StreamIndex, StreamIndexedQueue},
+    CanisterId, ComputeAllocation, Cycles, ExecutionRound, MemoryAllocation, NumBytes, PrincipalId,
+    QueueIndex, SubnetId, Time,
 };
-use ic_wasm_types::BinaryEncodedWasm;
+use ic_wasm_types::CanisterModule;
 use proptest::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::convert::TryFrom;
@@ -43,6 +48,8 @@ pub struct ReplicatedStateBuilder {
     subnet_id: SubnetId,
     batch_time: Time,
     time_of_last_allocation_charge: Time,
+    subnet_features: SubnetFeatures,
+    bitcoin_adapter_requests: Vec<BitcoinAdapterRequestWrapper>,
 }
 
 impl ReplicatedStateBuilder {
@@ -75,6 +82,19 @@ impl ReplicatedStateBuilder {
         self
     }
 
+    pub fn with_subnet_features(mut self, subnet_features: SubnetFeatures) -> Self {
+        self.subnet_features = subnet_features;
+        self
+    }
+
+    pub fn with_bitcoin_adapter_requests(
+        mut self,
+        bitcoin_adapter_requests: Vec<BitcoinAdapterRequestWrapper>,
+    ) -> Self {
+        self.bitcoin_adapter_requests = bitcoin_adapter_requests;
+        self
+    }
+
     pub fn build(self) -> ReplicatedState {
         let mut state =
             ReplicatedState::new_rooted_at(self.subnet_id, self.subnet_type, "Initial".into());
@@ -82,9 +102,25 @@ impl ReplicatedStateBuilder {
         for canister in self.canisters {
             state.put_canister_state(canister);
         }
+        let mut routing_table = RoutingTable::new();
+        routing_table
+            .insert(
+                CanisterIdRange {
+                    start: CanisterId::from(0),
+                    end: CanisterId::from(u64::MAX),
+                },
+                self.subnet_id,
+            )
+            .unwrap();
+        state.metadata.network_topology.routing_table = Arc::new(routing_table);
 
         state.metadata.batch_time = self.batch_time;
         state.metadata.time_of_last_allocation_charge = self.time_of_last_allocation_charge;
+        state.metadata.own_subnet_features = self.subnet_features;
+
+        for request in self.bitcoin_adapter_requests.into_iter() {
+            state.push_request_bitcoin_testnet(request).unwrap();
+        }
 
         state
     }
@@ -98,6 +134,8 @@ impl Default for ReplicatedStateBuilder {
             subnet_id: subnet_test_id(1),
             batch_time: mock_time(),
             time_of_last_allocation_charge: mock_time(),
+            subnet_features: SubnetFeatures::default(),
+            bitcoin_adapter_requests: Vec::new(),
         }
     }
 }
@@ -225,6 +263,7 @@ impl CanisterStateBuilder {
             let call_context_id = call_context_manager.new_call_context(
                 call_context.call_origin().clone(),
                 call_context.available_cycles(),
+                call_context.time().unwrap(),
             );
 
             let call_context_in_call_context_manager = call_context_manager
@@ -257,8 +296,8 @@ impl CanisterStateBuilder {
 
         let execution_state = match self.wasm {
             Some(wasm_binary) => {
-                let mut ee = initial_execution_state(None);
-                ee.wasm_binary = WasmBinary::new(BinaryEncodedWasm::new(wasm_binary));
+                let mut ee = initial_execution_state();
+                ee.wasm_binary = WasmBinary::new(CanisterModule::new(wasm_binary));
                 ee.stable_memory = stable_memory;
                 Some(ee)
             }
@@ -325,7 +364,7 @@ impl SystemStateBuilder {
     }
 
     pub fn initial_cycles(mut self, cycles: Cycles) -> Self {
-        self.system_state.cycles_balance = cycles;
+        *self.system_state.balance_mut() = cycles;
         self
     }
 
@@ -353,6 +392,7 @@ impl SystemStateBuilder {
 pub struct CallContextBuilder {
     call_origin: CallOrigin,
     responded: bool,
+    time: Time,
 }
 
 impl CallContextBuilder {
@@ -370,8 +410,19 @@ impl CallContextBuilder {
         self
     }
 
+    pub fn with_time(mut self, time: Time) -> Self {
+        self.time = time;
+        self
+    }
+
     pub fn build(self) -> CallContext {
-        CallContext::new(self.call_origin, self.responded, false, Cycles::from(0))
+        CallContext::new(
+            self.call_origin,
+            self.responded,
+            false,
+            Cycles::from(0),
+            self.time,
+        )
     }
 }
 
@@ -380,35 +431,50 @@ impl Default for CallContextBuilder {
         Self {
             call_origin: CallOrigin::Ingress(user_test_id(0), message_test_id(0)),
             responded: false,
+            time: Time::from_nanos_since_unix_epoch(0),
         }
     }
 }
 
-pub fn initial_execution_state(p: Option<std::path::PathBuf>) -> ExecutionState {
-    let cow_mem_mgr = match p {
-        Some(path) => CowMemoryManagerImpl::open_readwrite(path),
-        None => CowMemoryManagerImpl::open_readwrite_fake(),
-    };
+pub fn initial_execution_state() -> ExecutionState {
+    let mut metadata: BTreeMap<String, CustomSection> = BTreeMap::new();
+    metadata.insert(
+        String::from("candid"),
+        CustomSection {
+            visibility: CustomSectionType::Private,
+            content: vec![0, 2],
+        },
+    );
+    metadata.insert(
+        String::from("dummy"),
+        CustomSection {
+            visibility: CustomSectionType::Public,
+            content: vec![2, 1],
+        },
+    );
+    let wasm_metadata = WasmMetadata::new(metadata);
 
     ExecutionState {
         canister_root: "NOT_USED".into(),
         session_nonce: None,
-        wasm_binary: WasmBinary::new(BinaryEncodedWasm::new(vec![])),
+        wasm_binary: WasmBinary::new(CanisterModule::new(vec![])),
         wasm_memory: Memory::default(),
         stable_memory: Memory::default(),
         exported_globals: vec![],
         exports: ExportedFunctions::new(BTreeSet::new()),
+        metadata: wasm_metadata,
         last_executed_round: ExecutionRound::from(0),
-        cow_mem_mgr: Arc::new(cow_mem_mgr),
-        mapped_state: None,
-        sandbox_state: SandboxExecutionState::new(),
     }
 }
 
-pub fn canister_from_exec_state(execution_state: ExecutionState) -> CanisterState {
+pub fn canister_from_exec_state(
+    execution_state: ExecutionState,
+    canister_id: CanisterId,
+) -> CanisterState {
     CanisterState {
         system_state: SystemStateBuilder::new()
             .memory_allocation(NumBytes::new(8 * 1024 * 1024 * 1024)) // 8GiB
+            .canister_id(canister_id)
             .build(),
         execution_state: Some(execution_state),
         scheduler_state: Default::default(),
@@ -498,7 +564,7 @@ pub fn running_canister_into_stopped(mut canister: CanisterState) -> CanisterSta
     canister
 }
 
-/// Returns a `ReplicatedState` with variable amount of canisters, input
+/// Returns a `ReplicatedState` with SubnetType::Application, variable amount of canisters, input
 /// messages per canister and methods that are to be called.
 pub fn get_initial_state(canister_num: u64, message_num_per_canister: u64) -> ReplicatedState {
     get_initial_state_with_balance(
@@ -506,6 +572,20 @@ pub fn get_initial_state(canister_num: u64, message_num_per_canister: u64) -> Re
         message_num_per_canister,
         INITIAL_CYCLES,
         SubnetType::Application,
+    )
+}
+
+/// Returns a `ReplicatedState` with SubnetType::System, variable amount of canisters, input
+/// messages per canister and methods that are to be called.
+pub fn get_initial_system_subnet_state(
+    canister_num: u64,
+    message_num_per_canister: u64,
+) -> ReplicatedState {
+    get_initial_state_with_balance(
+        canister_num,
+        message_num_per_canister,
+        INITIAL_CYCLES,
+        SubnetType::System,
     )
 }
 
@@ -536,6 +616,18 @@ pub fn get_initial_state_with_balance(
 
         state.put_canister_state(canister_state_builder.build());
     }
+    state.metadata.network_topology.routing_table = Arc::new({
+        let mut rt = ic_registry_routing_table::RoutingTable::new();
+        rt.insert(
+            ic_registry_routing_table::CanisterIdRange {
+                start: CanisterId::from(0),
+                end: CanisterId::from(u64::MAX),
+            },
+            subnet_test_id(1),
+        )
+        .unwrap();
+        rt
+    });
     state
 }
 
@@ -557,6 +649,53 @@ pub fn new_canister_state(
     let system_state =
         SystemState::new_running(canister_id, controller, initial_cycles, freeze_threshold);
     CanisterState::new(system_state, None, scheduler_state)
+}
+
+/// Helper function to register a callback.
+pub fn register_callback(
+    canister_state: &mut CanisterState,
+    originator: CanisterId,
+    respondent: CanisterId,
+    callback_id: CallbackId,
+) {
+    let call_context_manager = canister_state
+        .system_state
+        .call_context_manager_mut()
+        .unwrap();
+    let call_context_id = call_context_manager.new_call_context(
+        CallOrigin::CanisterUpdate(originator, callback_id),
+        Cycles::zero(),
+        Time::from_nanos_since_unix_epoch(0),
+    );
+
+    call_context_manager.register_callback(Callback::new(
+        call_context_id,
+        Some(originator),
+        Some(respondent),
+        Cycles::zero(),
+        WasmClosure::new(0, 2),
+        WasmClosure::new(0, 2),
+        None,
+    ));
+}
+
+/// Helper function to insert a canister in the provided `ReplicatedState`.
+pub fn insert_dummy_canister(
+    state: &mut ReplicatedState,
+    canister_id: CanisterId,
+    controller: PrincipalId,
+) {
+    let wasm = CanisterModule::new(vec![]);
+    let mut canister_state = new_canister_state(
+        canister_id,
+        controller,
+        INITIAL_CYCLES,
+        NumSeconds::from(100_000),
+    );
+    let mut execution_state = initial_execution_state();
+    execution_state.wasm_binary = WasmBinary::new(wasm);
+    canister_state.execution_state = Some(execution_state);
+    state.put_canister_state(canister_state);
 }
 
 prop_compose! {
@@ -589,9 +728,7 @@ prop_compose! {
         ),
         message_num_per_canister in 1..message_num_per_canister_max,
     ) -> ReplicatedState {
-        let tmpdir = tempfile::Builder::new().prefix("test").tempdir().unwrap();
-
-        let mut state = ReplicatedState::new_rooted_at(subnet_test_id(1),  SubnetType::Application, tmpdir.path().into());
+        let mut state = ReplicatedStateBuilder::new().build();
         for (_, mut canister_state) in canister_states.into_iter().enumerate() {
             let canister_id = canister_state.canister_id();
             for i in 0..message_num_per_canister {
@@ -616,8 +753,8 @@ prop_compose! {
     (
         (allocation, round) in arb_compute_allocation_and_last_round(last_round_max)
     ) -> CanisterState {
-        let mut execution_state = initial_execution_state(None);
-        execution_state.wasm_binary = WasmBinary::new(BinaryEncodedWasm::new(wabt::wat2wasm(r#"(module)"#).unwrap()));
+        let mut execution_state = initial_execution_state();
+        execution_state.wasm_binary = WasmBinary::new(CanisterModule::new(wabt::wat2wasm(r#"(module)"#).unwrap()));
         let scheduler_state = SchedulerState::default();
         let system_state = SystemState::new_running(
             canister_test_id(0),
@@ -698,6 +835,54 @@ prop_compose! {
 }
 
 prop_compose! {
+    pub fn arb_reject_signals(sig_end: u64, sig_min_size: usize, sig_max_size: usize)(
+        sigs in prop::collection::btree_set(arbitrary::stream_index(sig_end), sig_min_size..=std::cmp::min(sig_end as usize, sig_max_size)),
+    ) -> VecDeque<StreamIndex> {
+        let mut reject_signals = VecDeque::with_capacity(sigs.len());
+        for s in sigs {
+            reject_signals.push_back(s);
+        }
+        reject_signals
+    }
+}
+
+prop_compose! {
+    pub fn arb_stream_with_signals(min_size: usize, max_size: usize, sig_end: u64, sig_min_size: usize, sig_max_size: usize)(
+        msg_start in 0..10000u64,
+        reqs in prop::collection::vec(arbitrary::request(), min_size..=max_size),
+        sigs in arb_reject_signals(sig_end, sig_min_size, sig_max_size),
+    ) -> Stream {
+        let mut messages = StreamIndexedQueue::with_begin(StreamIndex::from(msg_start));
+        for r in reqs {
+            messages.push(r.into())
+        }
+
+        let signals_end = StreamIndex::from(sig_end);
+
+        Stream::with_signals(messages, signals_end, sigs)
+    }
+}
+
+prop_compose! {
+    pub fn arb_stream_header(sig_end: u64, sig_min_size: usize, sig_max_size: usize)(
+        msg_start in 0..10000u64,
+        msg_len in 0..10000u64,
+        reject_signals in arb_reject_signals(sig_end, sig_min_size, sig_max_size),
+    ) -> StreamHeader {
+        let begin = StreamIndex::from(msg_start);
+        let end = StreamIndex::from(msg_start + msg_len);
+        let signals_end = StreamIndex::from(sig_end);
+
+        StreamHeader {
+            begin,
+            end,
+            signals_end,
+            reject_signals,
+        }
+    }
+}
+
+prop_compose! {
     /// Strategy that generates an arbitrary number (of receivers) between 1 and the
     /// provided value, if `Some`; or else `usize::MAX` (standing for unlimited
     /// receivers).
@@ -759,6 +944,19 @@ fn new_replicated_state_for_test(
         .collect();
 
     let mut replicated_state = ReplicatedStateBuilder::new().build();
+
+    let mut routing_table = RoutingTable::new();
+    routing_table
+        .insert(
+            CanisterIdRange {
+                start: CanisterId::from(0),
+                end: CanisterId::from(u64::MAX),
+            },
+            own_subnet_id,
+        )
+        .unwrap();
+    replicated_state.metadata.network_topology.routing_table = Arc::new(routing_table);
+
     replicated_state.put_canister_states(canister_states);
     if let Some(subnet_queues) = subnet_queues {
         replicated_state.put_subnet_queues(subnet_queues);
@@ -774,10 +972,31 @@ prop_compose! {
         max_requests_per_canister: usize,
         max_receivers: Option<usize>,
     ) (
+        time in 1..1000_u64,
         request_queues in prop::collection::vec(prop::collection::vec(arbitrary::request(), 0..=max_requests_per_canister), 0..=max_canisters),
         num_receivers in arb_num_receivers(max_receivers)
     ) -> (ReplicatedState, VecDeque<VecDeque<RequestOrResponse>>, usize) {
-        new_replicated_state_for_test(own_subnet_id, request_queues, num_receivers)
+        use rand::{Rng, SeedableRng};
+        use rand_chacha::ChaChaRng;
+
+        let (mut replicated_state, mut raw_requests, total_requests) = new_replicated_state_for_test(own_subnet_id, request_queues, num_receivers);
+
+        // We pseudorandomly rotate the queues to match the rotation applied by the iterator.
+        // Note that subnet queues are always at the front which is why we need to pop them
+        // before the rotation and push them to the front afterwards.
+        let subnet_queue_requests = raw_requests.pop_front();
+        let mut raw_requests : VecDeque<_> = raw_requests.into_iter().filter(|requests| !requests.is_empty()).collect();
+
+        replicated_state.metadata.batch_time = Time::from_nanos_since_unix_epoch(time);
+        let mut rng = ChaChaRng::seed_from_u64(time);
+        let rotation = rng.gen_range(0, raw_requests.len().max(1));
+        raw_requests.rotate_left(rotation);
+
+        if let Some(requests) = subnet_queue_requests {
+            raw_requests.push_front(requests);
+        }
+
+        (replicated_state, raw_requests, total_requests)
     }
 }
 

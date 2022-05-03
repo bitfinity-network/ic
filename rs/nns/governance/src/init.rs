@@ -27,7 +27,7 @@ impl GovernanceCanisterInitPayloadBuilder {
         Self {
             proto: Governance {
                 economics: Some(NetworkEconomics::with_default_values()),
-                wait_for_quiet_threshold_seconds: 60 * 60 * 24 * 2, // 2 days
+                wait_for_quiet_threshold_seconds: 60 * 60 * 24 * 4, // 4 days
                 short_voting_period_seconds: 60 * 60 * 12,          // 12 hours
                 ..Default::default()
             },
@@ -43,12 +43,9 @@ impl GovernanceCanisterInitPayloadBuilder {
     // the following graph on initialization that doesn't rely on ids.
     #[cfg(target_arch = "x86_64")]
     pub fn new_neuron_id(&mut self) -> NeuronId {
-        let neuron_id;
-
         let random_id = self.rng.next_u64();
-        neuron_id = NeuronId(random_id);
 
-        neuron_id
+        NeuronId(random_id)
     }
 
     #[cfg(not(target_arch = "x86_64"))]
@@ -87,7 +84,7 @@ impl GovernanceCanisterInitPayloadBuilder {
         use ic_nns_common::pb::v1::NeuronId as NeuronIdProto;
 
         const TWELVE_MONTHS_SECONDS: u64 = 30 * 12 * 24 * 60 * 60;
-        use ic_nns_constants::ids::{
+        use ic_nervous_system_common_test_keys::{
             TEST_NEURON_1_OWNER_PRINCIPAL, TEST_NEURON_2_OWNER_PRINCIPAL,
             TEST_NEURON_3_OWNER_PRINCIPAL,
         };
@@ -251,14 +248,13 @@ impl GovernanceCanisterInitPayloadBuilder {
 
             let neuron_id = NeuronIdProto::from(neuron_id);
 
-            let not_for_profit;
-            if record.len() < 8 {
-                not_for_profit = false;
+            let not_for_profit = if record.len() < 8 {
+                false
             } else {
-                not_for_profit = record[7]
+                record[7]
                     .parse::<bool>()
-                    .expect("couldn't read the neuron's not-for-profit flag");
-            }
+                    .expect("couldn't read the neuron's not-for-profit flag")
+            };
 
             let neuron = Neuron {
                 id: Some(neuron_id.clone()),
@@ -273,8 +269,8 @@ impl GovernanceCanisterInitPayloadBuilder {
                     duration_to_dissolution_ns / (1_000_000_000),
                 )), // to sec
                 followees: [(Topic::Unspecified as i32, Followees { followees })]
-                    .to_vec()
-                    .into_iter()
+                    .iter()
+                    .cloned()
                     .collect(),
                 ..Default::default()
             };

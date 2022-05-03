@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Provision a node based on an injected "ic-bootstrap.tar" file. This script
-# is meant to be run as a prerequisite before launching nodemanager/replica.
+# is meant to be run as a prerequisite before launching orchestrator/replica.
 #
 # The configuration format is presently described here:
 # https://docs.google.com/document/d/1W2bDkq3xhNvQyWPIVSKpYuBzaa5d1QN-N4uiXByr2Qg/edit
@@ -114,11 +114,3 @@ while [ ! -f /boot/config/CONFIGURED ]; do
         umount /mnt
     fi
 done
-
-# HACK: This workaround configures Journalbeat in mainnet. Will be removed once
-#       applied to all guests.
-if [ ! -f /boot/config/journalbeat.conf ]; then
-    cat >/boot/config/journalbeat.conf <<EOF
-journalbeat_hosts=elasticsearch.mercury.dfinity.systems:443
-EOF
-fi

@@ -13,15 +13,17 @@
 //! 2. executing the operation and return `cycles_spent`
 //! 3. reimburse the canister with `cycles_reserved` - `cycles_spent`
 
+use ic_base_types::NumSeconds;
 use ic_config::subnet_config::CyclesAccountManagerConfig;
+use ic_ic00_types::{
+    CanisterIdRecord, InstallCodeArgs, Method, Payload, SetControllerArgs, UpdateSettingsArgs,
+};
 use ic_interfaces::execution_environment::CanisterOutOfCyclesError;
-use ic_logger::{info, ReplicaLogger};
+use ic_logger::{error, info, ReplicaLogger};
+use ic_nns_constants::CYCLES_MINTING_CANISTER_ID;
 use ic_registry_subnet_type::SubnetType;
 use ic_replicated_state::{CanisterState, SystemState};
 use ic_types::{
-    ic00::{
-        CanisterIdRecord, InstallCodeArgs, Method, Payload, SetControllerArgs, UpdateSettingsArgs,
-    },
     messages::{
         is_subnet_message, Request, Response, SignedIngressContent,
         MAX_INTER_CANISTER_PAYLOAD_IN_BYTES,
@@ -29,6 +31,7 @@ use ic_types::{
     nominal_cycles::NominalCycles,
     CanisterId, ComputeAllocation, Cycles, MemoryAllocation, NumBytes, NumInstructions, SubnetId,
 };
+use serde::{Deserialize, Serialize};
 use std::{str::FromStr, time::Duration};
 
 /// Errors returned by the [`CyclesAccountManager`].
@@ -53,15 +56,11 @@ impl std::fmt::Display for CyclesAccountManagerError {
 
 /// Handles any operation related to cycles accounting, such as charging (due to
 /// using system resources) or refunding unused cycles.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CyclesAccountManager {
     /// The maximum allowed instructions to be spent on a single message
     /// execution.
     max_num_instructions: NumInstructions,
-
-    /// The maximum amount of cycles a canister can hold.
-    /// If set to None, the canisters have no upper limit.
-    max_cycles_per_canister: Option<Cycles>,
 
     /// The subnet type of this [`CyclesAccountManager`].
     own_subnet_type: SubnetType,
@@ -76,17 +75,15 @@ pub struct CyclesAccountManager {
 
 impl CyclesAccountManager {
     pub fn new(
-        // Note: `max_num_instructions` and `max_cycles_per_canister` are passed from different
-        // Configs
+        // Note: `max_num_instructions` is passed from a different config.
+        // Config.
         max_num_instructions: NumInstructions,
-        max_cycles_per_canister: Option<Cycles>,
         own_subnet_type: SubnetType,
         own_subnet_id: SubnetId,
         config: CyclesAccountManagerConfig,
     ) -> Self {
         Self {
             max_num_instructions,
-            max_cycles_per_canister,
             own_subnet_type,
             own_subnet_id,
             config,
@@ -137,21 +134,22 @@ impl CyclesAccountManager {
     /// Returns the freezing threshold for this canister in Cycles.
     pub fn freeze_threshold_cycles(
         &self,
-        system_state: &SystemState,
+        freeze_threshold: NumSeconds,
+        memory_allocation: MemoryAllocation,
         memory_usage: NumBytes,
         compute_allocation: ComputeAllocation,
     ) -> Cycles {
         let one_gib = 1 << 30;
 
         let memory_fee = {
-            let memory = match system_state.memory_allocation {
+            let memory = match memory_allocation {
                 MemoryAllocation::Reserved(bytes) => bytes,
                 MemoryAllocation::BestEffort => memory_usage,
             };
             Cycles::from(
                 (memory.get() as u128
                     * self.config.gib_storage_per_second_fee.get()
-                    * system_state.freeze_threshold.get() as u128)
+                    * freeze_threshold.get() as u128)
                     / one_gib,
             )
         };
@@ -160,7 +158,7 @@ impl CyclesAccountManager {
             Cycles::from(
                 compute_allocation.as_percent() as u128
                     * self.config.compute_percent_allocated_per_second_fee.get()
-                    * system_state.freeze_threshold.get() as u128,
+                    * freeze_threshold.get() as u128,
             )
         };
 
@@ -177,19 +175,28 @@ impl CyclesAccountManager {
     ///
     /// Returns a `CanisterOutOfCyclesError` if the
     /// requested amount is greater than the currently available.
+    #[allow(clippy::too_many_arguments)]
     pub fn withdraw_cycles_for_transfer(
         &self,
-        system_state: &mut SystemState,
+        canister_id: CanisterId,
+        freeze_threshold: NumSeconds,
+        memory_allocation: MemoryAllocation,
         canister_current_memory_usage: NumBytes,
         canister_compute_allocation: ComputeAllocation,
+        cycles_balance: &mut Cycles,
         cycles: Cycles,
     ) -> Result<(), CanisterOutOfCyclesError> {
-        let threshold = self.freeze_threshold_cycles(
-            system_state,
-            canister_current_memory_usage,
-            canister_compute_allocation,
-        );
-        self.withdraw_with_threshold(system_state, cycles, threshold)
+        self.withdraw_with_threshold(
+            canister_id,
+            cycles_balance,
+            cycles,
+            self.freeze_threshold_cycles(
+                freeze_threshold,
+                memory_allocation,
+                canister_current_memory_usage,
+                canister_compute_allocation,
+            ),
+        )
     }
 
     /// Withdraws and consumes cycles from the canister's balance.
@@ -210,7 +217,8 @@ impl CyclesAccountManager {
         cycles: Cycles,
     ) -> Result<(), CanisterOutOfCyclesError> {
         let threshold = self.freeze_threshold_cycles(
-            system_state,
+            system_state.freeze_threshold,
+            system_state.memory_allocation,
             canister_current_memory_usage,
             canister_compute_allocation,
         );
@@ -244,7 +252,8 @@ impl CyclesAccountManager {
             system_state,
             cycles_to_withdraw,
             self.freeze_threshold_cycles(
-                system_state,
+                system_state.freeze_threshold,
+                system_state.memory_allocation,
                 canister_current_memory_usage,
                 canister_compute_allocation,
             ),
@@ -257,10 +266,15 @@ impl CyclesAccountManager {
         &self,
         system_state: &mut SystemState,
         num_instructions: NumInstructions,
+        num_instructions_initially_charged: NumInstructions,
     ) {
-        let cycles_to_refund = self.config.ten_update_instructions_execution_fee
-            * Cycles::from(num_instructions.get() / 10);
-        self.refund_cycles(system_state, cycles_to_refund);
+        // TODO(EXC-1055): Log an error if `num_instructions` is larger.
+        let num_instructions_to_refund =
+            std::cmp::min(num_instructions, num_instructions_initially_charged);
+        self.refund_cycles(
+            system_state,
+            self.convert_instructions_to_cycles(num_instructions_to_refund),
+        );
     }
 
     /// Charges the canister for its compute allocation
@@ -317,28 +331,50 @@ impl CyclesAccountManager {
                 | Ok(Method::UninstallCode)
                 | Ok(Method::StopCanister) => match CanisterIdRecord::decode(ingress.arg()) {
                     Ok(record) => Some(record.get_canister_id()),
-                    Err(_) => return Err(IngressInductionCostError::InvalidSubnetPayload),
+                    Err(err) => {
+                        return Err(IngressInductionCostError::InvalidSubnetPayload(
+                            err.to_string(),
+                        ))
+                    }
                 },
                 Ok(Method::UpdateSettings) => match UpdateSettingsArgs::decode(ingress.arg()) {
                     Ok(record) => Some(record.get_canister_id()),
-                    Err(_) => return Err(IngressInductionCostError::InvalidSubnetPayload),
+                    Err(err) => {
+                        return Err(IngressInductionCostError::InvalidSubnetPayload(
+                            err.to_string(),
+                        ))
+                    }
                 },
                 Ok(Method::SetController) => match SetControllerArgs::decode(ingress.arg()) {
                     Ok(record) => Some(record.get_canister_id()),
-                    Err(_) => return Err(IngressInductionCostError::InvalidSubnetPayload),
+                    Err(err) => {
+                        return Err(IngressInductionCostError::InvalidSubnetPayload(
+                            err.to_string(),
+                        ))
+                    }
                 },
                 Ok(Method::InstallCode) => match InstallCodeArgs::decode(ingress.arg()) {
                     Ok(record) => Some(record.get_canister_id()),
-                    Err(_) => return Err(IngressInductionCostError::InvalidSubnetPayload),
+                    Err(err) => {
+                        return Err(IngressInductionCostError::InvalidSubnetPayload(
+                            err.to_string(),
+                        ))
+                    }
                 },
                 Ok(Method::CreateCanister)
                 | Ok(Method::SetupInitialDKG)
                 | Ok(Method::DepositCycles)
+                | Ok(Method::HttpRequest)
                 | Ok(Method::RawRand)
+                | Ok(Method::ECDSAPublicKey)
                 | Ok(Method::SignWithECDSA)
-                | Ok(Method::GetMockECDSAPublicKey)
-                | Ok(Method::SignWithMockECDSA)
-                | Err(_) => {
+                | Ok(Method::ComputeInitialEcdsaDealings)
+                | Ok(Method::BitcoinTestnetGetBalance)
+                | Ok(Method::BitcoinTestnetGetUtxos)
+                | Ok(Method::BitcoinTestnetSendTransaction) => {
+                    return Err(IngressInductionCostError::SubnetMethodNotAllowed);
+                }
+                Err(_) => {
                     return Err(IngressInductionCostError::UnknownSubnetMethod);
                 }
             }
@@ -366,6 +402,11 @@ impl CyclesAccountManager {
     /// How often canisters should be charged for memory and compute allocation.
     pub fn duration_between_allocation_charges(&self) -> Duration {
         self.config.duration_between_allocation_charges
+    }
+
+    /// Amount to charge for an ECDSA signature.
+    pub fn ecdsa_signature_fee(&self) -> Cycles {
+        self.config.ecdsa_signature_fee
     }
 
     ////////////////////////////////////////////////////////////////////////////
@@ -431,9 +472,13 @@ impl CyclesAccountManager {
     ///
     /// Returns a `CanisterOutOfCyclesError` if there is
     /// not enough cycles available to send the `Request`.
+    #[allow(clippy::too_many_arguments)]
     pub fn withdraw_request_cycles(
         &self,
-        system_state: &mut SystemState,
+        canister_id: CanisterId,
+        cycles_balance: &mut Cycles,
+        freeze_threshold: NumSeconds,
+        memory_allocation: MemoryAllocation,
         canister_current_memory_usage: NumBytes,
         canister_compute_allocation: ComputeAllocation,
         request: &Request,
@@ -448,11 +493,13 @@ impl CyclesAccountManager {
             + self.config.xnet_byte_transmission_fee
                 * Cycles::from(MAX_INTER_CANISTER_PAYLOAD_IN_BYTES.get())
             + self.execution_cost(self.max_num_instructions);
-        self.consume_with_threshold(
-            system_state,
+        self.withdraw_with_threshold(
+            canister_id,
+            cycles_balance,
             fee,
             self.freeze_threshold_cycles(
-                system_state,
+                freeze_threshold,
+                memory_allocation,
                 canister_current_memory_usage,
                 canister_compute_allocation,
             ),
@@ -462,13 +509,33 @@ impl CyclesAccountManager {
     /// Refunds the cycles from the response. In particular, adds leftover
     /// cycles from the what was reserved when the corresponding `Request` was
     /// sent earlier.
-    pub fn response_cycles_refund(&self, system_state: &mut SystemState, response: &mut Response) {
+    pub fn response_cycles_refund(
+        &self,
+        log: &ReplicaLogger,
+        system_state: &mut SystemState,
+        response: &mut Response,
+    ) {
         // We originally charged for the maximum number of bytes possible so
         // figure out how many extra bytes we charged for.
-        let extra_bytes = MAX_INTER_CANISTER_PAYLOAD_IN_BYTES - response.response_payload.size_of();
-        let cycles_to_refund =
-            self.config.xnet_byte_transmission_fee * Cycles::from(extra_bytes.get());
-        self.refund_cycles(system_state, cycles_to_refund);
+        let response_payload_size_bytes = response.payload_size_bytes().get();
+        let max_payload_size_bytes = MAX_INTER_CANISTER_PAYLOAD_IN_BYTES.get();
+        let some_extra_bytes = max_payload_size_bytes.checked_sub(response_payload_size_bytes);
+
+        match some_extra_bytes {
+            None => {
+                error!(
+                    log,
+                    "Unexpected response payload size of {} bytes (max expected {})",
+                    response_payload_size_bytes,
+                    max_payload_size_bytes
+                );
+            }
+            Some(extra_bytes) => {
+                let cycles_to_refund =
+                    self.config.xnet_byte_transmission_fee * Cycles::from(extra_bytes);
+                self.refund_cycles(system_state, cycles_to_refund);
+            }
+        }
     }
 
     ////////////////////////////////////////////////////////////////////////////
@@ -490,15 +557,16 @@ impl CyclesAccountManager {
         canister_compute_allocation: ComputeAllocation,
     ) -> Result<(), CanisterOutOfCyclesError> {
         let threshold = self.freeze_threshold_cycles(
-            system_state,
+            system_state.freeze_threshold,
+            system_state.memory_allocation,
             canister_current_memory_usage,
             canister_compute_allocation,
         );
 
-        if threshold + requested > system_state.cycles_balance {
+        if threshold + requested > system_state.balance() {
             Err(CanisterOutOfCyclesError {
                 canister_id: system_state.canister_id(),
-                available: system_state.cycles_balance,
+                available: system_state.balance(),
                 requested,
                 threshold,
             })
@@ -510,7 +578,7 @@ impl CyclesAccountManager {
     /// Note that this function is made public only for the tests.
     #[doc(hidden)]
     pub fn refund_cycles(&self, system_state: &mut SystemState, cycles: Cycles) {
-        system_state.cycles_balance += cycles;
+        *system_state.balance_mut() += cycles;
         system_state
             .canister_metrics
             .consumed_cycles_since_replica_started -= NominalCycles::from_cycles(cycles);
@@ -524,65 +592,55 @@ impl CyclesAccountManager {
         cycles: Cycles,
         threshold: Cycles,
     ) -> Result<(), CanisterOutOfCyclesError> {
-        self.withdraw_with_threshold(system_state, cycles, threshold)
-            .map(|()| self.observe_consumed_cycles(system_state, cycles))
+        self.withdraw_with_threshold(
+            system_state.canister_id,
+            system_state.balance_mut(),
+            cycles,
+            threshold,
+        )
+        .map(|()| self.observe_consumed_cycles(system_state, cycles))
     }
 
     /// Subtracts `cycles` worth of cycles from the canister's balance as long
     /// as there's enough above the provided `threshold`. This call should be
     /// used when the withdrawn cycles are sent somewhere else.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `CanisterOutOfCyclesError` if the
+    /// requested amount is greater than the currently available.
     // #[doc(hidden)] // pub for usage in tests
     pub fn withdraw_with_threshold(
         &self,
-        system_state: &mut SystemState,
+        canister_id: CanisterId,
+        cycles_balance: &mut Cycles,
         cycles: Cycles,
         threshold: Cycles,
     ) -> Result<(), CanisterOutOfCyclesError> {
-        let cycles_available = if system_state.cycles_balance > threshold {
-            system_state.cycles_balance - threshold
+        let cycles_available = if *cycles_balance > threshold {
+            *cycles_balance - threshold
         } else {
             Cycles::from(0)
         };
 
         if cycles > cycles_available {
             return Err(CanisterOutOfCyclesError {
-                canister_id: system_state.canister_id,
-                available: system_state.cycles_balance,
+                canister_id,
+                available: *cycles_balance,
                 requested: cycles,
                 threshold,
             });
         }
 
-        system_state.cycles_balance -= cycles;
+        *cycles_balance -= cycles;
         Ok(())
-    }
-
-    /// Returns the maximum amount of `Cycles` that can be added to a canister's
-    /// balance taking into account the `max_cycles_per_canister` value if
-    /// present.
-    pub fn check_max_cycles_can_add(
-        &self,
-        current_balance: Cycles,
-        cycles_to_add: Cycles,
-    ) -> Cycles {
-        match self.own_subnet_type {
-            SubnetType::System => cycles_to_add,
-            SubnetType::Application | SubnetType::VerifiedApplication => {
-                match self.max_cycles_per_canister {
-                    None => cycles_to_add,
-                    Some(max_cycles) => std::cmp::min(cycles_to_add, max_cycles - current_balance),
-                }
-            }
-        }
     }
 
     /// Adds `cycles` worth of cycles to the canister's balance.
     /// The cycles balance added in a single go is limited to u64::max_value()
     /// Returns the amount of cycles that does not fit in the balance.
-    pub fn add_cycles(&self, system_state: &mut SystemState, cycles_to_add: Cycles) -> Cycles {
-        let cycles = self.check_max_cycles_can_add(system_state.cycles_balance, cycles_to_add);
-        system_state.cycles_balance += cycles;
-        cycles_to_add - cycles
+    pub fn add_cycles(&self, cycles_balance: &mut Cycles, cycles_to_add: Cycles) {
+        *cycles_balance += cycles_to_add;
     }
 
     /// Mints `amount_to_mint` [`Cycles`].
@@ -592,18 +650,25 @@ impl CyclesAccountManager {
     /// subnet.
     pub fn mint_cycles(
         &self,
-        system_state: &mut SystemState,
+        canister_id: CanisterId,
+        cycles_balance: &mut Cycles,
         amount_to_mint: Cycles,
-        nns_subnet_id: SubnetId,
     ) -> Result<(), CyclesAccountManagerError> {
-        if self.own_subnet_id != nns_subnet_id {
-            let error_str =
-                    format!("ic0.mint_cycles cannot be executed. Should only be called by a canister on the NNS subnet: {} != {}", self.own_subnet_id, nns_subnet_id);
+        if canister_id != CYCLES_MINTING_CANISTER_ID {
+            let error_str = format!(
+                "ic0.mint_cycles cannot be executed on non Cycles Minting Canister: {} != {}",
+                canister_id, CYCLES_MINTING_CANISTER_ID
+            );
             Err(CyclesAccountManagerError::ContractViolation(error_str))
         } else {
-            self.add_cycles(system_state, amount_to_mint);
+            self.add_cycles(cycles_balance, amount_to_mint);
             Ok(())
         }
+    }
+
+    fn convert_instructions_to_cycles(&self, num_instructions: NumInstructions) -> Cycles {
+        self.config.ten_update_instructions_execution_fee
+            * Cycles::from(num_instructions.get() / 10)
     }
 
     /// Returns the cost of the provided `num_instructions` in `Cycles`.
@@ -613,8 +678,7 @@ impl CyclesAccountManager {
     #[doc(hidden)]
     pub fn execution_cost(&self, num_instructions: NumInstructions) -> Cycles {
         self.config.update_message_execution_fee
-            + self.config.ten_update_instructions_execution_fee
-                * Cycles::from(num_instructions.get() / 10)
+            + self.convert_instructions_to_cycles(num_instructions)
     }
 
     /// Charges a canister for its resource allocation and usage for the
@@ -687,6 +751,10 @@ impl IngressInductionCost {
 /// Errors returned when computing the cost of receiving an ingress.
 #[derive(Debug, Eq, PartialEq)]
 pub enum IngressInductionCostError {
+    /// The requested subnet method is not available.
     UnknownSubnetMethod,
-    InvalidSubnetPayload,
+    /// Failed to parse method payload.
+    InvalidSubnetPayload(String),
+    /// The subnet method can be called only by a canister.
+    SubnetMethodNotAllowed,
 }

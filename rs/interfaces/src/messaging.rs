@@ -1,8 +1,9 @@
 //! Message Routing public interfaces.
-use crate::validation::ValidationError;
+use crate::{payload::BatchPayloadSectionType, validation::ValidationError};
 use ic_types::{
     batch::{Batch, ValidationContext, XNetPayload},
-    Height, NumBytes,
+    consensus::Payload,
+    Height, NumBytes, Time,
 };
 
 /// Errors that `MessageRouting` may return.
@@ -33,6 +34,10 @@ pub enum XNetTransientValidationError {
 pub type XNetPayloadValidationError =
     ValidationError<InvalidXNetPayload, XNetTransientValidationError>;
 
+impl BatchPayloadSectionType for XNetPayload {
+    type PermanentValidationError = InvalidXNetPayload;
+    type TransientValidationError = XNetTransientValidationError;
+}
 /// The public interface for the MessageRouting layer.
 pub trait MessageRouting: Send + Sync {
     /// Delivers a finalized `Batch` for deterministic processing.
@@ -77,4 +82,21 @@ pub trait XNetPayloadBuilder: Send + Sync {
         validation_context: &ValidationContext,
         past_payloads: &[&XNetPayload],
     ) -> Result<NumBytes, XNetPayloadValidationError>;
+
+    /// Extracts the sequence of past `XNetPayloads` from `past_payloads`.
+    fn filter_past_payloads<'a>(
+        &self,
+        past_payloads: &'a [(Height, Time, Payload)],
+    ) -> Vec<&'a XNetPayload> {
+        past_payloads
+            .iter()
+            .filter_map(|(_, _, payload)| {
+                if payload.is_summary() {
+                    None
+                } else {
+                    Some(&payload.as_ref().as_data().batch.xnet)
+                }
+            })
+            .collect()
+    }
 }

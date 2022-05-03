@@ -1,7 +1,7 @@
 use std::{convert::TryFrom, str::FromStr};
 
 use ic_types::{
-    messages::{HttpRequestEnvelope, HttpSubmitContent},
+    messages::{HttpCallContent, HttpRequestEnvelope},
     PrincipalId,
 };
 use ledger_canister::{HashOf, SendArgs, Transaction};
@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{convert, errors::ApiError, request_types::RequestType};
 
-pub const NEURON_MANAGEMEN_PSEUDO_HASH: &str =
+pub const NEURON_MANAGEMENT_PSEUDO_HASH: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
 
 /// Neuron management commands have no transaction identifier.
@@ -29,19 +29,19 @@ pub struct TransactionIdentifier {
 
 impl TransactionIdentifier {
     pub fn is_transfer(&self) -> bool {
-        self.hash != NEURON_MANAGEMEN_PSEUDO_HASH
+        self.hash != NEURON_MANAGEMENT_PSEUDO_HASH
     }
 
-    /// This could be `TryFrom<&HttpRequestEnvelope<HttpSubmitContent>>`,
+    /// This could be `TryFrom<&HttpRequestEnvelope<HttpCallContent>>`,
     /// but double checking `RequestType` instead of using the canister method
     /// string is nice.
     pub fn try_from_envelope(
         request_type: RequestType,
-        signed_transaction: &HttpRequestEnvelope<HttpSubmitContent>,
+        signed_transaction: &HttpRequestEnvelope<HttpCallContent>,
     ) -> Result<TransactionIdentifier, ApiError> {
         match request_type {
             RequestType::Send => {
-                let HttpSubmitContent::Call { update } = &signed_transaction.content;
+                let HttpCallContent::Call { update } = &signed_transaction.content;
                 let from = PrincipalId::try_from(update.sender.clone().0)
                     .map_err(|e| ApiError::internal_error(e.to_string()))?;
                 let SendArgs {
@@ -67,10 +67,15 @@ impl TransactionIdentifier {
             | RequestType::StopDissolve { .. }
             | RequestType::SetDissolveTimestamp { .. }
             | RequestType::Disburse { .. }
-            | RequestType::AddHotKey { .. } => {
+            | RequestType::AddHotKey { .. }
+            | RequestType::RemoveHotKey { .. }
+            | RequestType::Spawn { .. }
+            | RequestType::MergeMaturity { .. }
+            | RequestType::NeuronInfo { .. }
+            | RequestType::Follow { .. } => {
                 // Unfortunately, staking operations don't really have a transaction ID
                 Ok(TransactionIdentifier {
-                    hash: NEURON_MANAGEMEN_PSEUDO_HASH.to_string(),
+                    hash: NEURON_MANAGEMENT_PSEUDO_HASH.to_string(),
                 })
             }
         }

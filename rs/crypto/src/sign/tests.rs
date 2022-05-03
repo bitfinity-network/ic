@@ -11,11 +11,11 @@ use ic_crypto_internal_csp_test_utils::secret_key_store_test_utils::{
 use ic_interfaces::crypto::DOMAIN_IC_REQUEST;
 use ic_protobuf::registry::crypto::v1::AlgorithmId as AlgorithmIdProto;
 use ic_protobuf::registry::crypto::v1::PublicKey as PublicKeyProto;
-use ic_registry_client::fake::FakeRegistryClient;
-use ic_registry_common::proto_registry_data_provider::ProtoRegistryDataProvider;
+use ic_registry_client_fake::FakeRegistryClient;
 use ic_registry_keys::make_crypto_node_key;
-use ic_test_utilities::registry::MockRegistryClient;
+use ic_registry_proto_data_provider::ProtoRegistryDataProvider;
 use ic_test_utilities::types::ids::{NODE_1, SUBNET_27};
+use ic_test_utilities_registry::MockRegistryClient;
 use ic_types::crypto::{AlgorithmId, KeyId, KeyPurpose};
 use ic_types::messages::MessageId;
 use ic_types::registry::RegistryClientError;
@@ -85,7 +85,27 @@ pub fn dealing_encryption_pk_record_with(
             key_purpose: KeyPurpose::DkgDealingEncryption,
         },
         value: PublicKeyProto {
-            algorithm: AlgorithmId::Groth20_Bls12_381 as i32,
+            algorithm: AlgorithmIdProto::Groth20Bls12381 as i32,
+            key_value,
+            version: 0,
+            proof_data: None,
+        },
+        registry_version,
+    }
+}
+
+pub fn mega_encryption_pk_record_with(
+    node_id: NodeId,
+    key_value: Vec<u8>,
+    registry_version: RegistryVersion,
+) -> CryptoRegistryRecord {
+    CryptoRegistryRecord {
+        key: CryptoRegistryKey {
+            node_id,
+            key_purpose: KeyPurpose::IDkgMEGaEncryption,
+        },
+        value: PublicKeyProto {
+            algorithm: AlgorithmIdProto::MegaSecp256k1 as i32,
             key_value,
             version: 0,
             proof_data: None,

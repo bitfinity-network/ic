@@ -1,27 +1,22 @@
 use assert_matches::assert_matches;
 use candid::Encode;
 use ic_config::Config;
+use ic_error_types::{ErrorCode, RejectCode};
+use ic_ic00_types::{
+    self as ic00, CanisterIdRecord, CanisterInstallMode, CanisterStatusResultV2,
+    CanisterStatusType, EmptyBlob, InstallCodeArgs, Method, Payload, SetControllerArgs, IC_00,
+};
 use ic_registry_provisional_whitelist::ProvisionalWhitelist;
 use ic_replica_tests as utils;
 use ic_replica_tests::assert_reject;
 use ic_test_utilities::assert_utils::assert_balance_equals;
 use ic_test_utilities::universal_canister::{call_args, management, wasm, UNIVERSAL_CANISTER_WASM};
-use ic_types::{
-    ic00,
-    ic00::{
-        CanisterIdRecord, CanisterStatusResultV2, EmptyBlob, InstallCodeArgs, Method, Payload,
-        SetControllerArgs, IC_00,
-    },
-    ingress::WasmResult,
-    messages::CanisterInstallMode,
-    user_error::{ErrorCode, RejectCode},
-    CanisterId, CanisterStatusType, ComputeAllocation, Cycles, NumBytes, PrincipalId,
-};
+use ic_types::{ingress::WasmResult, CanisterId, ComputeAllocation, Cycles, NumBytes, PrincipalId};
 use maplit::btreeset;
-use std::{collections::BTreeSet, convert::TryInto, str::FromStr};
+use std::{collections::BTreeSet, str::FromStr};
 
 const BALANCE_EPSILON: u64 = 1_000_000;
-const NUM_CYCLES: u64 = 1_000_000_000;
+const NUM_CYCLES: u128 = 1_000_000_000;
 const CANISTER_CREATION_FEE: Cycles = Cycles::new(1_000_000_000_000);
 const CANISTER_FREEZE_BALANCE_RESERVE: Cycles = Cycles::new(5_000_000_000_000);
 
@@ -34,12 +29,11 @@ fn can_create_canister_from_another_canister() {
         let expected_canister_id = CanisterId::from(1);
         let expected_response_payload =
             Encode!(&CanisterIdRecord::from(expected_canister_id)).unwrap();
-
-        let num_cycles = 1 << 40;
+        let num_cycles = Cycles::new(1 << 70);
         // Call method "create_canister" on ic:00. This should create a canister
         // with the auto-generated id above.
         assert_eq!(
-            canister.update(wasm().call(management::create_canister(num_cycles))),
+            canister.update(wasm().call(management::create_canister(num_cycles.into_parts()))),
             Ok(WasmResult::Reply(expected_response_payload))
         );
     });
@@ -51,11 +45,11 @@ fn full_canister_lifecycle_from_another_canister() {
     utils::simple_canister_test(|canister| {
         let expected_canister_id = CanisterId::from(1);
         let canister_id_record = Encode!(&CanisterIdRecord::from(expected_canister_id)).unwrap();
-        let num_cycles = 1 << 40;
+        let num_cycles = Cycles::new(1 << 70);
 
         // Create a new canister from within a canister.
         assert_eq!(
-            canister.update(wasm().call(management::create_canister(num_cycles))),
+            canister.update(wasm().call(management::create_canister(num_cycles.into_parts()))),
             Ok(WasmResult::Reply(canister_id_record,)),
         );
 
@@ -106,8 +100,7 @@ fn full_canister_lifecycle_ingress() {
         // Create a new canister
         let expected_canister_id = CanisterId::from(1);
         let canister_id_record = Encode!(&CanisterIdRecord::from(expected_canister_id)).unwrap();
-
-        let num_cycles = 1 << 40;
+        let num_cycles = Cycles::new(1 << 70);
 
         // Create a new canister from within a canister.
         assert_eq!(
@@ -118,7 +111,7 @@ fn full_canister_lifecycle_ingress() {
                     ic00::IC_00,
                     Method::CreateCanister,
                     call_args().other_side(EmptyBlob::encode()),
-                    num_cycles,
+                    num_cycles.into_parts(),
                 )
             ),
             Ok(WasmResult::Reply(canister_id_record.clone(),)),
@@ -135,7 +128,7 @@ fn full_canister_lifecycle_ingress() {
                     SetControllerArgs::new(expected_canister_id, PrincipalId::new_anonymous())
                         .encode(),
                 ),
-                num_cycles,
+                num_cycles.into_parts(),
             ),
         )
         .unwrap();
@@ -474,16 +467,13 @@ fn can_create_canister_with_cycles_from_another_canister() {
         let num_cycles = CANISTER_FREEZE_BALANCE_RESERVE + Cycles::new(5_000_000_000_000);
 
         // Create a universal canister.
-        let canister_id =
-            test.create_universal_canister_with_args(vec![], num_cycles.try_into().unwrap());
+        let canister_id = test.create_universal_canister_with_args(vec![], num_cycles.get());
 
-        let old_canister_cycles_balance_before = test
-            .canister_state(&canister_id)
-            .system_state
-            .cycles_balance;
+        let old_canister_cycles_balance_before =
+            test.canister_state(&canister_id).system_state.balance();
 
         // Create another canister with some cycles.
-        let cycles_for_new_canister = CANISTER_CREATION_FEE + Cycles::from(100_000_000);
+        let cycles_for_new_canister = CANISTER_CREATION_FEE + Cycles::new(100_000_000);
         let new_canister_id_payload = test
             .ingress(
                 canister_id,
@@ -492,7 +482,7 @@ fn can_create_canister_with_cycles_from_another_canister() {
                     IC_00,
                     Method::CreateCanister,
                     call_args().other_side(EmptyBlob::encode()),
-                    cycles_for_new_canister.into(),
+                    cycles_for_new_canister.into_parts(),
                 ),
             )
             .unwrap()
@@ -502,18 +492,14 @@ fn can_create_canister_with_cycles_from_another_canister() {
             .unwrap()
             .get_canister_id();
 
-        let old_canister_cycles_balance_after = test
-            .canister_state(&canister_id)
-            .system_state
-            .cycles_balance;
+        let old_canister_cycles_balance_after =
+            test.canister_state(&canister_id).system_state.balance();
         println!(
             "old canister balance after: {}",
             old_canister_cycles_balance_after
         );
-        let new_canister_cycles_balance = test
-            .canister_state(&new_canister_id)
-            .system_state
-            .cycles_balance;
+        let new_canister_cycles_balance =
+            test.canister_state(&new_canister_id).system_state.balance();
 
         // Check that the balance of the sending canister after creating a new canister
         // is at most its previous balance minus the cycles transferred.
@@ -548,11 +534,11 @@ fn provisional_create_canister_with_cycles_and_top_up() {
     utils::canister_test_with_ic_config(config, ic_config, |test| {
         // Create a canister
         let canister_a_id = test.create_universal_canister();
-        let canister_a_cycles_before: u64 = test
+        let canister_a_cycles_before: u128 = test
             .canister_state(&canister_a_id)
             .system_state
-            .cycles_balance
-            .into();
+            .balance()
+            .get();
         let canister_b_cycles_init = canister_a_cycles_before / 2; // Create with 1/2 * cycles of canister_a
         let canister_b_cycles_top_up = canister_b_cycles_init; // Top-Up with just as many cycles
 
@@ -579,11 +565,11 @@ fn provisional_create_canister_with_cycles_and_top_up() {
             .unwrap()
             .get_canister_id();
 
-        let canister_b_cycles: u64 = test
+        let canister_b_cycles: u128 = test
             .canister_state(&canister_b_id)
             .system_state
-            .cycles_balance
-            .into();
+            .balance()
+            .get();
 
         assert_eq!(canister_b_cycles, canister_b_cycles_init);
 
@@ -606,11 +592,11 @@ fn provisional_create_canister_with_cycles_and_top_up() {
         .unwrap()
         .bytes();
 
-        let canister_b_cycles_after_top_up: u64 = test
+        let canister_b_cycles_after_top_up: u128 = test
             .canister_state(&canister_b_id)
             .system_state
-            .cycles_balance
-            .into();
+            .balance()
+            .get();
 
         // Canister B now has (init + top-up) cycles
         assert_eq!(
@@ -639,10 +625,7 @@ fn provisional_create_canister_with_cycles_and_top_up() {
             .unwrap()
             .get_canister_id();
 
-        let canister_c_cycles = test
-            .canister_state(&canister_c_id)
-            .system_state
-            .cycles_balance;
+        let canister_c_cycles = test.canister_state(&canister_c_id).system_state.balance();
 
         assert_eq!(
             canister_c_cycles,
@@ -659,8 +642,8 @@ fn can_get_canister_information() {
     utils::canister_test(|test| {
         // Create a new canister
         let canister_a = test.create_universal_canister();
-        let num_cycles = Cycles::new(1 << 40);
-        let canister_b = test.create_canister_with_cycles(num_cycles.into()).unwrap();
+        let num_cycles = Cycles::new(1 << 70);
+        let canister_b = test.create_canister_with_cycles(num_cycles.get()).unwrap();
 
         // Set the controller of canister_b to be canister_a
         assert_eq!(
@@ -774,9 +757,7 @@ fn cannot_run_method_on_empty_canister() {
 fn installing_a_canister_with_lower_memory_allocation_than_it_uses_fails() {
     utils::canister_test(|test| {
         let num_cycles = CANISTER_FREEZE_BALANCE_RESERVE + Cycles::new(5_000_000_000_000);
-        let canister_id = test
-            .create_canister_with_cycles(num_cycles.try_into().unwrap())
-            .unwrap();
+        let canister_id = test.create_canister_with_cycles(num_cycles.get()).unwrap();
 
         // Install code to canister_id with low memory allocation.
         assert_matches!(
@@ -851,9 +832,7 @@ fn installing_a_canister_with_lower_memory_allocation_than_it_uses_fails() {
 fn upgrading_a_canister_with_lower_memory_allocation_than_it_needs_fails() {
     utils::canister_test(|test| {
         let num_cycles = CANISTER_FREEZE_BALANCE_RESERVE + Cycles::new(5_000_000_000_000);
-        let canister_id = test
-            .create_canister_with_cycles(num_cycles.try_into().unwrap())
-            .unwrap();
+        let canister_id = test.create_canister_with_cycles(num_cycles.get()).unwrap();
 
         // Install code to canister_id.
         test.ingress(

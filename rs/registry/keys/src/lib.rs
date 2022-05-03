@@ -4,7 +4,9 @@
 //! be compilable to WASM as well a native.
 
 use ic_base_types::{NodeId, SubnetId};
+use ic_ic00_types::EcdsaKeyId;
 use ic_types::crypto::KeyPurpose;
+use ic_types::registry::RegistryClientError;
 use ic_types::PrincipalId;
 use std::str::FromStr;
 
@@ -14,7 +16,6 @@ const SUBNET_LIST_KEY: &str = "subnet_list";
 /// far, the root subnet happens to host the NNS canisters and the registry in
 /// particular.
 pub const ROOT_SUBNET_ID_KEY: &str = "nns_subnet_id";
-const XDR_PER_ICP_KEY: &str = "xdr_per_icp";
 pub const NODE_REWARDS_TABLE_KEY: &str = "node_rewards_table";
 const UNASSIGNED_NODES_CONFIG_RECORD_KEY: &str = "unassigned_nodes_config";
 
@@ -26,11 +27,34 @@ pub const CRYPTO_RECORD_KEY_PREFIX: &str = "crypto_record_";
 pub const CRYPTO_TLS_CERT_KEY_PREFIX: &str = "crypto_tls_cert_";
 pub const CRYPTO_THRESHOLD_SIGNING_KEY_PREFIX: &str = "crypto_threshold_signing_public_key_";
 pub const DATA_CENTER_KEY_PREFIX: &str = "data_center_record_";
+pub const ECDSA_SIGNING_SUBNET_LIST_KEY_PREFIX: &str = "key_id_";
 
-/// Returns the only key whose payload is the ICP/XDR conversion rate.
-pub fn make_icp_xdr_conversion_rate_record_key() -> String {
-    XDR_PER_ICP_KEY.to_string()
+pub fn make_ecdsa_signing_subnet_list_key(key_id: &EcdsaKeyId) -> String {
+    format!("{}{}", ECDSA_SIGNING_SUBNET_LIST_KEY_PREFIX, key_id)
 }
+
+pub fn get_ecdsa_key_id_from_signing_subnet_list_key(
+    signing_subnet_list_key: &str,
+) -> Result<EcdsaKeyId, RegistryClientError> {
+    let prefix_removed = signing_subnet_list_key
+        .strip_prefix(ECDSA_SIGNING_SUBNET_LIST_KEY_PREFIX)
+        .ok_or_else(|| RegistryClientError::DecodeError {
+            error: format!(
+                "ECDSA Signing Subnet List key id {} does not start with prefix {}",
+                signing_subnet_list_key, ECDSA_SIGNING_SUBNET_LIST_KEY_PREFIX
+            ),
+        })?;
+    prefix_removed
+        .parse::<EcdsaKeyId>()
+        .map_err(|error| RegistryClientError::DecodeError {
+            error: format!(
+                "ECDSA Signing Subnet List key id {} could not be converted to an EcdsaKeyId: {:?}",
+                signing_subnet_list_key, error
+            ),
+        })
+}
+
+pub const ID_GLOBAL_FIREWALL_RULES: &str = "global";
 
 /// Returns the only key whose payload is the list of subnets.
 pub fn make_subnet_list_record_key() -> String {
@@ -59,8 +83,17 @@ pub fn make_routing_table_record_key() -> String {
     "routing_table".to_string()
 }
 
+pub fn make_canister_migrations_record_key() -> String {
+    "canister_migrations".to_string()
+}
+
+// TODO: Remove when all subnets are upgraded with IC-1026
 pub fn make_firewall_config_record_key() -> String {
     "firewall_config".to_string()
+}
+
+pub fn make_firewall_rules_record_key(id: &str) -> String {
+    format!("firewall_rules_{}", id)
 }
 
 pub fn make_provisional_whitelist_record_key() -> String {
@@ -181,13 +214,10 @@ pub fn make_nns_canister_records_key() -> String {
     "nns_canister_records".to_string()
 }
 
-pub fn make_unassigned_nodes_replica_version() -> String {
-    "unassigned_nodes_replica_version".to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ic_ic00_types::EcdsaCurve;
     use rand::Rng;
 
     #[test]
@@ -251,5 +281,44 @@ mod tests {
         let wrong_key = make_crypto_tls_cert_key(node_id);
         let parsed = maybe_parse_crypto_threshold_signing_pubkey_key(&wrong_key);
         assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn escdsa_signing_subnet_list_key_round_trips() {
+        let key_id = EcdsaKeyId {
+            curve: EcdsaCurve::Secp256k1,
+            name: "some_key".to_string(),
+        };
+        let signing_subnet_list_key = make_ecdsa_signing_subnet_list_key(&key_id);
+        assert_eq!(
+            get_ecdsa_key_id_from_signing_subnet_list_key(&signing_subnet_list_key).unwrap(),
+            key_id
+        );
+    }
+
+    #[test]
+    fn escdsa_signing_subnet_list_bad_key_id_error_message() {
+        let bad_key = "key_without_curve";
+        let signing_subnet_list_key =
+            format!("{}{}", ECDSA_SIGNING_SUBNET_LIST_KEY_PREFIX, bad_key);
+        assert_eq!(
+            get_ecdsa_key_id_from_signing_subnet_list_key(&signing_subnet_list_key).unwrap_err(),
+            RegistryClientError::DecodeError {
+                error: "ECDSA Signing Subnet List key id key_id_key_without_curve could not be converted to an EcdsaKeyId: \"ECDSA key id key_without_curve does not contain a ':'\"".to_string()
+            }
+        )
+    }
+
+    #[test]
+    fn escdsa_signing_subnet_list_bad_curve_error_message() {
+        let bad_key = "UnknownCurve:key_name";
+        let signing_subnet_list_key =
+            format!("{}{}", ECDSA_SIGNING_SUBNET_LIST_KEY_PREFIX, bad_key);
+        assert_eq!(
+            get_ecdsa_key_id_from_signing_subnet_list_key(&signing_subnet_list_key).unwrap_err(),
+            RegistryClientError::DecodeError {
+                error: "ECDSA Signing Subnet List key id key_id_UnknownCurve:key_name could not be converted to an EcdsaKeyId: \"UnknownCurve is not a recognized ECDSA curve\"".to_string()
+            }
+        )
     }
 }

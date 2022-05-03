@@ -1,7 +1,7 @@
 //! Command line for multisignatures.
 use std::str::FromStr;
 use strum::IntoEnumIterator;
-use strum_macros::{EnumIter, EnumString, ToString};
+use strum_macros::{Display, EnumIter, EnumString};
 
 mod bench;
 mod combine_signatures;
@@ -10,7 +10,7 @@ mod sign;
 mod verify_combined;
 mod verify_individual;
 
-#[derive(EnumString, EnumIter, ToString)]
+#[derive(EnumString, EnumIter, Display)]
 #[strum(serialize_all = "snake_case")]
 enum Command {
     KeyGen,
@@ -23,7 +23,7 @@ enum Command {
 
 fn help_str() -> String {
     Command::iter().fold("Subcommands:\n".to_string(), |accumulator, next| {
-        format!("{}{}\n", accumulator, next.to_string())
+        format!("{}{}\n", accumulator, next)
     })
 }
 

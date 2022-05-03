@@ -40,39 +40,41 @@ impl SandboxService for SandboxClientStub {
         Call::new(cell)
     }
 
-    fn open_state(&self, req: OpenStateRequest) -> Call<OpenStateReply> {
-        let cell = self.channel.call(Request::OpenState(req), |rep| match rep {
-            Reply::OpenState(rep) => Ok(rep),
-            _ => Err(Error::ServerError),
-        });
-        Call::new(cell)
-    }
-
-    fn close_state(&self, req: CloseStateRequest) -> Call<CloseStateReply> {
+    fn open_memory(&self, req: OpenMemoryRequest) -> Call<OpenMemoryReply> {
         let cell = self
             .channel
-            .call(Request::CloseState(req), |rep| match rep {
-                Reply::CloseState(rep) => Ok(rep),
+            .call(Request::OpenMemory(req), |rep| match rep {
+                Reply::OpenMemory(rep) => Ok(rep),
                 _ => Err(Error::ServerError),
             });
         Call::new(cell)
     }
 
-    fn open_execution(&self, req: OpenExecutionRequest) -> Call<OpenExecutionReply> {
+    fn close_memory(&self, req: CloseMemoryRequest) -> Call<CloseMemoryReply> {
         let cell = self
             .channel
-            .call(Request::OpenExecution(req), |rep| match rep {
-                Reply::OpenExecution(rep) => Ok(rep),
+            .call(Request::CloseMemory(req), |rep| match rep {
+                Reply::CloseMemory(rep) => Ok(rep),
                 _ => Err(Error::ServerError),
             });
         Call::new(cell)
     }
 
-    fn close_execution(&self, req: CloseExecutionRequest) -> Call<CloseExecutionReply> {
+    fn start_execution(&self, req: StartExecutionRequest) -> Call<StartExecutionReply> {
         let cell = self
             .channel
-            .call(Request::CloseExecution(req), |rep| match rep {
-                Reply::CloseExecution(rep) => Ok(rep),
+            .call(Request::StartExecution(req), |rep| match rep {
+                Reply::StartExecution(rep) => Ok(rep),
+                _ => Err(Error::ServerError),
+            });
+        Call::new(cell)
+    }
+
+    fn resume_execution(&self, req: ResumeExecutionRequest) -> Call<ResumeExecutionReply> {
+        let cell = self
+            .channel
+            .call(Request::ResumeExecution(req), |rep| match rep {
+                Reply::ResumeExecution(rep) => Ok(rep),
                 _ => Err(Error::ServerError),
             });
         Call::new(cell)

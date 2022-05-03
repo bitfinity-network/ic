@@ -5,25 +5,24 @@ use super::errors::into_parity_wasm_error;
 
 use ic_config::{
     embedders::{Config as EmbeddersConfig, FeatureFlags},
-    feature_status::FeatureStatus,
+    flag_status::FlagStatus,
 };
+use ic_replicated_state::canister_state::execution_state::{
+    CustomSection, CustomSectionType, WasmMetadata,
+};
+use ic_types::NumBytes;
 use ic_wasm_types::{BinaryEncodedWasm, WasmValidationError};
 use parity_wasm::elements::{
     DataSegment, External, ImportCountType,
     Instruction::{self},
     Internal, Module, Section, Type, ValueType,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use wasmtime::Config;
 
 /// Symbols that are reserved and cannot be exported by canisters.
 #[doc(hidden)] // pub for usage in tests
-pub const RESERVED_SYMBOLS: [&str; 4] = [
-    "canister counter_instructions",
-    "canister counter_get",
-    "canister counter_set",
-    "canister_start",
-];
+pub const RESERVED_SYMBOLS: [&str; 2] = ["canister counter_instructions", "canister_start"];
 
 // Represents the expected function signature for any System APIs the Internet
 // Computer provides or any special exported user functions.
@@ -523,8 +522,8 @@ fn get_valid_system_apis(
     ];
 
     let experimental_apis = match feature_flags.api_cycles_u128_flag {
-        FeatureStatus::Disabled => vec![],
-        FeatureStatus::Enabled => vec![
+        FlagStatus::Disabled => vec![],
+        FlagStatus::Enabled => vec![
             (
                 "call_cycles_add128",
                 vec![(
@@ -906,6 +905,107 @@ fn validate_function_section(
     Ok(())
 }
 
+// Extracts the name of the custom section.
+// Possible options:
+//      * icp:public <name>
+//      * icp:private <name>
+// If the name starts with the prefix `icp:` but does not define
+// the visibility `private` or `public` then this custom name is invalid.
+#[doc(hidden)] // pub for usage in tests
+pub fn extract_custom_section_name(
+    name: &str,
+) -> Result<Option<(&str, CustomSectionType)>, WasmValidationError> {
+    let split = name.split_whitespace().collect::<Vec<&str>>();
+
+    // We are extracting custom name
+    // only if visibility and name is provided.
+    if split.len() != 2 {
+        return Ok(None);
+    }
+
+    let visibility = split[0];
+    let name = split[1];
+    match visibility {
+        "icp:public" => Ok(Some((name, CustomSectionType::Public))),
+        "icp:private" => Ok(Some((name, CustomSectionType::Private))),
+        _ => {
+            match visibility.starts_with("icp:") {
+                true => Err(WasmValidationError::InvalidCustomSection(format!(
+                    "Invalid custom section: Custom section named {} has no public/private scope defined.",
+                    name
+                ))),
+                // Ignore custom section name which does not start with `icp:`.
+                false => Ok(None),
+            }
+        }
+    }
+}
+
+// Performs the following checks to validate the custom sections:
+// * Ensures that the names of the custom sections are unique
+// * Check that visibility level is provided to a custom section
+//      * `icp:public`
+//      * `icp:private`
+// * Checks that no more than `max_custom_sections` are defined in the
+// module.
+// * Checks that the size of a custom section does not exceed
+// `max_custom_section_size`.
+//
+// Returns the validated custom sections.
+
+// Public for usage in tests.
+// TODO(EXC-787): Use validate `validate_wam_binary` once wabt fully supports
+// custom sections.
+#[doc(hidden)]
+pub fn validate_custom_section(
+    module: &Module,
+    config: &EmbeddersConfig,
+) -> Result<WasmMetadata, WasmValidationError> {
+    let mut validated_custom_sections: BTreeMap<String, CustomSection> = BTreeMap::new();
+    let custom_sections = module.custom_sections();
+    let mut total_custom_sections_size = NumBytes::from(0);
+
+    for custom_section in custom_sections {
+        let payload = custom_section.payload();
+
+        // Extract the name.
+        if let Some((name, visibility)) = extract_custom_section_name(custom_section.name())? {
+            if validated_custom_sections.contains_key(name) {
+                return Err(WasmValidationError::InvalidCustomSection(format!(
+                    "Invalid custom section: name {} already exists",
+                    name
+                )));
+            }
+
+            // Check the total accumulated size of the custom sections.
+            let size_custom_section = NumBytes::new((payload.len() + name.len()) as u64);
+            total_custom_sections_size += size_custom_section;
+            if total_custom_sections_size > config.max_custom_sections_size {
+                return Err(WasmValidationError::InvalidCustomSection(format!(
+                        "Invalid custom sections: total size of the custom sections exceeds the maximum allowed: size {} bytes, allowed {} bytes",
+                        total_custom_sections_size, config.max_custom_sections_size
+                    )));
+            }
+
+            validated_custom_sections.insert(
+                name.to_string(),
+                CustomSection::new(visibility, payload.to_vec()),
+            );
+
+            // Check that adding a new custom section does not exceed `max_custom_sections`
+            // allowed.
+            if validated_custom_sections.len() > config.max_custom_sections {
+                return Err(WasmValidationError::TooManyCustomSections {
+                    defined: validated_custom_sections.len(),
+                    allowed: config.max_custom_sections,
+                });
+            }
+        }
+    }
+
+    Ok(WasmMetadata::new(validated_custom_sections))
+}
+
 /// Sets Wasmtime flags to ensure deterministic execution.
 pub fn ensure_determinism(config: &mut Config) {
     config
@@ -949,6 +1049,7 @@ pub struct WasmValidationDetails {
     // "canister_" prefix.
     pub reserved_exports: usize,
     pub imports_details: WasmImportsDetails,
+    pub wasm_metadata: WasmMetadata,
 }
 
 /// Validates a Wasm binary against the requirements of the interface spec
@@ -963,6 +1064,7 @@ pub struct WasmValidationDetails {
 /// * Data
 /// * Global
 /// * Function
+/// * CustomSections
 ///
 /// Additionally, it ensures that the wasm binary can actually compile.
 pub fn validate_wasm_binary(
@@ -977,8 +1079,10 @@ pub fn validate_wasm_binary(
     validate_data_section(&module)?;
     validate_global_section(&module, config.max_globals)?;
     validate_function_section(&module, config.max_functions)?;
+    let wasm_metadata = validate_custom_section(&module, config)?;
     Ok(WasmValidationDetails {
         reserved_exports,
         imports_details,
+        wasm_metadata,
     })
 }

@@ -3,11 +3,12 @@ use std::collections::{HashMap, VecDeque};
 use std::convert::TryFrom;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use log::{debug, error, info, trace, warn};
 use reqwest::Client;
+use serde_json::Value;
 use tokio::sync::RwLock;
 use tokio::task::{spawn, JoinHandle};
 use url::Url;
@@ -15,31 +16,36 @@ use url::Url;
 use dfn_candid::CandidOne;
 use dfn_protobuf::{ProtoBuf, ToProto};
 use ic_canister_client::{Agent, HttpClient, Sender};
-use ic_nns_governance::pb::v1::manage_neuron_response::DisburseResponse;
+use ic_nns_governance::pb::v1::manage_neuron_response::{
+    DisburseResponse, FollowResponse, MergeMaturityResponse, SpawnResponse,
+};
 use ic_nns_governance::pb::v1::{
     claim_or_refresh_neuron_from_account_response::Result as ClaimOrRefreshResult,
     governance_error, manage_neuron::NeuronIdOrSubaccount, manage_neuron_response,
-    ClaimOrRefreshNeuronFromAccountResponse, GovernanceError, ManageNeuronResponse, NeuronInfo,
+    ClaimOrRefreshNeuronFromAccountResponse, GovernanceError, ManageNeuronResponse, Neuron,
+    NeuronInfo, NeuronState,
 };
-use ic_types::messages::{HttpSubmitContent, MessageId};
-use ic_types::CanisterId;
+use ic_types::messages::{HttpCallContent, MessageId};
 use ic_types::{crypto::threshold_sig::ThresholdSigPublicKey, messages::SignedRequestBytes};
+use ic_types::{CanisterId, PrincipalId};
 use ledger_canister::protobuf::{ArchiveIndexEntry, ArchiveIndexResponse};
 use ledger_canister::{
     protobuf::TipOfChainRequest, AccountIdentifier, BlockArg, BlockHeight, BlockRes, EncodedBlock,
-    GetBlocksArgs, GetBlocksRes, HashOf, TipOfChainRes, Tokens, Transaction,
+    GetBlocksArgs, GetBlocksRes, HashOf, Symbol, TipOfChainRes, Tokens, Transaction, TransferFee,
+    TransferFeeArgs, DEFAULT_TRANSFER_FEE,
 };
 use on_wire::{FromWire, IntoWire};
 
 use crate::balance_book::BalanceBook;
 use crate::certification::verify_block_hash;
 use crate::errors::{ApiError, Details, ICError};
-use crate::models::{EnvelopePair, SignedTransaction};
+use crate::models::{EnvelopePair, Object, SignedTransaction};
 use crate::request_types::START_DISSOLVE;
 use crate::request_types::STOP_DISSOLVE;
 use crate::request_types::{Request, RequestResult, RequestType, Status, TransactionResults};
-use crate::store::{BlockStore, BlockStoreError, HashedBlock, SQLiteStore};
+use crate::store::{BlockStoreError, HashedBlock, SQLiteStore};
 use crate::transaction_id::TransactionIdentifier;
+use crate::{convert, models};
 
 // If pruning is enabled, instead of pruning after each new block
 // we'll wait for PRUNE_DELAY blocks to accumulate and prune them in one go
@@ -52,6 +58,7 @@ pub trait LedgerAccess {
     async fn sync_blocks(&self, stopped: Arc<AtomicBool>) -> Result<(), ApiError>;
     fn ledger_canister_id(&self) -> &CanisterId;
     fn governance_canister_id(&self) -> &CanisterId;
+    fn token_symbol(&self) -> &str;
     async fn submit(&self, _envelopes: SignedTransaction) -> Result<TransactionResults, ApiError>;
     async fn cleanup(&self);
     async fn neuron_info(
@@ -59,6 +66,7 @@ pub trait LedgerAccess {
         acc_id: NeuronIdOrSubaccount,
         verified: bool,
     ) -> Result<NeuronInfo, ApiError>;
+    async fn transfer_fee(&self) -> Result<TransferFee, ApiError>;
 }
 
 pub struct SubmitResult {
@@ -72,22 +80,28 @@ pub struct LedgerClient {
     governance_canister_id: CanisterId,
     canister_access: Option<Arc<CanisterAccess>>,
     ic_url: Url,
+    token_symbol: String,
     store_max_blocks: Option<u64>,
     offline: bool,
     root_key: Option<ThresholdSigPublicKey>,
 }
 
 impl LedgerClient {
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         ic_url: Url,
         canister_id: CanisterId,
+        token_symbol: String,
         governance_canister_id: CanisterId,
-        block_store: SQLiteStore,
+        store_location: Option<&std::path::Path>,
         store_max_blocks: Option<u64>,
         offline: bool,
         root_key: Option<ThresholdSigPublicKey>,
     ) -> Result<LedgerClient, ApiError> {
-        let mut blocks = Blocks::new(block_store);
+        let mut blocks = match store_location {
+            Some(loc) => Blocks::new_persistent(loc),
+            None => Blocks::new_in_memory(),
+        };
         let canister_access = if offline {
             None
         } else {
@@ -115,6 +129,42 @@ impl LedgerClient {
                 verify_block_hash(&certification, tip_block.hash(), &root_key, &canister_id)
                     .map_err(ApiError::internal_error)?;
             }
+
+            let arg = CandidOne(())
+                .into_bytes()
+                .map_err(|e| ApiError::internal_error(format!("Serialization failed: {:?}", e)))?;
+
+            let symbol_res: Result<Symbol, String> = canister_access
+                .agent
+                .execute_query(&canister_access.canister_id, "symbol", arg)
+                .await
+                .and_then(|bytes| {
+                    CandidOne::from_bytes(
+                        bytes.ok_or_else(|| "symbol reply payload was empty".to_string())?,
+                    )
+                    .map(|c| c.0)
+                });
+
+            match symbol_res {
+                Ok(Symbol { symbol }) => {
+                    if symbol != token_symbol {
+                        return Err(ApiError::internal_error(format!(
+                            "The ledger serves a different token ({}) than specified ({})",
+                            symbol, token_symbol
+                        )));
+                    }
+                }
+                Err(e) => {
+                    if e.contains("has no query method") || e.contains("not found") {
+                        log::warn!("Symbol endpoint not present in the ledger canister. Couldn't verify token symbol.");
+                    } else {
+                        return Err(ApiError::internal_error(format!(
+                            "Failed to fetch symbol name from the ledger: {}",
+                            e
+                        )));
+                    }
+                }
+            };
 
             Some(canister_access)
         };
@@ -146,6 +196,7 @@ impl LedgerClient {
         Ok(Self {
             blockchain: RwLock::new(blocks),
             canister_id,
+            token_symbol,
             governance_canister_id,
             canister_access,
             ic_url,
@@ -252,6 +303,10 @@ async fn send_post_request(
 impl LedgerAccess for LedgerClient {
     async fn read_blocks(&self) -> Box<dyn Deref<Target = Blocks> + '_> {
         Box::new(self.blockchain.read().await)
+    }
+
+    fn token_symbol(&self) -> &str {
+        &self.token_symbol
     }
 
     async fn cleanup(&self) {
@@ -385,9 +440,7 @@ impl LedgerAccess for LedgerClient {
         if self.offline {
             return Err(ApiError::NotAvailableOffline(false, Details::default()));
         }
-
         let start_time = Instant::now();
-
         let http_client = reqwest::Client::new();
 
         let mut results: TransactionResults = envelopes
@@ -399,6 +452,7 @@ impl LedgerAccess for LedgerClient {
                     neuron_id: None,
                     transaction_identifier: None,
                     status: crate::request_types::Status::NotAttempted,
+                    response: None,
                 })
             })
             .collect::<Result<Vec<_>, _>>()?
@@ -412,7 +466,10 @@ impl LedgerAccess for LedgerClient {
                 .await
             {
                 result.status = Status::Failed(e);
-                return Err(ApiError::from(results));
+                return Err(convert::transaction_results_to_api_error(
+                    results,
+                    &self.token_symbol,
+                ));
             }
         }
 
@@ -485,6 +542,44 @@ impl LedgerAccess for LedgerClient {
 
         Ok(ninfo)
     }
+
+    async fn transfer_fee(&self) -> Result<TransferFee, ApiError> {
+        let agent = &self.canister_access.as_ref().unwrap().agent;
+        let arg = CandidOne(TransferFeeArgs {})
+            .into_bytes()
+            .map_err(|e| ApiError::internal_error(format!("Serialization failed: {:?}", e)))?;
+
+        let res = agent
+            .execute_query(&self.canister_id, "transfer_fee", arg)
+            .await;
+
+        // Older Ledger versions may not have the transfer_fee method. Ideally
+        // this method should return the default DEFAULT_TRANSFER_FEE as transfer_fee
+        // only if the IC returns an error saying that the canister doesn't have
+        // the method. canister-client's agent does not return the error code
+        // with the error so there is no way to know if the error was 302
+        // CanisterMethodNotFound or something else. As a workaround, we always
+        // return the default transfer fee if there was an error in calling the
+        // Ledger transfer_fee method.
+        // see https://dfinity.atlassian.net/browse/NET-833
+        match res {
+            Err(e) => {
+                warn!(
+                    "Error while calling transfer_fee, returning the default one {}. Error was: {}",
+                    DEFAULT_TRANSFER_FEE, e
+                );
+                Ok(TransferFee {
+                    transfer_fee: DEFAULT_TRANSFER_FEE,
+                })
+            }
+            Ok(None) => Err(ApiError::internal_error(
+                "conf reply payload was empty".to_string(),
+            )),
+            Ok(Some(bytes)) => CandidOne::from_bytes(bytes).map(|c| c.0).map_err(|e| {
+                ApiError::internal_error(format!("Error querying transfer_fee: {}", e))
+            }),
+        }
+    }
 }
 
 impl LedgerClient {
@@ -513,24 +608,23 @@ impl LedgerClient {
                 let ingress_expiry =
                     ic_types::Time::from_nanos_since_unix_epoch(update.content.ingress_expiry());
                 let ingress_start = ingress_expiry
-                    - (ic_types::ingress::MAX_INGRESS_TTL - ic_types::ingress::PERMITTED_DRIFT);
+                    - (ic_constants::MAX_INGRESS_TTL - ic_constants::PERMITTED_DRIFT);
                 ingress_start <= now && ingress_expiry > now
             })
             .ok_or(ApiError::TransactionExpired)?;
 
         let canister_id = match &update.content {
-            HttpSubmitContent::Call { update } => {
-                CanisterId::try_from(update.canister_id.0.clone()).map_err(|e| {
+            HttpCallContent::Call { update } => CanisterId::try_from(update.canister_id.0.clone())
+                .map_err(|e| {
                     ApiError::internal_error(format!(
                         "Cannot parse canister ID found in submit call: {}",
                         e
                     ))
-                })?
-            }
+                })?,
         };
 
         let request_id = MessageId::from(update.content.representation_independent_hash());
-        let txn_id = TransactionIdentifier::try_from_envelope(request_type, &update)?;
+        let txn_id = TransactionIdentifier::try_from_envelope(request_type.clone(), &update)?;
 
         if txn_id.is_transfer() {
             result.transaction_identifier = Some(txn_id.clone());
@@ -577,7 +671,6 @@ impl LedgerClient {
                     if status.is_success() {
                         break;
                     }
-
                     // Retry on 5xx errors. We don't want to retry on
                     // e.g. authentication errors.
                     let body =
@@ -602,6 +695,12 @@ impl LedgerClient {
             poll_interval = poll_interval
                 .mul_f32(Self::POLL_INTERVAL_MULTIPLIER)
                 .min(Self::MAX_POLL_INTERVAL);
+        }
+
+        enum OperationOutput {
+            BlockIndex(BlockHeight),
+            NeuronId(u64),
+            NeuronResponse(NeuronResponse),
         }
 
         // Do read-state calls until the result becomes available.
@@ -652,11 +751,12 @@ impl LedgerClient {
                                 debug!("Read state response: {:?}", status);
 
                                 match status.status.as_ref() {
-                                    "replied" => match status.reply {
-                                        Some(bytes) => {
-                                            match request_type {
-                                                RequestType::Send => {
-                                                    let block_index: BlockHeight =
+                                    "replied" => {
+                                        match status.reply {
+                                            Some(bytes) => {
+                                                match request_type.clone() {
+                                                    RequestType::Send => {
+                                                        let block_index: BlockHeight =
                                                         ProtoBuf::from_bytes(bytes)
                                                         .map(|c| c.0)
                                                         .map_err(|err| {
@@ -665,37 +765,47 @@ impl LedgerClient {
                                                                 err
                                                             )
                                                         })?;
-                                                    return Ok(Ok(Some(block_index)));
-                                                }
-                                                RequestType::Stake { .. } => {
-                                                    let res: ClaimOrRefreshNeuronFromAccountResponse = candid::decode_one(&bytes)
+                                                        return Ok(Ok(Some(
+                                                            OperationOutput::BlockIndex(
+                                                                block_index,
+                                                            ),
+                                                        )));
+                                                    }
+                                                    RequestType::Stake { .. } => {
+                                                        let res: ClaimOrRefreshNeuronFromAccountResponse = candid::decode_one(&bytes)
                                                         .map_err(|err| {
                                                             format!(
                                                                 "While parsing the reply of the stake creation call: {}",
                                                                 err
                                                             )
                                                         })?;
-                                                    match res.result.unwrap() {
-                                                        ClaimOrRefreshResult::Error(err) => {
-                                                            return Ok(Err(ApiError::TransactionRejected(
+                                                        match res.result.unwrap() {
+                                                            ClaimOrRefreshResult::Error(err) => {
+                                                                return Ok(Err(ApiError::TransactionRejected(
                                                                 false,
                                                                 format!("Could not claim neuron: {}", err).into())));
-                                                        }
-                                                        ClaimOrRefreshResult::NeuronId(nid) => {
-                                                            return Ok(Ok(Some(nid.id)));
-                                                        }
-                                                    };
-                                                }
-                                                RequestType::SetDissolveTimestamp { .. } => {
-                                                    let response: ManageNeuronResponse =
+                                                            }
+                                                            ClaimOrRefreshResult::NeuronId(nid) => {
+                                                                return Ok(Ok(Some(
+                                                                    OperationOutput::NeuronId(
+                                                                        nid.id,
+                                                                    ),
+                                                                )));
+                                                            }
+                                                        };
+                                                    }
+                                                    RequestType::SetDissolveTimestamp {
+                                                        ..
+                                                    } => {
+                                                        let response: ManageNeuronResponse =
                                                         candid::decode_one(bytes.as_ref())
                                                             .map_err(|err| {
                                                                 format!(
-                                                                    "Could not set dissolve timestamp: {}",
+                                                                    "Could not decode dissolve timestamp response: {}",
                                                                     err
                                                                 )
                                                             })?;
-                                                    match &response.command {
+                                                        match &response.command {
                                                         Some(manage_neuron_response::Command::Configure(_)) => { return Ok(Ok(None)); }
                                                         Some(manage_neuron_response::Command::Error(err)) => {
                                                             if err.error_message == "Can't set a dissolve delay that is smaller than the current dissolve delay." {
@@ -709,25 +819,26 @@ impl LedgerClient {
                                                         }
                                                         _ => panic!("unexpected set dissolve delay timestamp result: {:?}", response.command),
                                                     }
-                                                }
-                                                RequestType::StartDissolve { .. }
-                                                | RequestType::StopDissolve { .. } => {
-                                                    let response: ManageNeuronResponse =
-                                                        candid::decode_one(bytes.as_ref())
-                                                            .map_err(|err| {
-                                                                format!(
-                                                                    "Could not set dissolve: {}",
+                                                    }
+                                                    RequestType::StartDissolve { .. }
+                                                    | RequestType::StopDissolve { .. } => {
+                                                        let response: ManageNeuronResponse =
+                                                            candid::decode_one(bytes.as_ref())
+                                                                .map_err(|err| {
+                                                                    format!(
+                                                                    "Could not decode start/stop disburse response: {}",
                                                                     err
                                                                 )
-                                                            })?;
-                                                    match &response.command {
+                                                                })?;
+                                                        match &response.command {
                                                         Some(manage_neuron_response::Command::Configure(_)) => {
                                                             return Ok(Ok(None));
                                                         }
                                                         Some(manage_neuron_response::Command::Error(err)) => {
-                                                            if (request_type.into_str() ==  START_DISSOLVE
+                                                            let req_str= request_type.into_str();
+                                                            if (req_str ==  START_DISSOLVE
                                                                 && err.error_type == governance_error::ErrorType::RequiresNotDissolving as i32)
-                                                                || (request_type.into_str() == STOP_DISSOLVE
+                                                                || (req_str == STOP_DISSOLVE
                                                                     && err.error_type == governance_error::ErrorType::RequiresDissolving as i32)
                                                             {
                                                                 return Ok(Ok(None));
@@ -743,20 +854,20 @@ impl LedgerClient {
                                                             response.command
                                                         ),
                                                     }
-                                                }
-                                                RequestType::Disburse { .. } => {
-                                                    let response: ManageNeuronResponse =
-                                                        candid::decode_one(bytes.as_ref())
-                                                            .map_err(|err| {
-                                                                format!(
-                                                                    "Could not disburse : {}",
-                                                                    err
-                                                                )
-                                                            })?;
+                                                    }
+                                                    RequestType::Disburse { .. } => {
+                                                        let response: ManageNeuronResponse =
+                                                            candid::decode_one(bytes.as_ref())
+                                                                .map_err(|err| {
+                                                                    format!(
+                                                                        "Could not decode DISBURSE response : {}",
+                                                                        err
+                                                                    )
+                                                                })?;
 
-                                                    match &response.command {
+                                                        match &response.command {
                                                         Some(manage_neuron_response::Command::Disburse(DisburseResponse {transfer_block_height})) => {
-                                                            return Ok(Ok(Some(*transfer_block_height)));
+                                                            return Ok(Ok(Some(OperationOutput::BlockIndex(*transfer_block_height))));
                                                         }
                                                         Some(manage_neuron_response::Command::Error(err)) => {
                                                                 return Ok(Err(ApiError::TransactionRejected(
@@ -766,45 +877,186 @@ impl LedgerClient {
                                                         }
                                                         _ => panic!(
                                                             "unexpected disburse result: {:?}", response.command)}
-                                                }
-                                                RequestType::AddHotKey { .. } => {
-                                                    let response: ManageNeuronResponse =
+                                                    }
+                                                    RequestType::AddHotKey { .. } => {
+                                                        let response: ManageNeuronResponse =
                                                         candid::decode_one(bytes.as_ref())
                                                             .map_err(|err| {
                                                                 format!(
-                                                                    "Could not decode ADD_HOTKEY request: {}",
+                                                                    "Could not decode ADD_HOTKEY response: {}",
                                                                     err
                                                                 )
                                                             })?;
-                                                    match &response.command {
-                                                        Some(manage_neuron_response::Command::Configure(_)) => {
-                                                            return Ok(Ok(None));
-                                                        }
-                                                        Some(manage_neuron_response::Command::Error(err)) => {
-                                                            if err.error_message.contains("Hot key duplicated") {
-                                                                 return Ok(Ok(None));
-                                                            } else {
-                                                                return Ok(Err(ApiError::TransactionRejected(
-                                                                            false,
-                                                                            format!("Could not add hot key: {}", err).into()
-                                                                        )
-                                                                    )
-                                                                );
+                                                        match &response.command {
+                                                            Some(manage_neuron_response::Command::Configure(_)) => {
+                                                                return Ok(Ok(None));
                                                             }
+                                                            Some(manage_neuron_response::Command::Error(err)) => {
+                                                                if err.error_message.contains("Hot key duplicated") {
+                                                                     return Ok(Ok(None));
+                                                                } else {
+                                                                    return Ok(Err(ApiError::TransactionRejected(
+                                                                                false,
+                                                                                format!("Could not add hot key: {}", err).into()
+                                                                            )
+                                                                        )
+                                                                    );
+                                                                }
+                                                            }
+                                                            _ => panic!(
+                                                                "unexpected add hot key result: {:?}",
+                                                                response.command
+                                                            ),
                                                         }
-                                                        _ => panic!(
-                                                            "unexpected add hot key result: {:?}",
+                                                    }
+                                                    RequestType::RemoveHotKey { .. } => {
+                                                        let response: ManageNeuronResponse =
+                                                            candid::decode_one(bytes.as_ref())
+                                                                .map_err(|err| {
+                                                                    format!(
+                                                                        "Could not decode REMOVE_HOTKEY response: {}",
+                                                                        err
+                                                                    )
+                                                                })?;
+                                                        match &response.command {
+                                                            Some(manage_neuron_response::Command::Configure(_)) => {
+                                                                return Ok(Ok(None));
+                                                            }
+                                                            Some(manage_neuron_response::Command::Error(err)) => {
+                                                                    return Ok(Err(ApiError::TransactionRejected(
+                                                                        false,
+                                                                        format!("Could not remove hotkey: {}", err).into()
+                                                                    )));
+                                                            }
+                                                            _ => panic!(
+                                                                "unexpected remove hot key result: {:?}",
+                                                                response.command
+                                                            ),
+                                                        }
+                                                    }
+                                                    RequestType::Spawn { .. } => {
+                                                        let response: ManageNeuronResponse =
+                                                        candid::decode_one(bytes.as_ref())
+                                                            .map_err(|err| {
+                                                                format!(
+                                                                    "Could not decode SPAWN response: {}",
+                                                                    err
+                                                                )
+                                                            })?;
+                                                        match &response.command {
+                                                            Some(manage_neuron_response::Command::Spawn(SpawnResponse{ .. })) => {
+                                                                return Ok(Ok(None));
+                                                            }
+                                                            Some(manage_neuron_response::Command::Error(err)) => {
+                                                                return Ok(Err(ApiError::TransactionRejected(
+                                                                    false,
+                                                                    format!("Could not spawn neuron: {}",err).into()
+                                                                )));
+                                                            }
+                                                            _ => panic!(
+                                                                "unexpected spawn result: {:?}",
+                                                                response.command
+                                                            ),
+                                                        }
+                                                    }
+                                                    RequestType::MergeMaturity { .. } => {
+                                                        let response: ManageNeuronResponse =
+                                                            candid::decode_one(bytes.as_ref())
+                                                                .map_err(|err| {
+                                                                    format!(
+                                                                        "Could not decode MERGE_MATURITY response: {}",
+                                                                        err
+                                                                    )
+                                                                })?;
+                                                        match &response.command {
+                                                            Some(manage_neuron_response::Command::MergeMaturity(MergeMaturityResponse{ .. })) => {
+                                                                return Ok(Ok(None));
+                                                            }
+                                                            Some(manage_neuron_response::Command::Error(err)) => {
+                                                                return Ok(Err(ApiError::TransactionRejected(
+                                                                    false,
+                                                                    format!("Could not merge maturity: {}",err).into()
+                                                                )));
+                                                            }
+                                                            _ => panic!(
+                                                                "unexpected merge maturity result: {:?}",
+                                                                response.command
+                                                            ),
+                                                        }
+                                                    }
+                                                    RequestType::NeuronInfo { .. } => {
+                                                        // Check the response from governance call.
+                                                        let response: Result<Neuron, GovernanceError> =
+                                                            candid::decode_one(bytes.as_ref())
+                                                                .map_err(|err| {
+                                                                    format!(
+                                                                        "Could not decode NEURON_INFO response: {}",
+                                                                        err
+                                                                    )
+                                                                })?;
+                                                        return match response {
+                                                            Err(e) => {
+                                                                Ok(Err(ApiError::InvalidRequest(
+                                                                    false,
+                                                                    format!("Could not retrieve neuron information: {}", e.error_message).into()
+                                                                )))
+                                                            },
+                                                            Ok(neuron) => {
+                                                                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                                                                let state = neuron.state(now);
+                                                                let state = match state{
+                                                                    NeuronState::NotDissolving => models::NeuronState::NotDissolving,
+                                                                    NeuronState::Dissolving => models::NeuronState::Dissolving,
+                                                                    NeuronState::Dissolved => models::NeuronState::Dissolved,
+                                                                    NeuronState::Unspecified => models::NeuronState::Dissolved,
+                                                                };
 
-                                                            response.command
-                                                        ),
+                                                                let output = OperationOutput::NeuronResponse(NeuronResponse {
+                                                                    neuron_id: neuron.id.as_ref().unwrap().id,
+                                                                    controller: neuron.controller.unwrap(),
+                                                                    kyc_verified: neuron.kyc_verified,
+                                                                    state,
+                                                                    maturity_e8s_equivalent: neuron.maturity_e8s_equivalent,
+                                                                    neuron_fees_e8s: neuron.neuron_fees_e8s,
+                                                                });
+                                                                return Ok(Ok(Some(output)));
+                                                            }
+                                                        };
+                                                    }
+                                                    RequestType::Follow { .. } => {
+                                                        let response: ManageNeuronResponse =
+                                                            candid::decode_one(bytes.as_ref())
+                                                                .map_err(|err| {
+                                                                    format!(
+                                                                        "Could not decode FOLLOW response: {}",
+                                                                        err
+                                                                    )
+                                                                })?;
+                                                        match &response.command {
+                                                            Some(manage_neuron_response::Command::Follow(FollowResponse{ .. })) => {
+                                                                return Ok(Ok(None));
+                                                            }
+                                                            Some(manage_neuron_response::Command::Error(err)) => {
+                                                                return Ok(Err(ApiError::TransactionRejected(
+                                                                    false,
+                                                                    format!("Could not follow: {}",err).into()
+                                                                )));
+                                                            }
+                                                            _ => panic!(
+                                                                "unexpected follow result: {:?}",
+                                                                response.command
+                                                            ),
+                                                        }
                                                     }
                                                 }
                                             }
+                                            None => {
+                                                return Err(
+                                                    "Send returned with no result.".to_owned()
+                                                );
+                                            }
                                         }
-                                        None => {
-                                            return Err("Send returned with no result.".to_owned());
-                                        }
-                                    },
+                                    }
                                     "unknown" | "received" | "processing" => {}
                                     "rejected" => {
                                         return Ok(Err(ApiError::TransactionRejected(
@@ -814,6 +1066,12 @@ impl LedgerClient {
                                                 .unwrap_or_else(|| "(no message)".to_owned())
                                                 .into(),
                                         )));
+                                    }
+                                    "done" => {
+                                        return Err(
+                                            "The call has completed but the reply/reject data has been pruned."
+                                                .to_string(),
+                                        );
                                     }
                                     _ => {
                                         return Err(format!(
@@ -849,7 +1107,7 @@ impl LedgerClient {
 
                 // We didn't get a response in 30 seconds. Let the client handle it.
                 return Err(format!(
-                    "Block submission took longer than {:?} to complete.",
+                    "Operation took longer than {:?} to complete.",
                     Self::TIMEOUT
                 ));
             }
@@ -860,12 +1118,22 @@ impl LedgerClient {
          * 200 result with no block index. */
         match wait_for_result().await {
             // Success
-            Ok(Ok(id)) => {
-                if let Request::Stake(_) = result._type {
-                    result.neuron_id = id;
-                } else {
-                    result.block_index = id;
+            Ok(Ok(Some(output))) => {
+                match output {
+                    OperationOutput::BlockIndex(block_height) => {
+                        result.block_index = Some(block_height);
+                    }
+                    OperationOutput::NeuronId(neuron_id) => {
+                        result.neuron_id = Some(neuron_id);
+                    }
+                    OperationOutput::NeuronResponse(response) => {
+                        result.response = Some(Object::from(response));
+                    }
                 }
+                result.status = Status::Completed;
+                Ok(())
+            }
+            Ok(Ok(None)) => {
                 result.status = Status::Completed;
                 Ok(())
             }
@@ -880,6 +1148,25 @@ impl LedgerClient {
                 result.status = Status::Failed(ApiError::internal_error(e_msg));
                 Ok(())
             }
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct NeuronResponse {
+    neuron_id: u64,
+    controller: PrincipalId,
+    kyc_verified: bool,
+    state: models::NeuronState,
+    maturity_e8s_equivalent: u64,
+    neuron_fees_e8s: u64,
+}
+
+impl From<NeuronResponse> for Object {
+    fn from(r: NeuronResponse) -> Self {
+        match serde_json::to_value(r) {
+            Ok(Value::Object(o)) => o,
+            _ => Object::default(),
         }
     }
 }
@@ -1106,8 +1393,7 @@ impl CanisterAccess {
             Some(entry) => (
                 entry
                     .canister_id
-                    .map(|pid| CanisterId::try_from(pid).ok())
-                    .flatten()
+                    .and_then(|pid| CanisterId::try_from(pid).ok())
                     .unwrap_or(self.canister_id),
                 entry.height_to + 1,
             ),
@@ -1128,16 +1414,12 @@ pub struct Blocks {
     last_hash: Option<HashOf<EncodedBlock>>,
 }
 
-impl Default for Blocks {
-    fn default() -> Self {
-        Blocks::new_in_memory()
-    }
-}
-
 impl Blocks {
     const LOAD_FROM_STORE_BLOCK_BATCH_LEN: u64 = 10000;
 
-    pub fn new(block_store: SQLiteStore) -> Self {
+    pub fn new_persistent(store_location: &std::path::Path) -> Self {
+        let block_store = SQLiteStore::new_on_disk(store_location)
+            .expect("Failed to initialize sql store for ledger");
         Self {
             balance_book: BalanceBook::default(),
             hash_location: HashMap::default(),
@@ -1148,9 +1430,15 @@ impl Blocks {
     }
 
     pub fn new_in_memory() -> Self {
-        let store =
+        let block_store =
             SQLiteStore::new_in_memory().expect("Failed to initialize sql store for ledger");
-        Self::new(store)
+        Self {
+            balance_book: BalanceBook::default(),
+            hash_location: HashMap::default(),
+            tx_hash_location: HashMap::default(),
+            block_store,
+            last_hash: None,
+        }
     }
 
     pub fn load_from_store(&mut self) -> Result<u64, ApiError> {
@@ -1178,7 +1466,7 @@ impl Blocks {
             self.last_hash = Some(first.hash);
         }
 
-        let mut n = 0;
+        let mut n = 1; // one block loaded so far (genesis or first from snapshot)
         let mut next_idx = self.last()?.map(|hb| hb.index + 1).unwrap();
         loop {
             let batch = self

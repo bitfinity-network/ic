@@ -1,9 +1,11 @@
 use crate::basic_cpmgr::BasicCheckpointManager;
 use crate::error::LayoutError;
 
+use bitcoin::{hashes::Hash, Network, OutPoint, Script, TxOut, Txid};
 use ic_base_types::{NumBytes, NumSeconds};
 use ic_logger::ReplicaLogger;
 use ic_protobuf::{
+    bitcoin::v1 as pb_bitcoin,
     proxy::{try_from_option_field, ProxyDecodeError},
     state::{
         canister_state_bits::v1 as pb_canister_state_bits, queues::v1 as pb_queues,
@@ -11,20 +13,24 @@ use ic_protobuf::{
     },
 };
 use ic_replicated_state::{
-    CallContextManager, CanisterStatus, ExportedFunctions, Global, NumWasmPages,
+    bitcoin_state, canister_state::execution_state::WasmMetadata, CallContextManager,
+    CanisterStatus, ExportedFunctions, Global, NumWasmPages,
 };
+use ic_sys::mmap::ScopedMmap;
 use ic_types::{
     nominal_cycles::NominalCycles, AccumulatedPriority, CanisterId, ComputeAllocation, Cycles,
-    ExecutionRound, Height, MemoryAllocation, PrincipalId,
+    ExecutionRound, Height, MemoryAllocation, NumInstructions, PrincipalId,
 };
-use ic_wasm_types::BinaryEncodedWasm;
+use ic_wasm_types::CanisterModule;
 use std::convert::{From, TryFrom, TryInto};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
-use std::{collections::BTreeSet, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 pub trait CheckpointManager: Send + Sync {
     /// Returns the base directory path managed by checkpoint manager.
@@ -155,6 +161,7 @@ pub struct ExecutionStateBits {
     pub heap_size: NumWasmPages,
     pub exports: ExportedFunctions,
     pub last_executed_round: ExecutionRound,
+    pub metadata: WasmMetadata,
 }
 
 /// This struct contains bits of the `CanisterState` that are not already
@@ -179,6 +186,30 @@ pub struct CanisterStateBits {
     pub consumed_cycles_since_replica_started: NominalCycles,
     pub stable_memory_size: NumWasmPages,
     pub heap_delta_debit: NumBytes,
+    pub install_code_debit: NumInstructions,
+}
+
+/// This struct contains bits of the `BitcoinState` that are not already
+/// covered somewhere else and are too small to be serialized separately.
+#[derive(Debug)]
+pub struct BitcoinStateBits {
+    pub adapter_queues: bitcoin_state::AdapterQueues,
+    pub unstable_blocks: bitcoin_state::UnstableBlocks,
+    pub stable_height: u32,
+    pub network: Network,
+    pub utxos_large: BTreeMap<OutPoint, (TxOut, u32)>,
+}
+
+impl Default for BitcoinStateBits {
+    fn default() -> Self {
+        Self {
+            network: Network::Testnet,
+            adapter_queues: bitcoin_state::AdapterQueues::default(),
+            unstable_blocks: bitcoin_state::UnstableBlocks::default(),
+            stable_height: 0,
+            utxos_large: BTreeMap::default(),
+        }
+    }
 }
 
 /// `StateLayout` provides convenience functions to construct correct
@@ -197,6 +228,12 @@ pub struct CanisterStateBits {
 /// │── tip
 /// │   ├── system_metadata.pbuf
 /// │   ├── subnet_queues.pbuf
+/// │   ├── bitcoin
+/// |   |   └── testnet
+/// |   |       └── state.pbuf
+/// |   |       └── utxos_small.bin
+/// |   |       └── utxos_medium.bin
+/// |   |       └── address_outpoints.bin
 /// │   └── canister_states
 /// │       └── <hex(canister_id)>
 /// │           ├── queues.pbuf
@@ -209,6 +246,12 @@ pub struct CanisterStateBits {
 /// │   └──<hex(round)>
 /// │      ├── system_metadata.pbuf
 /// │      ├── subnet_queues.pbuf
+/// |      ├── bitcoin
+/// |      |   └── testnet
+/// |      |       └── state.pbuf
+/// |      |       └── utxos_small.bin
+/// |      |       └── utxos_medium.bin
+/// |      |       └── address_outpoints.bin
 /// │      └── canister_states
 /// │          └── <hex(canister_id)>
 /// │              ├── queues.pbuf
@@ -224,7 +267,7 @@ pub struct CanisterStateBits {
 #[derive(Clone)]
 pub struct StateLayout {
     cp_manager: Arc<dyn CheckpointManager>,
-    log: ReplicaLogger,
+    _log: ReplicaLogger,
 }
 
 impl StateLayout {
@@ -232,7 +275,7 @@ impl StateLayout {
     pub fn new(log: ReplicaLogger, root: PathBuf) -> Self {
         Self {
             cp_manager: Arc::new(BasicCheckpointManager::new(log.clone(), root)),
-            log,
+            _log: log,
         }
     }
 
@@ -249,14 +292,24 @@ impl StateLayout {
         Ok(tmp)
     }
 
+    /// Removes the tmp directory and all its contents
+    pub fn remove_tmp(&self) -> Result<(), LayoutError> {
+        let tmp = self.tmp()?;
+        std::fs::remove_dir_all(&tmp).map_err(|err| LayoutError::IoError {
+            path: tmp,
+            message: "Unable to remove temporary directory".to_string(),
+            io_err: err,
+        })
+    }
+
     /// Returns a layout object representing tip state in "tip"
     /// directory. During round execution this directory may contain
     /// inconsistent state. During full checkpointing this directory contains
     /// full state and is converted to a checkpoint.
     /// This directory is cleaned during restart of a node and reset to
     /// last full checkpoint.
-    pub fn tip(&self) -> Result<CheckpointLayout<RwPolicy>, LayoutError> {
-        CheckpointLayout::new(self.tip_path(), Height::from(0))
+    pub fn tip(&self, height: Height) -> Result<CheckpointLayout<RwPolicy>, LayoutError> {
+        CheckpointLayout::new(self.tip_path(), height)
     }
 
     /// Returns the path to the serialized states metadata.
@@ -293,9 +346,9 @@ impl StateLayout {
     pub fn tip_to_checkpoint(
         &self,
         tip: CheckpointLayout<RwPolicy>,
-        height: Height,
         thread_pool: Option<&mut scoped_threadpool::Pool>,
     ) -> Result<CheckpointLayout<ReadOnly>, LayoutError> {
+        let height = tip.height;
         let cp_name = self.checkpoint_name(height);
         match self
             .cp_manager
@@ -680,6 +733,10 @@ impl<Permissions: AccessPolicy> CheckpointLayout<Permissions> {
         )
     }
 
+    pub fn bitcoin_testnet(&self) -> Result<BitcoinStateLayout<Permissions>, LayoutError> {
+        BitcoinStateLayout::new(self.root.join("bitcoin").join("testnet"))
+    }
+
     pub fn height(&self) -> Height {
         self.height
     }
@@ -748,6 +805,41 @@ impl<Permissions: AccessPolicy> CanisterLayout<Permissions> {
 
     pub fn is_marked_deleted(&self) -> bool {
         Path::new(&self.tombstone()).exists()
+    }
+}
+
+pub struct BitcoinStateLayout<Permissions: AccessPolicy> {
+    bitcoin_root: PathBuf,
+    permissions_tag: PhantomData<Permissions>,
+}
+
+impl<Permissions: AccessPolicy> BitcoinStateLayout<Permissions> {
+    pub fn new(bitcoin_root: PathBuf) -> Result<Self, LayoutError> {
+        Permissions::check_dir(&bitcoin_root)?;
+        Ok(Self {
+            bitcoin_root,
+            permissions_tag: PhantomData,
+        })
+    }
+
+    pub fn raw_path(&self) -> PathBuf {
+        self.bitcoin_root.clone()
+    }
+
+    pub fn bitcoin_state(&self) -> ProtoFileWith<pb_bitcoin::BitcoinStateBits, Permissions> {
+        self.bitcoin_root.join("state.pbuf").into()
+    }
+
+    pub fn utxos_small(&self) -> PathBuf {
+        self.bitcoin_root.join("utxos_small.bin")
+    }
+
+    pub fn utxos_medium(&self) -> PathBuf {
+        self.bitcoin_root.join("utxos_medium.bin")
+    }
+
+    pub fn address_outpoints(&self) -> PathBuf {
+        self.bitcoin_root.join("address_outpoints.bin")
     }
 }
 
@@ -836,17 +928,13 @@ where
         self.deserialize_file(file)
     }
 
-    fn deserialize_file(&self, mut f: std::fs::File) -> Result<T, LayoutError> {
-        let mut buffer: Vec<u8> = Vec::new();
-        use std::io::prelude::*;
-
-        f.read_to_end(&mut buffer)
-            .map_err(|io_err| LayoutError::IoError {
-                path: self.path.clone(),
-                message: "failed to read file".to_string(),
-                io_err,
-            })?;
-        T::decode(buffer.as_slice()).map_err(|err| LayoutError::CorruptedLayout {
+    fn deserialize_file(&self, f: std::fs::File) -> Result<T, LayoutError> {
+        let mmap = ScopedMmap::mmap_file_readonly(f).map_err(|io_err| LayoutError::IoError {
+            path: self.path.clone(),
+            message: "failed to mmap a file".to_string(),
+            io_err,
+        })?;
+        T::decode(mmap.as_slice()).map_err(|err| LayoutError::CorruptedLayout {
             path: self.path.clone(),
             message: format!(
                 "failed to deserialize an object of type {} from protobuf: {}",
@@ -856,6 +944,9 @@ where
         })
     }
 
+    /// Deserializes the value if the underlying file exists.
+    /// If the proto file does not exist, returns Ok(None).
+    /// Returns an error for all other I/O errors.
     pub fn deserialize_opt(&self) -> Result<Option<T>, LayoutError> {
         match open_for_read(&self.path) {
             Ok(f) => self.deserialize_file(f).map(Some),
@@ -890,12 +981,18 @@ pub struct WasmFile<Permissions> {
     permissions_tag: PhantomData<Permissions>,
 }
 
+impl<T> WasmFile<T> {
+    pub fn raw_path(&self) -> &Path {
+        &self.path
+    }
+}
+
 impl<T> WasmFile<T>
 where
     T: ReadPolicy,
 {
-    pub fn deserialize(&self) -> Result<BinaryEncodedWasm, LayoutError> {
-        BinaryEncodedWasm::new_from_file(self.path.clone()).map_err(|err| LayoutError::IoError {
+    pub fn deserialize(&self) -> Result<CanisterModule, LayoutError> {
+        CanisterModule::new_from_file(self.path.clone()).map_err(|err| LayoutError::IoError {
             path: self.path.clone(),
             message: "Failed to read file contents".to_string(),
             io_err: err,
@@ -907,35 +1004,26 @@ impl<T> WasmFile<T>
 where
     T: WritePolicy,
 {
-    pub fn serialize(&self, wasm: &BinaryEncodedWasm) -> Result<(), LayoutError> {
-        if wasm.file().is_none() {
-            // Canister was installed/upgraded. Persist the new
-            // wasm binary
-            let mut file = open_for_write(&self.path)?;
-            file.write_all(wasm.as_slice())
-                .and_then(|_| file.flush())
-                .map_err(|err| LayoutError::IoError {
-                    path: self.path.clone(),
-                    message: "failed to write wasm binary to file".to_string(),
-                    io_err: err,
-                })?;
-
-            file.flush().map_err(|err| LayoutError::IoError {
+    pub fn serialize(&self, wasm: &CanisterModule) -> Result<(), LayoutError> {
+        let mut file = open_for_write(&self.path)?;
+        file.write_all(wasm.as_slice())
+            .map_err(|err| LayoutError::IoError {
                 path: self.path.clone(),
-                message: "failed to flush wasm binary to disk".to_string(),
+                message: "failed to write wasm binary to file".to_string(),
                 io_err: err,
             })?;
 
-            file.sync_all().map_err(|err| LayoutError::IoError {
-                path: self.path.clone(),
-                message: "failed to sync wasm binary to disk".to_string(),
-                io_err: err,
-            })
-        } else {
-            // No need to persist as existing wasm binary was used and
-            // it did not change since last checkpoint
-            Ok(())
-        }
+        file.flush().map_err(|err| LayoutError::IoError {
+            path: self.path.clone(),
+            message: "failed to flush wasm binary to disk".to_string(),
+            io_err: err,
+        })?;
+
+        file.sync_all().map_err(|err| LayoutError::IoError {
+            path: self.path.clone(),
+            message: "failed to sync wasm binary to disk".to_string(),
+            io_err: err,
+        })
     }
 }
 
@@ -951,18 +1039,6 @@ impl<Permissions> From<PathBuf> for WasmFile<Permissions> {
 impl From<CanisterStateBits> for pb_canister_state_bits::CanisterStateBits {
     fn from(item: CanisterStateBits) -> Self {
         Self {
-            // Field `controller` is now deprecated. Once all subnets in production contain the
-            // new version of this field, we can remove it.
-            controller: Some(
-                // To maintain compatibility in case we need to downgrade in an emergency,
-                // we still assign the controller field. If there are multiple controllers,
-                // we assign one of them as the controller, and if there are none, we assign
-                // the "no controller" marker.
-                match item.controllers.iter().next() {
-                    None => no_controllers_marker().into(),
-                    Some(controller) => controller.to_owned().into(),
-                },
-            ),
             controllers: item
                 .controllers
                 .into_iter()
@@ -976,7 +1052,6 @@ impl From<CanisterStateBits> for pb_canister_state_bits::CanisterStateBits {
             memory_allocation: item.memory_allocation.bytes().get(),
             freeze_threshold: item.freeze_threshold.get(),
             cycles_balance: Some(item.cycles_balance.into()),
-            cycles_account: Some(item.cycles_balance.into()),
             canister_status: Some((&item.status).into()),
             scheduled_as_first: item.scheduled_as_first,
             skipped_round_due_to_no_messages: item.skipped_round_due_to_no_messages,
@@ -986,15 +1061,9 @@ impl From<CanisterStateBits> for pb_canister_state_bits::CanisterStateBits {
             consumed_cycles_since_replica_started: Some(
                 (&item.consumed_cycles_since_replica_started).into(),
             ),
-            stable_memory_size: match u32::try_from(item.stable_memory_size.get()) {
-                Ok(num) => num,
-                // If the value is bigger than 2^32, simply saturate it, `stable_memory_size64`
-                // should be the field that correctly represents the size of stable memory in this
-                // case.
-                Err(_) => u32::MAX,
-            },
             stable_memory_size64: item.stable_memory_size.get() as u64,
             heap_delta_debit: item.heap_delta_debit.get(),
+            install_code_debit: item.install_code_debit.get(),
         }
     }
 }
@@ -1024,35 +1093,9 @@ impl TryFrom<pb_canister_state_bits::CanisterStateBits> for CanisterStateBits {
         for controller in value.controllers.into_iter() {
             controllers.insert(PrincipalId::try_from(controller)?);
         }
-        if let Some(controller) = value.controller {
-            if controller != no_controllers_marker().into() {
-                controllers.insert(PrincipalId::try_from(controller)?);
-            }
-        }
 
-        // Once all subnets in production contain the
-        // new version of this field, we can remove this code.
-        let cycles_balance = match try_from_option_field(
-            value.cycles_balance,
-            "CanisterStateBits::cycles_balance",
-        ) {
-            Ok(cycles_balance) => cycles_balance,
-            Err(_) => {
-                try_from_option_field(value.cycles_account, "CanisterStateBits::cycles_account")?
-            }
-        };
-
-        // TODO(EXC-402): Remove this branch once subnets have been upgraded to have
-        // the new 64-bit size along with the old 32-bit size.
-        let stable_memory_size = if value.stable_memory_size64 > 0 {
-            value.stable_memory_size64
-        } else {
-            // This case happens on the first upgrade of the replica when
-            // `stable_memory_size64` is not set yet has the default value of 0.
-            // This may also happen if the memory size is actually 0, then
-            // `stable_memory_size` is guaranteed to be 0 as well.
-            value.stable_memory_size as u64
-        };
+        let cycles_balance =
+            try_from_option_field(value.cycles_balance, "CanisterStateBits::cycles_balance")?;
 
         Ok(Self {
             controllers,
@@ -1083,8 +1126,9 @@ impl TryFrom<pb_canister_state_bits::CanisterStateBits> for CanisterStateBits {
             interruped_during_execution: value.interruped_during_execution,
             certified_data: value.certified_data,
             consumed_cycles_since_replica_started,
-            stable_memory_size: NumWasmPages::from(stable_memory_size as usize),
+            stable_memory_size: NumWasmPages::from(value.stable_memory_size64 as usize),
             heap_delta_debit: NumBytes::from(value.heap_delta_debit),
+            install_code_debit: NumInstructions::from(value.install_code_debit),
         })
     }
 }
@@ -1104,6 +1148,7 @@ impl From<&ExecutionStateBits> for pb_canister_state_bits::ExecutionStateBits {
                 .expect("Canister heap size didn't fit into 32 bits"),
             exports: (&item.exports).into(),
             last_executed_round: item.last_executed_round.get(),
+            metadata: Some((&item.metadata).into()),
         }
     }
 }
@@ -1120,22 +1165,111 @@ impl TryFrom<pb_canister_state_bits::ExecutionStateBits> for ExecutionStateBits 
             heap_size: (value.heap_size as usize).into(),
             exports: value.exports.try_into()?,
             last_executed_round: value.last_executed_round.into(),
+            metadata: try_from_option_field(value.metadata, "ExecutionStateBits::metadata")
+                .unwrap_or_default(),
         })
     }
 }
 
-// A principal used to indicate that there are no controllers present.
-// Note the "no controller" substring in the principal.
-fn no_controllers_marker() -> PrincipalId {
-    PrincipalId::from_str("zrl4w-cqaaa-nocon-troll-eraaa-d5qc").unwrap()
+impl From<&BitcoinStateBits> for pb_bitcoin::BitcoinStateBits {
+    fn from(item: &BitcoinStateBits) -> Self {
+        pb_bitcoin::BitcoinStateBits {
+            adapter_queues: Some((&item.adapter_queues).into()),
+            unstable_blocks: Some((&item.unstable_blocks).into()),
+            stable_height: item.stable_height,
+            network: match item.network {
+                Network::Testnet => 1,
+                Network::Bitcoin => 2,
+                // TODO(EXC-1096): Define our Network struct to avoid this panic.
+                _ => panic!("Invalid network ID"),
+            },
+            utxos_large: item
+                .utxos_large
+                .iter()
+                .map(|(outpoint, (txout, height))| pb_bitcoin::Utxo {
+                    outpoint: Some(pb_bitcoin::OutPoint {
+                        txid: outpoint.txid.to_vec(),
+                        vout: outpoint.vout,
+                    }),
+                    txout: Some(pb_bitcoin::TxOut {
+                        value: txout.value,
+                        script_pubkey: txout.script_pubkey.to_bytes(),
+                    }),
+                    height: *height,
+                })
+                .collect(),
+        }
+    }
+}
+
+impl TryFrom<pb_bitcoin::BitcoinStateBits> for BitcoinStateBits {
+    type Error = ProxyDecodeError;
+
+    fn try_from(value: pb_bitcoin::BitcoinStateBits) -> Result<Self, Self::Error> {
+        let adapter_queues: bitcoin_state::AdapterQueues =
+            try_from_option_field(value.adapter_queues, "BitcoinStateBits::adapter_queues")?;
+
+        // NOTE: The `unwrap_or_default` here is needed temporarily for backward compatibility.
+        // TODO(EXC-1094): Replace the `unwrap_or_default` with an error once this change
+        //                 is deployed to prod.
+        let unstable_blocks: bitcoin_state::UnstableBlocks =
+            try_from_option_field(value.unstable_blocks, "BitcoinStateBits::unstable_blocks")
+                .unwrap_or_default();
+        Ok(BitcoinStateBits {
+            adapter_queues,
+            unstable_blocks,
+            stable_height: value.stable_height,
+            network: match value.network {
+                0 => {
+                    // No network specified. Assume "testnet".
+                    // NOTE: This is needed temporarily for protobuf backward compatibility.
+                    // TODO(EXC-1094): Remove this condition once it has been deployed to prod.
+                    Network::Testnet
+                }
+                1 => Network::Testnet,
+                2 => Network::Bitcoin,
+                other => {
+                    return Err(ProxyDecodeError::ValueOutOfRange {
+                        typ: "Network",
+                        err: format!("Expected 0 or 1 (testnet), 2 (mainnet), got {}", other),
+                    })
+                }
+            },
+            utxos_large: value
+                .utxos_large
+                .into_iter()
+                .map(|utxo| {
+                    let outpoint = utxo
+                        .outpoint
+                        .map(|o| {
+                            OutPoint::new(
+                                Txid::from_hash(Hash::from_slice(&o.txid).unwrap()),
+                                o.vout,
+                            )
+                        })
+                        .unwrap();
+
+                    let tx_out = utxo
+                        .txout
+                        .map(|t| TxOut {
+                            value: t.value,
+                            script_pubkey: Script::from(t.script_pubkey),
+                        })
+                        .unwrap();
+
+                    (outpoint, (tx_out, utxo.height))
+                })
+                .collect(),
+        })
+    }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
 
+    use ic_ic00_types::IC_00;
     use ic_test_utilities::types::ids::canister_test_id;
-    use ic_types::ic00::IC_00;
 
     #[test]
     fn test_encode_decode_empty_controllers() {
@@ -1159,13 +1293,10 @@ mod test {
             consumed_cycles_since_replica_started: NominalCycles::from(0),
             stable_memory_size: NumWasmPages::from(0),
             heap_delta_debit: NumBytes::from(0),
+            install_code_debit: NumInstructions::from(0),
         };
 
         let pb_bits = pb_canister_state_bits::CanisterStateBits::from(canister_state_bits);
-
-        // No controllers is encoded with the "no controller" marker.
-        assert_eq!(pb_bits.controller, Some(no_controllers_marker().into()));
-
         let canister_state_bits = CanisterStateBits::try_from(pb_bits).unwrap();
 
         // Controllers are still empty, as expected.
@@ -1198,53 +1329,15 @@ mod test {
             consumed_cycles_since_replica_started: NominalCycles::from(0),
             stable_memory_size: NumWasmPages::from(0),
             heap_delta_debit: NumBytes::from(0),
+            install_code_debit: NumInstructions::from(0),
         };
 
         let pb_bits = pb_canister_state_bits::CanisterStateBits::from(canister_state_bits);
-
-        assert_eq!(pb_bits.controller, Some(IC_00.get().into()));
-
         let canister_state_bits = CanisterStateBits::try_from(pb_bits).unwrap();
 
         let mut expected_controllers = BTreeSet::new();
         expected_controllers.insert(canister_test_id(0).get());
         expected_controllers.insert(IC_00.into());
         assert_eq!(canister_state_bits.controllers, expected_controllers);
-    }
-
-    #[test]
-    fn test_encode_decode_no_controller_marker_as_controllers() {
-        // If the controller is set explicitly to the no_controllers_marker, then
-        // it should still be preserved.
-        let mut controllers = BTreeSet::new();
-        controllers.insert(no_controllers_marker());
-
-        // A canister state with empty controllers.
-        let canister_state_bits = CanisterStateBits {
-            controllers: controllers.clone(),
-            last_full_execution_round: ExecutionRound::from(0),
-            call_context_manager: None,
-            compute_allocation: ComputeAllocation::try_from(0).unwrap(),
-            accumulated_priority: AccumulatedPriority::from(0),
-            execution_state_bits: None,
-            memory_allocation: MemoryAllocation::default(),
-            freeze_threshold: NumSeconds::from(0),
-            cycles_balance: Cycles::from(0),
-            status: CanisterStatus::Stopped,
-            scheduled_as_first: 0,
-            skipped_round_due_to_no_messages: 0,
-            executed: 0,
-            interruped_during_execution: 0,
-            certified_data: vec![],
-            consumed_cycles_since_replica_started: NominalCycles::from(0),
-            stable_memory_size: NumWasmPages::from(0),
-            heap_delta_debit: NumBytes::from(0),
-        };
-
-        let pb_bits = pb_canister_state_bits::CanisterStateBits::from(canister_state_bits);
-
-        let canister_state_bits = CanisterStateBits::try_from(pb_bits).unwrap();
-
-        assert_eq!(canister_state_bits.controllers, controllers)
     }
 }

@@ -1,11 +1,13 @@
 use dfn_candid::candid;
 use ic_base_types::PrincipalId;
 use ic_canister_client::Sender;
+use ic_nervous_system_common_test_keys::{
+    TEST_NEURON_1_OWNER_KEYPAIR, TEST_NEURON_2_OWNER_KEYPAIR,
+};
 use ic_nns_common::{
     registry::encode_or_panic,
     types::{NeuronId, ProposalId},
 };
-use ic_nns_constants::ids::{TEST_NEURON_1_OWNER_KEYPAIR, TEST_NEURON_2_OWNER_KEYPAIR};
 use ic_nns_governance::pb::v1::{ManageNeuronResponse, NnsFunction, ProposalStatus, Vote};
 use ic_nns_test_utils::{
     governance::{get_pending_proposals, submit_external_update_proposal, wait_for_final_state},
@@ -36,7 +38,7 @@ fn test_submit_and_accept_clear_provisional_whitelist_proposal() {
             .with_test_neurons()
             .with_initial_mutations(vec![RegistryAtomicMutateRequest {
                 mutations: vec![insert(
-                    key.as_bytes().to_vec(),
+                    key.as_bytes(),
                     encode_or_panic(&initial_provisional_whitelist),
                 )],
                 preconditions: vec![],

@@ -1,64 +1,74 @@
 //! The pre signature process manager
 
 use crate::consensus::{
-    metrics::{timed_call, EcdsaPreSignerMetrics},
+    metrics::{timed_call, EcdsaPayloadMetrics, EcdsaPreSignerMetrics},
     utils::RoundRobin,
     ConsensusCrypto,
 };
-
-use ic_interfaces::consensus_pool::ConsensusPoolCache;
+use crate::ecdsa::complaints::EcdsaTranscriptLoader;
+use crate::ecdsa::utils::{load_transcripts, transcript_op_summary, EcdsaBlockReaderImpl};
+use ic_interfaces::consensus_pool::{ConsensusBlockCache, ConsensusBlockChain};
 use ic_interfaces::crypto::{ErrorReplication, IDkgProtocol};
 use ic_interfaces::ecdsa::{EcdsaChangeAction, EcdsaChangeSet, EcdsaPool};
 use ic_logger::{debug, warn, ReplicaLogger};
 use ic_metrics::MetricsRegistry;
 use ic_types::artifact::EcdsaMessageId;
 use ic_types::consensus::ecdsa::{
-    EcdsaBlockReader, EcdsaBlockReaderImpl, EcdsaDealing, EcdsaDealingSupport, EcdsaMessage,
+    EcdsaBlockReader, EcdsaDealing, EcdsaDealingSupport, EcdsaMessage, EcdsaSignedDealing,
     EcdsaVerifiedDealing,
 };
-use ic_types::consensus::MultiSignature;
 use ic_types::crypto::canister_threshold_sig::idkg::{
-    IDkgMultiSignedDealing, IDkgTranscript, IDkgTranscriptId, IDkgTranscriptParams,
+    IDkgDealing, IDkgMultiSignedDealing, IDkgTranscript, IDkgTranscriptId, IDkgTranscriptOperation,
+    IDkgTranscriptParams,
 };
-use ic_types::{Height, NodeId};
+use ic_types::malicious_flags::MaliciousFlags;
+use ic_types::signature::MultiSignature;
+use ic_types::{Height, NodeId, SubnetId};
 
+use prometheus::IntCounterVec;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Debug, Formatter};
 use std::sync::Arc;
 
 pub(crate) trait EcdsaPreSigner: Send {
     /// The on_state_change() called from the main ECDSA path.
-    fn on_state_change(&self, ecdsa_pool: &dyn EcdsaPool) -> EcdsaChangeSet;
-
-    /// Returns the transcripts that can be successfully built from
-    /// the current entries in the ECDSA pool
-    fn get_completed_transcripts(&self, ecdsa_pool: &dyn EcdsaPool) -> Vec<IDkgTranscript>;
+    fn on_state_change(
+        &self,
+        ecdsa_pool: &dyn EcdsaPool,
+        transcript_loader: &dyn EcdsaTranscriptLoader,
+    ) -> EcdsaChangeSet;
 }
 
 pub(crate) struct EcdsaPreSignerImpl {
     node_id: NodeId,
-    consensus_cache: Arc<dyn ConsensusPoolCache>,
+    subnet_id: SubnetId,
+    consensus_block_cache: Arc<dyn ConsensusBlockCache>,
     crypto: Arc<dyn ConsensusCrypto>,
     schedule: RoundRobin,
     metrics: EcdsaPreSignerMetrics,
     log: ReplicaLogger,
+    malicious_flags: MaliciousFlags,
 }
 
 impl EcdsaPreSignerImpl {
     pub(crate) fn new(
         node_id: NodeId,
-        consensus_cache: Arc<dyn ConsensusPoolCache>,
+        subnet_id: SubnetId,
+        consensus_block_cache: Arc<dyn ConsensusBlockCache>,
         crypto: Arc<dyn ConsensusCrypto>,
         metrics_registry: MetricsRegistry,
         log: ReplicaLogger,
+        malicious_flags: MaliciousFlags,
     ) -> Self {
         Self {
             node_id,
-            consensus_cache,
+            subnet_id,
+            consensus_block_cache,
             crypto,
             schedule: RoundRobin::default(),
             metrics: EcdsaPreSignerMetrics::new(metrics_registry),
             log,
+            malicious_flags,
         }
     }
 
@@ -68,10 +78,18 @@ impl EcdsaPreSignerImpl {
     fn send_dealings(
         &self,
         ecdsa_pool: &dyn EcdsaPool,
+        transcript_loader: &dyn EcdsaTranscriptLoader,
         block_reader: &dyn EcdsaBlockReader,
     ) -> EcdsaChangeSet {
-        block_reader
-            .requested_transcripts()
+        let requested_transcripts = resolve_transcript_refs(
+            block_reader,
+            "send_dealings",
+            self.metrics.pre_sign_errors.clone(),
+            &self.log,
+        );
+
+        requested_transcripts
+            .iter()
             .filter(|transcript_params| {
                 // Issue a dealing if we are in the dealer list and we haven't
                 //already issued a dealing for this transcript
@@ -82,8 +100,14 @@ impl EcdsaPreSignerImpl {
                         &self.node_id,
                     )
             })
-            .map(|transcript_params| self.crypto_create_dealing(block_reader, transcript_params))
-            .flatten()
+            .flat_map(|transcript_params| {
+                self.crypto_create_dealing(
+                    ecdsa_pool,
+                    transcript_loader,
+                    block_reader,
+                    transcript_params,
+                )
+            })
             .collect()
     }
 
@@ -93,73 +117,77 @@ impl EcdsaPreSignerImpl {
         ecdsa_pool: &dyn EcdsaPool,
         block_reader: &dyn EcdsaBlockReader,
     ) -> EcdsaChangeSet {
+        let requested_transcripts = resolve_transcript_refs(
+            block_reader,
+            "validate_dealings",
+            self.metrics.pre_sign_errors.clone(),
+            &self.log,
+        );
+
         // Pass 1: collection of <TranscriptId, DealerId>
         let mut dealing_keys = BTreeSet::new();
         let mut duplicate_keys = BTreeSet::new();
-        for (_, dealing) in ecdsa_pool.unvalidated().dealings() {
-            let key = (dealing.transcript_id, dealing.dealer_id);
+        for (_, signed_dealing) in ecdsa_pool.unvalidated().signed_dealings() {
+            let dealing = signed_dealing.get();
+            let key = (
+                dealing.idkg_dealing.transcript_id,
+                dealing.idkg_dealing.dealer_id,
+            );
             if !dealing_keys.insert(key) {
                 duplicate_keys.insert(key);
             }
         }
 
         let mut ret = Vec::new();
-        for (id, dealing) in ecdsa_pool.unvalidated().dealings() {
+        for (id, signed_dealing) in ecdsa_pool.unvalidated().signed_dealings() {
+            let dealing = signed_dealing.get();
             // Remove the duplicate entries
-            let key = (dealing.transcript_id, dealing.dealer_id);
+            let key = (
+                dealing.idkg_dealing.transcript_id,
+                dealing.idkg_dealing.dealer_id,
+            );
             if duplicate_keys.contains(&key) {
                 self.metrics
                     .pre_sign_errors_inc("duplicate_dealing_in_batch");
                 ret.push(EcdsaChangeAction::HandleInvalid(
                     id,
-                    format!(
-                        "Duplicate dealing in unvalidated batch: dealer = {:?}, height = {:?},
-                          transcript_id = {:?}",
-                        dealing.dealer_id, dealing.requested_height, dealing.transcript_id
-                    ),
+                    format!("Duplicate dealing in unvalidated batch: {}", signed_dealing),
                 ));
                 continue;
             }
 
             match Action::action(
                 block_reader,
+                &requested_transcripts,
                 dealing.requested_height,
-                &dealing.transcript_id,
+                &dealing.idkg_dealing.transcript_id,
             ) {
                 Action::Process(transcript_params) => {
                     if transcript_params
                         .dealers()
-                        .position(dealing.dealer_id)
+                        .position(dealing.idkg_dealing.dealer_id)
                         .is_none()
                     {
                         // The node is not in the dealer list for this transcript
                         self.metrics.pre_sign_errors_inc("unexpected_dealing");
                         ret.push(EcdsaChangeAction::HandleInvalid(
                             id,
-                            format!(
-                                "Dealing from unexpected node: dealer = {:?}, height = {:?},
-                                  transcript_id = {:?}",
-                                dealing.dealer_id, dealing.requested_height, dealing.transcript_id
-                            ),
+                            format!("Dealing from unexpected node: {}", signed_dealing),
                         ))
                     } else if self.has_dealer_issued_dealing(
                         ecdsa_pool,
-                        &dealing.transcript_id,
-                        &dealing.dealer_id,
+                        &dealing.idkg_dealing.transcript_id,
+                        &dealing.idkg_dealing.dealer_id,
                     ) {
                         // The node already sent a valid dealing for this transcript
                         self.metrics.pre_sign_errors_inc("duplicate_dealing");
                         ret.push(EcdsaChangeAction::HandleInvalid(
                             id,
-                            format!(
-                                "Duplicate dealing: dealer = {:?}, height = {:?},
-                                  transcript_id = {:?}",
-                                dealing.dealer_id, dealing.requested_height, dealing.transcript_id
-                            ),
+                            format!("Duplicate dealing: {}", signed_dealing),
                         ))
                     } else {
                         let mut changes =
-                            self.crypto_verify_dealing(&id, transcript_params, dealing);
+                            self.crypto_verify_dealing(&id, transcript_params, &signed_dealing);
                         ret.append(&mut changes);
                     }
                 }
@@ -177,49 +205,70 @@ impl EcdsaPreSignerImpl {
         ecdsa_pool: &dyn EcdsaPool,
         block_reader: &dyn EcdsaBlockReader,
     ) -> EcdsaChangeSet {
+        let requested_transcripts = resolve_transcript_refs(
+            block_reader,
+            "send_dealing_support",
+            self.metrics.pre_sign_errors.clone(),
+            &self.log,
+        );
+
         // TranscriptId -> TranscriptParams
         let mut trancript_param_map = BTreeMap::new();
-        for transcript_params in block_reader.requested_transcripts() {
+        for transcript_params in &requested_transcripts {
             trancript_param_map.insert(transcript_params.transcript_id(), transcript_params);
+        }
+
+        let mut xnet_reshare_transcripts = BTreeSet::new();
+        for transcript_params_ref in block_reader.xnet_reshare_transcripts() {
+            xnet_reshare_transcripts.insert(transcript_params_ref.transcript_id);
         }
 
         ecdsa_pool
             .validated()
-            .dealings()
-            .filter(|(_, dealing)| {
+            .signed_dealings()
+            .filter(|(_, signed_dealing)| {
+                let dealing = signed_dealing.get();
                 !self.has_node_issued_dealing_support(
                     ecdsa_pool,
-                    &dealing.transcript_id,
-                    &dealing.dealer_id,
+                    &dealing.idkg_dealing.transcript_id,
+                    &dealing.idkg_dealing.dealer_id,
                     &self.node_id,
                 )
             })
-            .filter_map(|(id, dealing)| {
+            .filter_map(|(id, signed_dealing)| {
+                let dealing = signed_dealing.get();
                 // Look up the transcript params for the dealing, and check if we
                 // are a receiver for this dealing
-                if let Some(transcript_params) = trancript_param_map.get(&dealing.transcript_id) {
+                if let Some(transcript_params) =
+                    trancript_param_map.get(&dealing.idkg_dealing.transcript_id)
+                {
                     transcript_params
                         .receivers()
                         .position(self.node_id)
-                        .map(|_| (id, transcript_params, dealing))
+                        .map(|_| (id, transcript_params, signed_dealing))
                 } else {
                     self.metrics
                         .pre_sign_errors_inc("create_support_missing_transcript_params");
                     warn!(
                         self.log,
-                        "Dealing support creation: transcript_param not found: dealer = {:?},
-                          height = {:?}, transcript_id = {:?}",
-                        dealing.dealer_id,
-                        dealing.requested_height,
-                        dealing.transcript_id,
+                        "Dealing support creation: transcript_param not found: {}", signed_dealing,
                     );
                     None
                 }
             })
-            .map(|(id, transcript_params, dealing)| {
-                self.crypto_create_dealing_support(&id, transcript_params, dealing)
+            .flat_map(|(id, transcript_params, signed_dealing)| {
+                let dealing = signed_dealing.get();
+                if xnet_reshare_transcripts.contains(&dealing.idkg_dealing.transcript_id) {
+                    self.metrics
+                        .pre_sign_errors_inc("create_support_for_xnet_transcript");
+                    warn!(
+                        self.log,
+                        "Dealing support creation: unexpected support for xnet dealing: {}",
+                        signed_dealing,
+                    );
+                }
+                self.crypto_create_dealing_support(&id, transcript_params, signed_dealing.get())
             })
-            .flatten()
             .collect()
     }
 
@@ -229,11 +278,27 @@ impl EcdsaPreSignerImpl {
         ecdsa_pool: &dyn EcdsaPool,
         block_reader: &dyn EcdsaBlockReader,
     ) -> EcdsaChangeSet {
+        let requested_transcripts = resolve_transcript_refs(
+            block_reader,
+            "validate_dealing_support",
+            self.metrics.pre_sign_errors.clone(),
+            &self.log,
+        );
+
         // Get the set of valid dealings <TranscriptId, DealerId>
         let mut valid_dealings = BTreeSet::new();
-        for (_, dealing) in ecdsa_pool.validated().dealings() {
-            let dealing_key = (dealing.transcript_id, dealing.dealer_id);
+        for (_, signed_dealing) in ecdsa_pool.validated().signed_dealings() {
+            let dealing = signed_dealing.get();
+            let dealing_key = (
+                dealing.idkg_dealing.transcript_id,
+                dealing.idkg_dealing.dealer_id,
+            );
             valid_dealings.insert(dealing_key);
+        }
+
+        let mut xnet_reshare_transcripts = BTreeSet::new();
+        for transcript_params_ref in block_reader.xnet_reshare_transcripts() {
+            xnet_reshare_transcripts.insert(transcript_params_ref.transcript_id);
         }
 
         // Pass 1: collection of <TranscriptId, DealerId, SignerId>
@@ -242,8 +307,8 @@ impl EcdsaPreSignerImpl {
         for (_, support) in ecdsa_pool.unvalidated().dealing_support() {
             let dealing = &support.content;
             let support_key = (
-                dealing.transcript_id,
-                dealing.dealer_id,
+                dealing.idkg_dealing.transcript_id,
+                dealing.idkg_dealing.dealer_id,
                 support.signature.signer,
             );
             if !supports.insert(support_key) {
@@ -254,10 +319,13 @@ impl EcdsaPreSignerImpl {
         let mut ret = Vec::new();
         for (id, support) in ecdsa_pool.unvalidated().dealing_support() {
             let dealing = &support.content;
-            let dealing_key = (dealing.transcript_id, dealing.dealer_id);
+            let dealing_key = (
+                dealing.idkg_dealing.transcript_id,
+                dealing.idkg_dealing.dealer_id,
+            );
             let support_key = (
-                dealing.transcript_id,
-                dealing.dealer_id,
+                dealing.idkg_dealing.transcript_id,
+                dealing.idkg_dealing.dealer_id,
                 support.signature.signer,
             );
 
@@ -267,22 +335,26 @@ impl EcdsaPreSignerImpl {
                     .pre_sign_errors_inc("duplicate_support_in_batch");
                 ret.push(EcdsaChangeAction::HandleInvalid(
                     id,
-                    format!(
-                        "Duplicate support in unvalidated batch: dealer = {:?}, height = {:?},
-                          transcript_id = {:?}, signer = {:?}",
-                        dealing.dealer_id,
-                        dealing.requested_height,
-                        dealing.transcript_id,
-                        support.signature.signer,
-                    ),
+                    format!("Duplicate support in unvalidated batch: {}", support),
+                ));
+                continue;
+            }
+
+            // Drop shares for xnet reshare transcripts
+            if xnet_reshare_transcripts.contains(&dealing.idkg_dealing.transcript_id) {
+                self.metrics.pre_sign_errors_inc("xnet_reshare_support");
+                ret.push(EcdsaChangeAction::HandleInvalid(
+                    id,
+                    format!("Support for xnet reshare transcript: {}", support),
                 ));
                 continue;
             }
 
             match Action::action(
                 block_reader,
+                &requested_transcripts,
                 dealing.requested_height,
-                &dealing.transcript_id,
+                &dealing.idkg_dealing.transcript_id,
             ) {
                 Action::Process(transcript_params) => {
                     if transcript_params
@@ -295,37 +367,26 @@ impl EcdsaPreSignerImpl {
                         self.metrics.pre_sign_errors_inc("unexpected_support");
                         ret.push(EcdsaChangeAction::HandleInvalid(
                             id,
-                            format!(
-                                "Support from unexpected node: dealer = {:?}, height = {:?},
-                                  transcript_id = {:?}, signer = support.signature.signer",
-                                dealing.dealer_id, dealing.requested_height, dealing.transcript_id
-                            ),
+                            format!("Support from unexpected node: {}", support),
                         ))
                     } else if !valid_dealings.contains(&dealing_key) {
                         // Support for a dealing we don't have yet, defer it
                         continue;
                     } else if self.has_node_issued_dealing_support(
                         ecdsa_pool,
-                        &dealing.transcript_id,
-                        &dealing.dealer_id,
+                        &dealing.idkg_dealing.transcript_id,
+                        &dealing.idkg_dealing.dealer_id,
                         &support.signature.signer,
                     ) {
                         // The node already sent a valid support for this dealing
                         self.metrics.pre_sign_errors_inc("duplicate_support");
                         ret.push(EcdsaChangeAction::HandleInvalid(
                             id,
-                            format!(
-                                "Duplicate support: dealer = {:?}, height = {:?},
-                                  transcript_id = {:?}, signer = {:?}",
-                                dealing.dealer_id,
-                                dealing.requested_height,
-                                dealing.transcript_id,
-                                support.signature.signer
-                            ),
+                            format!("Duplicate support: {}", support),
                         ))
                     } else {
                         let mut changes =
-                            self.crypto_verify_dealing_support(&id, transcript_params, support);
+                            self.crypto_verify_dealing_support(&id, transcript_params, &support);
                         ret.append(&mut changes);
                     }
                 }
@@ -343,19 +404,34 @@ impl EcdsaPreSignerImpl {
         ecdsa_pool: &dyn EcdsaPool,
         block_reader: &dyn EcdsaBlockReader,
     ) -> EcdsaChangeSet {
+        let requested_transcripts = resolve_transcript_refs(
+            block_reader,
+            "purge_artifacts",
+            self.metrics.pre_sign_errors.clone(),
+            &self.log,
+        );
+
         let mut in_progress = BTreeSet::new();
-        for transcript_params in block_reader.requested_transcripts() {
+        for transcript_params in requested_transcripts {
             in_progress.insert(transcript_params.transcript_id());
         }
 
         let mut ret = Vec::new();
-        let current_height = block_reader.height();
+        let current_height = block_reader.tip_height();
+        let xnet_reshare_in_progress = block_reader.xnet_reshare_in_progress();
 
         // Unvalidated dealings.
         let mut action = ecdsa_pool
             .unvalidated()
-            .dealings()
-            .filter(|(_, dealing)| self.should_purge(dealing, current_height, &in_progress))
+            .signed_dealings()
+            .filter(|(_, signed_dealing)| {
+                self.should_purge(
+                    signed_dealing.get(),
+                    current_height,
+                    &in_progress,
+                    xnet_reshare_in_progress,
+                )
+            })
             .map(|(id, _)| EcdsaChangeAction::RemoveUnvalidated(id))
             .collect();
         ret.append(&mut action);
@@ -363,8 +439,15 @@ impl EcdsaPreSignerImpl {
         // Validated dealings.
         let mut action = ecdsa_pool
             .validated()
-            .dealings()
-            .filter(|(_, dealing)| self.should_purge(dealing, current_height, &in_progress))
+            .signed_dealings()
+            .filter(|(_, signed_dealing)| {
+                self.should_purge(
+                    signed_dealing.get(),
+                    current_height,
+                    &in_progress,
+                    xnet_reshare_in_progress,
+                )
+            })
             .map(|(id, _)| EcdsaChangeAction::RemoveValidated(id))
             .collect();
         ret.append(&mut action);
@@ -374,7 +457,12 @@ impl EcdsaPreSignerImpl {
             .unvalidated()
             .dealing_support()
             .filter(|(_, support)| {
-                self.should_purge(&support.content, current_height, &in_progress)
+                self.should_purge(
+                    &support.content,
+                    current_height,
+                    &in_progress,
+                    xnet_reshare_in_progress,
+                )
             })
             .map(|(id, _)| EcdsaChangeAction::RemoveUnvalidated(id))
             .collect();
@@ -385,7 +473,12 @@ impl EcdsaPreSignerImpl {
             .validated()
             .dealing_support()
             .filter(|(_, support)| {
-                self.should_purge(&support.content, current_height, &in_progress)
+                self.should_purge(
+                    &support.content,
+                    current_height,
+                    &in_progress,
+                    xnet_reshare_in_progress,
+                )
             })
             .map(|(id, _)| EcdsaChangeAction::RemoveValidated(id))
             .collect();
@@ -397,31 +490,79 @@ impl EcdsaPreSignerImpl {
     /// Helper to create dealing
     fn crypto_create_dealing(
         &self,
+        ecdsa_pool: &dyn EcdsaPool,
+        transcript_loader: &dyn EcdsaTranscriptLoader,
         block_reader: &dyn EcdsaBlockReader,
         transcript_params: &IDkgTranscriptParams,
     ) -> EcdsaChangeSet {
-        IDkgProtocol::create_dealing(&*self.crypto, transcript_params).map_or_else(
-            |error| {
+        if let Some(changes) = self.load_dependencies(
+            ecdsa_pool,
+            transcript_loader,
+            transcript_params,
+            block_reader.tip_height(),
+        ) {
+            return changes;
+        }
+
+        // Create the dealing
+        let idkg_dealing = match IDkgProtocol::create_dealing(&*self.crypto, transcript_params) {
+            Ok(idkg_dealing) => {
+                self.metrics.pre_sign_metrics_inc("dealing_created");
+                idkg_dealing
+            }
+            Err(err) => {
                 // TODO: currently, transcript creation will be retried the next time, which
                 // will most likely fail again. This should be signaled up so that the bad
                 // transcript params can be acted on
-                warn!(self.log, "Failed to create dealing: {:?}", error);
+                warn!(
+                    self.log,
+                    "Failed to create dealing: transcript_id = {:?}, type = {:?}, error = {:?}",
+                    transcript_params.transcript_id(),
+                    transcript_op_summary(transcript_params.operation_type()),
+                    err
+                );
                 self.metrics.pre_sign_errors_inc("create_dealing");
-                Default::default()
-            },
-            |dealing| {
-                let dealing = EcdsaDealing {
-                    requested_height: block_reader.height(),
-                    transcript_id: transcript_params.transcript_id(),
-                    dealer_id: self.node_id,
-                    dealing,
+                return Default::default();
+            }
+        };
+
+        // Corrupt the dealing if malicious testing is enabled
+        #[cfg(feature = "malicious_code")]
+        let idkg_dealing = self.crypto_corrupt_dealing(idkg_dealing, transcript_params);
+
+        let ecdsa_dealing = EcdsaDealing {
+            requested_height: block_reader.tip_height(),
+            idkg_dealing,
+        };
+
+        // Sign the dealing
+        match self.crypto.sign(
+            &ecdsa_dealing,
+            self.node_id,
+            transcript_params.registry_version(),
+        ) {
+            Ok(signature) => {
+                let signed_dealing = EcdsaSignedDealing {
+                    signature,
+                    content: ecdsa_dealing,
                 };
-                self.metrics.pre_sign_metrics_inc("dealings_sent");
+                self.metrics.pre_sign_metrics_inc("dealing_sent");
                 vec![EcdsaChangeAction::AddToValidated(
-                    EcdsaMessage::EcdsaDealing(dealing),
+                    EcdsaMessage::EcdsaSignedDealing(signed_dealing),
                 )]
-            },
-        )
+            }
+            Err(err) => {
+                warn!(
+                    self.log,
+                    "Failed to sign dealing: transcript_id = {:?}, type = {:?}, error = {:?}",
+                    transcript_params.transcript_id(),
+                    transcript_op_summary(transcript_params.operation_type()),
+                    err
+                );
+                self.metrics.pre_sign_errors_inc("sign_dealing");
+                Default::default()
+            }
+        }
     }
 
     /// Helper to verify a dealing received for a transcript we are building
@@ -429,44 +570,116 @@ impl EcdsaPreSignerImpl {
         &self,
         id: &EcdsaMessageId,
         transcript_params: &IDkgTranscriptParams,
-        dealing: &EcdsaDealing,
+        signed_dealing: &EcdsaSignedDealing,
     ) -> EcdsaChangeSet {
-        IDkgProtocol::verify_dealing_public(&*self.crypto, transcript_params, &dealing.dealing)
-            .map_or_else(
-                |error| {
-                    if error.is_replicated() {
-                        self.metrics.pre_sign_errors_inc("verify_dealing_permanent");
-                        vec![EcdsaChangeAction::HandleInvalid(
-                            id.clone(),
-                            format!(
-                                "Dealing validation(permanent error): dealer = {:?},
-                              height = {:?}, transcript_id = {:?}, error = {:?}",
-                                dealing.dealer_id,
-                                dealing.requested_height,
-                                dealing.transcript_id,
-                                error
-                            ),
-                        )]
-                    } else {
-                        // Defer in case of transient errors
-                        debug!(
-                            self.log,
-                            "Dealing validation(transient error): dealer = {:?},
-                          height = {:?}, transcript_id = {:?}, error = {:?}",
-                            dealing.dealer_id,
-                            dealing.requested_height,
-                            dealing.transcript_id,
-                            error
-                        );
-                        self.metrics.pre_sign_errors_inc("verify_dealing_transient");
-                        Default::default()
-                    }
-                },
-                |()| {
-                    self.metrics.pre_sign_metrics_inc("dealings_received");
-                    vec![EcdsaChangeAction::MoveToValidated(id.clone())]
-                },
-            )
+        let dealing = signed_dealing.get();
+
+        // Verify the dealer signature
+        if let Err(error) = self
+            .crypto
+            .verify(signed_dealing, transcript_params.registry_version())
+        {
+            if error.is_replicated() {
+                self.metrics
+                    .pre_sign_errors_inc("verify_dealing_signature_permanent");
+                return vec![EcdsaChangeAction::HandleInvalid(
+                    id.clone(),
+                    format!(
+                        "Dealing signature validation(permanent error): {}, error = {:?}",
+                        signed_dealing, error
+                    ),
+                )];
+            } else {
+                // Defer in case of transient errors
+                debug!(
+                    self.log,
+                    "Dealing signature validation(transient error): {}, error = {:?}",
+                    signed_dealing,
+                    error
+                );
+                self.metrics
+                    .pre_sign_errors_inc("verify_dealing_signature_transient");
+                return Default::default();
+            }
+        }
+
+        IDkgProtocol::verify_dealing_public(
+            &*self.crypto,
+            transcript_params,
+            dealing.idkg_dealing.dealer_id,
+            &dealing.idkg_dealing,
+        )
+        .map_or_else(
+            |error| {
+                if error.is_replicated() {
+                    self.metrics.pre_sign_errors_inc("verify_dealing_permanent");
+                    vec![EcdsaChangeAction::HandleInvalid(
+                        id.clone(),
+                        format!(
+                            "Dealing validation(permanent error): {}, error = {:?}",
+                            signed_dealing, error
+                        ),
+                    )]
+                } else {
+                    // Defer in case of transient errors
+                    debug!(
+                        self.log,
+                        "Dealing validation(transient error): {}, error = {:?}",
+                        signed_dealing,
+                        error
+                    );
+                    self.metrics.pre_sign_errors_inc("verify_dealing_transient");
+                    Default::default()
+                }
+            },
+            |()| {
+                self.metrics.pre_sign_metrics_inc("dealing_received");
+                vec![EcdsaChangeAction::MoveToValidated(id.clone())]
+            },
+        )
+    }
+
+    /// Helper to corrupt the crypto dealing for malicious testing
+    #[cfg(feature = "malicious_code")]
+    fn crypto_corrupt_dealing(
+        &self,
+        idkg_dealing: IDkgDealing,
+        transcript_params: &IDkgTranscriptParams,
+    ) -> IDkgDealing {
+        if !self.malicious_flags.maliciously_corrupt_ecdsa_dealings {
+            return idkg_dealing;
+        }
+
+        let mut rng = rand::thread_rng();
+        let mut exclude_set = BTreeSet::new();
+        exclude_set.insert(self.node_id);
+        match ic_crypto_test_utils_canister_threshold_sigs::corrupt_idkg_dealing(
+            &idkg_dealing,
+            transcript_params,
+            &exclude_set,
+            &mut rng,
+        ) {
+            Ok(dealing) => {
+                warn!(
+                     every_n_seconds => 2,
+                     self.log,
+                    "Corrupted dealing: transcript_id = {:?}", transcript_params.transcript_id()
+                );
+                self.metrics.pre_sign_metrics_inc("dealing_corrupted");
+                dealing
+            }
+            Err(err) => {
+                warn!(
+                    self.log,
+                    "Failed to corrupt dealing: transcript_id = {:?}, type = {:?}, error = {:?}",
+                    transcript_params.transcript_id(),
+                    transcript_op_summary(transcript_params.operation_type()),
+                    err
+                );
+                self.metrics.pre_sign_errors_inc("corrupt_dealing");
+                idkg_dealing
+            }
+        }
     }
 
     /// Helper to issue a support share for a dealing. Assumes we are a receiver
@@ -477,18 +690,26 @@ impl EcdsaPreSignerImpl {
         transcript_params: &IDkgTranscriptParams,
         dealing: &EcdsaDealing,
     ) -> EcdsaChangeSet {
-        if let Err(error) =
-            IDkgProtocol::verify_dealing_private(&*self.crypto, transcript_params, &dealing.dealing)
-        {
+        if let Err(error) = IDkgProtocol::verify_dealing_private(
+            &*self.crypto,
+            transcript_params,
+            dealing.idkg_dealing.dealer_id,
+            &dealing.idkg_dealing,
+        ) {
             if error.is_replicated() {
                 self.metrics
                     .pre_sign_errors_inc("verify_dealing_private_permanent");
+                warn!(
+                    self.log,
+                    "Dealing private verification(permanent error): {}, error = {:?}",
+                    dealing,
+                    error
+                );
                 return vec![EcdsaChangeAction::HandleInvalid(
                     id.clone(),
                     format!(
-                        "Dealing private verification(permanent error): dealer = {:?},
-                          height = {:?}, transcript_id = {:?}, error = {:?}",
-                        dealing.dealer_id, dealing.requested_height, dealing.transcript_id, error
+                        "Dealing private verification(permanent error): {}, error = {:?}",
+                        dealing, error
                     ),
                 )];
             } else {
@@ -496,11 +717,8 @@ impl EcdsaPreSignerImpl {
                     .pre_sign_errors_inc("verify_dealing_private_transient");
                 debug!(
                     self.log,
-                    "Dealing private verification(transient error): dealer = {:?},
-                          height = {:?}, transcript_id = {:?}, error = {:?}",
-                    dealing.dealer_id,
-                    dealing.requested_height,
-                    dealing.transcript_id,
+                    "Dealing private verification(transient error): {}, error = {:?}",
+                    dealing,
                     error
                 );
                 return Default::default();
@@ -514,12 +732,7 @@ impl EcdsaPreSignerImpl {
                 |error| {
                     debug!(
                         self.log,
-                        "Dealing multi sign failed: dealer = {:?},
-                          height = {:?}, transcript_id = {:?}, error = {:?}",
-                        dealing.dealer_id,
-                        dealing.requested_height,
-                        dealing.transcript_id,
-                        error
+                        "Dealing multi sign failed: {}, error = {:?}", dealing, error
                     );
                     self.metrics
                         .pre_sign_errors_inc("dealing_support_multi_sign");
@@ -530,6 +743,7 @@ impl EcdsaPreSignerImpl {
                         content: dealing.clone(),
                         signature: multi_sig_share,
                     };
+                    self.metrics.pre_sign_metrics_inc("dealing_support_sent");
                     vec![EcdsaChangeAction::AddToValidated(
                         EcdsaMessage::EcdsaDealingSupport(dealing_support),
                     )]
@@ -544,7 +758,6 @@ impl EcdsaPreSignerImpl {
         transcript_params: &IDkgTranscriptParams,
         support: &EcdsaDealingSupport,
     ) -> EcdsaChangeSet {
-        let dealing = &support.content;
         self.crypto
             .verify(support, transcript_params.registry_version())
             .map_or_else(
@@ -553,62 +766,40 @@ impl EcdsaPreSignerImpl {
                     vec![EcdsaChangeAction::HandleInvalid(
                         id.clone(),
                         format!(
-                            "Support validation failed: dealer = {:?},
-                          height = {:?}, transcript_id = {:?}, signer = {:?}, error = {:?}",
-                            dealing.dealer_id,
-                            dealing.requested_height,
-                            dealing.transcript_id,
-                            support.signature.signer,
-                            error
+                            "Support validation failed: {}, error = {:?}",
+                            support, error
                         ),
                     )]
                 },
-                |_| vec![EcdsaChangeAction::MoveToValidated(id.clone())],
-            )
-    }
-
-    /// Helper to combine the multi sig shares for a dealing
-    fn crypto_aggregate_dealing_support(
-        &self,
-        transcript_params: &IDkgTranscriptParams,
-        support_shares: &[&EcdsaDealingSupport],
-    ) -> Option<MultiSignature<EcdsaDealing>> {
-        // Check if we have enough shares for aggregation
-        if support_shares.len() < (transcript_params.verification_threshold().get() as usize) {
-            return None;
-        }
-
-        let mut signatures = Vec::new();
-        for support_share in support_shares {
-            signatures.push(&support_share.signature);
-        }
-
-        self.crypto
-            .aggregate(signatures, transcript_params.registry_version())
-            .map_or_else(
                 |_| {
                     self.metrics
-                        .pre_sign_errors_inc("aggregate_dealing_support");
-                    None
+                        .pre_sign_metrics_inc("dealing_support_received");
+                    vec![EcdsaChangeAction::MoveToValidated(id.clone())]
                 },
-                Some,
             )
     }
 
-    /// Helper to create the transcript from the verified dealings
-    fn crypto_create_transcript(
+    /// Helper to load the transcripts the given transcript is dependent on.
+    /// Returns true if the dependencies were loaded successfully.
+    fn load_dependencies(
         &self,
+        ecdsa_pool: &dyn EcdsaPool,
+        transcript_loader: &dyn EcdsaTranscriptLoader,
         transcript_params: &IDkgTranscriptParams,
-        verified_dealings: &BTreeMap<NodeId, IDkgMultiSignedDealing>,
-    ) -> Option<IDkgTranscript> {
-        IDkgProtocol::create_transcript(&*self.crypto, transcript_params, verified_dealings)
-            .map_or_else(
-                |_| {
-                    self.metrics.pre_sign_errors_inc("create_transcript");
-                    None
-                },
-                Some,
-            )
+        height: Height,
+    ) -> Option<EcdsaChangeSet> {
+        match &transcript_params.operation_type() {
+            IDkgTranscriptOperation::Random => None,
+            IDkgTranscriptOperation::ReshareOfMasked(t) => {
+                load_transcripts(ecdsa_pool, transcript_loader, &[t], height)
+            }
+            IDkgTranscriptOperation::ReshareOfUnmasked(t) => {
+                load_transcripts(ecdsa_pool, transcript_loader, &[t], height)
+            }
+            IDkgTranscriptOperation::UnmaskedTimesMasked(t1, t2) => {
+                load_transcripts(ecdsa_pool, transcript_loader, &[t1, t2], height)
+            }
+        }
     }
 
     /// Checks if the we have a valid dealing from the dealer for the given
@@ -619,9 +810,14 @@ impl EcdsaPreSignerImpl {
         transcript_id: &IDkgTranscriptId,
         dealer_id: &NodeId,
     ) -> bool {
-        ecdsa_pool.validated().dealings().any(|(_, dealing)| {
-            dealing.dealer_id == *dealer_id && dealing.transcript_id == *transcript_id
-        })
+        ecdsa_pool
+            .validated()
+            .signed_dealings()
+            .any(|(_, signed_dealing)| {
+                let dealing = signed_dealing.get();
+                dealing.idkg_dealing.dealer_id == *dealer_id
+                    && dealing.idkg_dealing.transcript_id == *transcript_id
+            })
     }
 
     /// Checks if the we have a valid dealing support from the node for the
@@ -637,8 +833,8 @@ impl EcdsaPreSignerImpl {
             .validated()
             .dealing_support()
             .any(|(_, support)| {
-                support.content.dealer_id == *dealer_id
-                    && support.content.transcript_id == *transcript_id
+                support.content.idkg_dealing.dealer_id == *dealer_id
+                    && support.content.idkg_dealing.transcript_id == *transcript_id
                     && support.signature.signer == *node_id
             })
     }
@@ -649,20 +845,34 @@ impl EcdsaPreSignerImpl {
         dealing: &EcdsaDealing,
         current_height: Height,
         in_progress: &BTreeSet<IDkgTranscriptId>,
+        xnet_reshare_in_progress: bool,
     ) -> bool {
-        dealing.requested_height <= current_height && !in_progress.contains(&dealing.transcript_id)
+        // It is possible the ECDSA component runs and tries to purge the initial
+        // dealings before the finalized tip has the next_key_transcript_creation
+        // set up. Avoid this by keeping the initial dealings until the initial
+        // resharing completes.
+        if *dealing.idkg_dealing.transcript_id.source_subnet() != self.subnet_id {
+            return !xnet_reshare_in_progress;
+        }
+
+        dealing.requested_height <= current_height
+            && !in_progress.contains(&dealing.idkg_dealing.transcript_id)
     }
 }
 
 impl EcdsaPreSigner for EcdsaPreSignerImpl {
-    fn on_state_change(&self, ecdsa_pool: &dyn EcdsaPool) -> EcdsaChangeSet {
-        let block_reader = EcdsaBlockReaderImpl::new(self.consensus_cache.finalized_block());
+    fn on_state_change(
+        &self,
+        ecdsa_pool: &dyn EcdsaPool,
+        transcript_loader: &dyn EcdsaTranscriptLoader,
+    ) -> EcdsaChangeSet {
+        let block_reader = EcdsaBlockReaderImpl::new(self.consensus_block_cache.finalized_chain());
         let metrics = self.metrics.clone();
 
         let send_dealings = || {
             timed_call(
                 "send_dealings",
-                || self.send_dealings(ecdsa_pool, &block_reader),
+                || self.send_dealings(ecdsa_pool, transcript_loader, &block_reader),
                 &metrics.on_state_change_duration,
             )
         };
@@ -704,61 +914,260 @@ impl EcdsaPreSigner for EcdsaPreSignerImpl {
         ];
         self.schedule.call_next(&calls)
     }
+}
 
-    fn get_completed_transcripts(&self, ecdsa_pool: &dyn EcdsaPool) -> Vec<IDkgTranscript> {
-        // TranscriptId -> TranscriptParams
-        let block_reader = EcdsaBlockReaderImpl::new(self.consensus_cache.finalized_block());
-        let mut trancript_state_map = BTreeMap::new();
-        for transcript_params in block_reader.requested_transcripts() {
-            trancript_state_map.insert(
-                transcript_params.transcript_id(),
-                TranscriptState::new(transcript_params),
-            );
+pub(crate) trait EcdsaTranscriptBuilder: Send {
+    /// Returns the specified transcript if it can be successfully
+    /// built from the current entries in the ECDSA pool
+    fn get_completed_transcript(
+        &self,
+        transcript_id: IDkgTranscriptId,
+        ecdsa_pool: &dyn EcdsaPool,
+    ) -> Option<IDkgTranscript>;
+
+    /// Returns the validated dealings for the given transcript Id from
+    /// the ECDSA pool
+    fn get_validated_dealings(
+        &self,
+        transcript_id: IDkgTranscriptId,
+        ecdsa_pool: &dyn EcdsaPool,
+    ) -> BTreeMap<NodeId, IDkgDealing>;
+}
+
+pub(crate) struct EcdsaTranscriptBuilderImpl<'a> {
+    requested_transcripts: Vec<IDkgTranscriptParams>,
+    crypto: &'a dyn ConsensusCrypto,
+    metrics: &'a EcdsaPayloadMetrics,
+    log: ReplicaLogger,
+}
+
+impl<'a> EcdsaTranscriptBuilderImpl<'a> {
+    pub(crate) fn new(
+        chain: Arc<dyn ConsensusBlockChain>,
+        crypto: &'a dyn ConsensusCrypto,
+        metrics: &'a EcdsaPayloadMetrics,
+        log: ReplicaLogger,
+    ) -> Self {
+        let block_reader = EcdsaBlockReaderImpl::new(chain);
+        let requested_transcripts = resolve_transcript_refs(
+            &block_reader,
+            "transcript_builder",
+            metrics.payload_errors.clone(),
+            &log,
+        );
+
+        Self {
+            requested_transcripts,
+            crypto,
+            metrics,
+            log,
         }
+    }
+
+    /// Build the specified transcript from the pool.
+    fn build_transcript(
+        &self,
+        transcript_id: IDkgTranscriptId,
+        ecdsa_pool: &dyn EcdsaPool,
+    ) -> Option<IDkgTranscript> {
+        // Look up the transcript params
+        let transcript_params = self
+            .requested_transcripts
+            .iter()
+            .find(|transcript_params| transcript_params.transcript_id() == transcript_id);
+        let mut transcript_state = match transcript_params {
+            Some(params) => TranscriptState::new(params),
+            None => {
+                self.metrics
+                    .transcript_builder_errors_inc("missing_transcript_params");
+                return None;
+            }
+        };
 
         // Step 1: Build the verified dealings from the support shares
-        for (_, dealing) in ecdsa_pool.validated().dealings() {
-            let transcript_state = match trancript_state_map.get_mut(&dealing.transcript_id) {
-                Some(state) => state,
-                None => continue,
-            };
-
-            // Collect the shares for this dealing and aggregate the shares
-            // TODO: do preprocessing to avoid repeated walking of the
-            // support pool
-            let support_shares: Vec<&EcdsaDealingSupport> = ecdsa_pool
-                .validated()
-                .dealing_support()
-                .filter_map(|(_, support)| {
-                    if support.content.transcript_id == dealing.transcript_id
-                        && support.content.dealer_id == dealing.dealer_id
-                    {
-                        Some(support)
-                    } else {
-                        None
+        timed_call(
+            "aggregate_dealing_support",
+            || {
+                for (_, signed_dealing) in ecdsa_pool.validated().signed_dealings() {
+                    let dealing = signed_dealing.get();
+                    if dealing.idkg_dealing.transcript_id != transcript_id {
+                        continue;
                     }
-                })
-                .collect();
 
-            if let Some(multi_sig) = self.crypto_aggregate_dealing_support(
-                transcript_state.transcript_params,
-                &support_shares,
-            ) {
-                transcript_state.add_completed_dealing(dealing, multi_sig);
-            }
+                    // Collect the shares for this dealing and aggregate the shares
+                    let support_shares: Vec<EcdsaDealingSupport> = ecdsa_pool
+                        .validated()
+                        .dealing_support()
+                        .filter_map(|(_, support)| {
+                            if support.content.idkg_dealing.transcript_id
+                                == dealing.idkg_dealing.transcript_id
+                                && support.content.idkg_dealing.dealer_id
+                                    == dealing.idkg_dealing.dealer_id
+                            {
+                                Some(support)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+
+                    // Debug for now
+                    let mut content_hash = BTreeSet::new();
+                    for share in &support_shares {
+                        content_hash.insert(ic_crypto::crypto_hash(&share.content));
+                    }
+                    if content_hash.len() > 1 {
+                        warn!(
+                            self.log,
+                            "Unexpected multi share content: support_shares = {}, content_hash = {}",
+                            support_shares.len(),
+                            content_hash.len()
+                        );
+                        self.metrics.payload_errors_inc("invalid_content_hash");
+                    }
+
+                    if let Some(multi_sig) = self.crypto_aggregate_dealing_support(
+                        transcript_state.transcript_params,
+                        &support_shares,
+                    ) {
+                        transcript_state.add_completed_dealing(signed_dealing.content, multi_sig);
+                    }
+                }
+            },
+            &self.metrics.transcript_builder_duration,
+        );
+
+        // Step 2: Build the transcript from the verified dealings
+        timed_call(
+            "create_transcript",
+            || {
+                self.crypto_create_transcript(
+                    transcript_state.transcript_params,
+                    &transcript_state.completed_dealings,
+                )
+            },
+            &self.metrics.transcript_builder_duration,
+        )
+    }
+
+    /// Helper to combine the multi sig shares for a dealing
+    fn crypto_aggregate_dealing_support(
+        &self,
+        transcript_params: &IDkgTranscriptParams,
+        support_shares: &[EcdsaDealingSupport],
+    ) -> Option<MultiSignature<EcdsaDealing>> {
+        // Check if we have enough shares for aggregation
+        if support_shares.len() < (transcript_params.verification_threshold().get() as usize) {
+            self.metrics
+                .transcript_builder_metrics_inc("insufficient_support_shares");
+            return None;
         }
 
-        // Step 2: Build the transcripts from the verified dealings
-        let mut completed_transcripts = Vec::new();
-        for transcript_state in trancript_state_map.values() {
-            if let Some(transcript) = self.crypto_create_transcript(
-                transcript_state.transcript_params,
-                &transcript_state.completed_dealings,
-            ) {
-                completed_transcripts.push(transcript);
+        let mut signatures = Vec::new();
+        for support_share in support_shares {
+            signatures.push(&support_share.signature);
+        }
+
+        self.crypto
+            .aggregate(signatures, transcript_params.registry_version())
+            .map_or_else(
+                |error| {
+                    warn!(
+                        self.log,
+                        "Failed to aggregate: transcript_id = {:?}, error = {:?}",
+                        transcript_params.transcript_id(),
+                        error
+                    );
+                    self.metrics
+                        .transcript_builder_errors_inc("aggregate_dealing_support");
+                    None
+                },
+                |multi_sig| {
+                    self.metrics.transcript_builder_metrics_inc_by(
+                        support_shares.len() as u64,
+                        "support_aggregated",
+                    );
+                    self.metrics
+                        .transcript_builder_metrics_inc("dealing_aggregated");
+                    Some(multi_sig)
+                },
+            )
+    }
+
+    /// Helper to create the transcript from the verified dealings
+    fn crypto_create_transcript(
+        &self,
+        transcript_params: &IDkgTranscriptParams,
+        verified_dealings: &BTreeMap<NodeId, IDkgMultiSignedDealing>,
+    ) -> Option<IDkgTranscript> {
+        // Check if we have enough dealings to create transcript
+        if verified_dealings.len() < (transcript_params.collection_threshold().get() as usize) {
+            self.metrics
+                .transcript_builder_metrics_inc("insufficient_dealings");
+            return None;
+        }
+
+        IDkgProtocol::create_transcript(&*self.crypto, transcript_params, verified_dealings)
+            .map_or_else(
+                |error| {
+                    warn!(
+                        self.log,
+                        "Failed to create transcript: transcript_id = {:?}, error = {:?}",
+                        transcript_params.transcript_id(),
+                        error
+                    );
+                    self.metrics
+                        .transcript_builder_errors_inc("create_transcript");
+                    None
+                },
+                |transcript| {
+                    self.metrics
+                        .transcript_builder_metrics_inc("transcript_created");
+                    Some(transcript)
+                },
+            )
+    }
+
+    /// Helper to get the validated dealings.
+    fn get_validated_dealings(
+        &self,
+        transcript_id: IDkgTranscriptId,
+        ecdsa_pool: &dyn EcdsaPool,
+    ) -> BTreeMap<NodeId, IDkgDealing> {
+        let mut ret = BTreeMap::new();
+        for (_, signed_dealing) in ecdsa_pool.validated().signed_dealings() {
+            let dealing = signed_dealing.get();
+            if dealing.idkg_dealing.transcript_id == transcript_id {
+                ret.insert(dealing.idkg_dealing.dealer_id, dealing.idkg_dealing.clone());
             }
         }
-        completed_transcripts
+        ret
+    }
+}
+
+impl<'a> EcdsaTranscriptBuilder for EcdsaTranscriptBuilderImpl<'a> {
+    fn get_completed_transcript(
+        &self,
+        transcript_id: IDkgTranscriptId,
+        ecdsa_pool: &dyn EcdsaPool,
+    ) -> Option<IDkgTranscript> {
+        timed_call(
+            "get_completed_transcript",
+            || self.build_transcript(transcript_id, ecdsa_pool),
+            &self.metrics.transcript_builder_duration,
+        )
+    }
+
+    fn get_validated_dealings(
+        &self,
+        transcript_id: IDkgTranscriptId,
+        ecdsa_pool: &dyn EcdsaPool,
+    ) -> BTreeMap<NodeId, IDkgDealing> {
+        timed_call(
+            "get_validated_dealings",
+            || self.get_validated_dealings(transcript_id, ecdsa_pool),
+            &self.metrics.transcript_builder_duration,
+        )
     }
 }
 
@@ -784,16 +1193,17 @@ impl<'a> Action<'a> {
     #[allow(clippy::self_named_constructors)]
     fn action(
         block_reader: &'a dyn EcdsaBlockReader,
+        requested_transcripts: &'a [IDkgTranscriptParams],
         msg_height: Height,
         msg_transcript_id: &IDkgTranscriptId,
     ) -> Action<'a> {
-        if msg_height > block_reader.height() {
+        if msg_height > block_reader.tip_height() {
             // Message is from a node ahead of us, keep it to be
             // processed later
             return Action::Defer;
         }
 
-        for transcript_params in block_reader.requested_transcripts() {
+        for transcript_params in requested_transcripts {
             if *msg_transcript_id == transcript_params.transcript_id() {
                 return Action::Process(transcript_params);
             }
@@ -840,244 +1250,75 @@ impl<'a> TranscriptState<'a> {
     // is stored in the IDkgMultiSignedDealing format
     fn add_completed_dealing(
         &mut self,
-        dealing: &'a EcdsaDealing,
+        dealing: EcdsaDealing,
         multi_sig: MultiSignature<EcdsaDealing>,
     ) {
+        let dealer_id = dealing.idkg_dealing.dealer_id;
         let verified_dealing = EcdsaVerifiedDealing {
-            content: dealing.clone(),
+            content: dealing,
             signature: multi_sig,
         };
         self.completed_dealings
-            .insert(dealing.dealer_id, verified_dealing.into());
+            .insert(dealer_id, verified_dealing.into());
     }
+}
+
+/// Resolves the IDkgTranscriptParamsRef -> IDkgTranscriptParams
+fn resolve_transcript_refs(
+    block_reader: &dyn EcdsaBlockReader,
+    reason: &str,
+    metric: IntCounterVec,
+    log: &ReplicaLogger,
+) -> Vec<IDkgTranscriptParams> {
+    let mut ret = Vec::new();
+    for transcript_params_ref in block_reader.requested_transcripts() {
+        // Translate the IDkgTranscriptParamsRef -> IDkgTranscriptParams
+        match transcript_params_ref.translate(block_reader) {
+            Ok(transcript_params) => {
+                ret.push(transcript_params);
+            }
+            Err(error) => {
+                warn!(
+                    log,
+                    "Failed to translate transcript ref: reason = {}, \
+                     transcript_params_ref = {:?}, error = {:?}",
+                    reason,
+                    transcript_params_ref,
+                    error
+                );
+                metric.with_label_values(&[reason]).inc();
+            }
+        }
+    }
+    ret
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consensus::mocks::{dependencies, Dependencies};
-    use ic_artifact_pool::ecdsa_pool::EcdsaPoolImpl;
-    use ic_config::artifact_pool::ArtifactPoolConfig;
+    use crate::ecdsa::utils::test_utils::*;
     use ic_ecdsa_object::EcdsaObject;
     use ic_interfaces::artifact_pool::UnvalidatedArtifact;
     use ic_interfaces::ecdsa::MutableEcdsaPool;
     use ic_interfaces::time_source::TimeSource;
-    use ic_test_utilities::consensus::fake::*;
-    use ic_test_utilities::crypto::{
-        dummy_idkg_dealing_for_tests, dummy_idkg_transcript_id_for_tests,
-    };
     use ic_test_utilities::types::ids::{NODE_1, NODE_2, NODE_3, NODE_4};
     use ic_test_utilities::with_test_replica_logger;
     use ic_test_utilities::FastForwardTimeSource;
-    use ic_types::consensus::MultiSignatureShare;
-    use ic_types::crypto::canister_threshold_sig::idkg::{
-        IDkgDealers, IDkgReceivers, IDkgTranscriptId, IDkgTranscriptOperation, IDkgTranscriptParams,
-    };
-    use ic_types::crypto::AlgorithmId;
-    use ic_types::{Height, RegistryVersion};
-    use std::collections::BTreeSet;
-
-    // Implementation of EcdsaBlockReader to inject the test transcript params
-    struct TestEcdsaBlockReader {
-        height: Height,
-        requests: Vec<IDkgTranscriptParams>,
-    }
-
-    impl TestEcdsaBlockReader {
-        fn new(height: Height, requests: Vec<IDkgTranscriptParams>) -> Self {
-            Self { height, requests }
-        }
-    }
-
-    impl EcdsaBlockReader for TestEcdsaBlockReader {
-        fn height(&self) -> Height {
-            self.height
-        }
-
-        fn requested_transcripts(&self) -> Box<dyn Iterator<Item = &IDkgTranscriptParams> + '_> {
-            Box::new(self.requests.iter())
-        }
-    }
-
-    fn create_dependencies(
-        pool_config: ArtifactPoolConfig,
-        logger: ReplicaLogger,
-    ) -> (EcdsaPoolImpl, EcdsaPreSignerImpl) {
-        let metrics_registry = MetricsRegistry::new();
-        let Dependencies {
-            pool,
-            replica_config: _,
-            membership: _,
-            registry: _,
-            crypto,
-            ..
-        } = dependencies(pool_config, 1);
-
-        let pre_signer = EcdsaPreSignerImpl::new(
-            NODE_1,
-            pool.get_cache(),
-            crypto,
-            metrics_registry.clone(),
-            logger.clone(),
-        );
-        let ecdsa_pool = EcdsaPoolImpl::new(logger, metrics_registry);
-
-        (ecdsa_pool, pre_signer)
-    }
-
-    // Creates a test transcript param
-    fn create_transcript_param(
-        transcript_id: IDkgTranscriptId,
-        dealer_list: &[NodeId],
-        receiver_list: &[NodeId],
-    ) -> IDkgTranscriptParams {
-        let mut dealers = BTreeSet::new();
-        dealer_list.iter().for_each(|val| {
-            dealers.insert(*val);
-        });
-        let mut receivers = BTreeSet::new();
-        receiver_list.iter().for_each(|val| {
-            receivers.insert(*val);
-        });
-        IDkgTranscriptParams::new(
-            transcript_id,
-            IDkgDealers::new(dealers).unwrap(),
-            IDkgReceivers::new(receivers).unwrap(),
-            RegistryVersion::from(0),
-            AlgorithmId::ThresholdEcdsaSecp256k1,
-            IDkgTranscriptOperation::Random,
-        )
-        .unwrap()
-    }
-
-    // Creates a test dealing
-    fn create_dealing(transcript_id: IDkgTranscriptId, dealer_id: NodeId) -> EcdsaDealing {
-        EcdsaDealing {
-            requested_height: Height::from(10),
-            dealer_id,
-            transcript_id,
-            dealing: dummy_idkg_dealing_for_tests(),
-        }
-    }
-
-    // Creates a test dealing support
-    fn create_support(
-        transcript_id: IDkgTranscriptId,
-        dealer_id: NodeId,
-        signer: NodeId,
-    ) -> EcdsaDealingSupport {
-        EcdsaDealingSupport {
-            content: create_dealing(transcript_id, dealer_id),
-            signature: MultiSignatureShare::fake(signer),
-        }
-    }
-
-    // Checks that the dealing with the given id is being added to the validated
-    // pool
-    fn is_dealing_added_to_validated(
-        change_set: &[EcdsaChangeAction],
-        transcript_id: &IDkgTranscriptId,
-    ) -> bool {
-        for action in change_set {
-            if let EcdsaChangeAction::AddToValidated(EcdsaMessage::EcdsaDealing(dealing)) = action {
-                if dealing.transcript_id == *transcript_id && dealing.dealer_id == NODE_1 {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
-    // Checks that the dealing support for the given dealing is being added to the
-    // validated pool
-    fn is_dealing_support_added_to_validated(
-        change_set: &[EcdsaChangeAction],
-        transcript_id: &IDkgTranscriptId,
-        dealer_id: &NodeId,
-    ) -> bool {
-        for action in change_set {
-            if let EcdsaChangeAction::AddToValidated(EcdsaMessage::EcdsaDealingSupport(support)) =
-                action
-            {
-                let dealing = &support.content;
-                if dealing.transcript_id == *transcript_id
-                    && dealing.dealer_id == *dealer_id
-                    && support.signature.signer == NODE_1
-                {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
-    // Checks that artifact is being moved from unvalidated to validated pool
-    fn is_moved_to_validated(change_set: &[EcdsaChangeAction], msg_id: &EcdsaMessageId) -> bool {
-        for action in change_set {
-            if let EcdsaChangeAction::MoveToValidated(id) = action {
-                if *id == *msg_id {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
-    // Checks that artifact is being removed from validated pool
-    fn is_removed_from_validated(
-        change_set: &[EcdsaChangeAction],
-        msg_id: &EcdsaMessageId,
-    ) -> bool {
-        for action in change_set {
-            if let EcdsaChangeAction::RemoveValidated(id) = action {
-                if *id == *msg_id {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
-    // Checks that artifact is being removed from unvalidated pool
-    fn is_removed_from_unvalidated(
-        change_set: &[EcdsaChangeAction],
-        msg_id: &EcdsaMessageId,
-    ) -> bool {
-        for action in change_set {
-            if let EcdsaChangeAction::RemoveUnvalidated(id) = action {
-                if *id == *msg_id {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
-    // Checks that artifact is being dropped as invalid
-    fn is_handle_invalid(change_set: &[EcdsaChangeAction], msg_id: &EcdsaMessageId) -> bool {
-        for action in change_set {
-            if let EcdsaChangeAction::HandleInvalid(id, _) = action {
-                if *id == *msg_id {
-                    return true;
-                }
-            }
-        }
-        false
-    }
+    use ic_types::Height;
 
     // Tests the Action logic
     #[test]
-    fn test_action() {
+    fn test_ecdsa_pre_signer_action() {
         let (id_1, id_2, id_3, id_4) = (
-            dummy_idkg_transcript_id_for_tests(1),
-            dummy_idkg_transcript_id_for_tests(2),
-            dummy_idkg_transcript_id_for_tests(3),
-            dummy_idkg_transcript_id_for_tests(4),
+            create_transcript_id(1),
+            create_transcript_id(2),
+            create_transcript_id(3),
+            create_transcript_id(4),
         );
 
         // The finalized block requests transcripts 1, 2, 3
         let nodes = [NODE_1];
-        let block_reader = TestEcdsaBlockReader::new(
+        let block_reader = TestEcdsaBlockReader::for_pre_signer_test(
             Height::from(100),
             vec![
                 create_transcript_param(id_1, &nodes, &nodes),
@@ -1085,10 +1326,14 @@ mod tests {
                 create_transcript_param(id_3, &nodes, &nodes),
             ],
         );
+        let mut requested = Vec::new();
+        for transcript_params_ref in block_reader.requested_transcripts() {
+            requested.push(transcript_params_ref.translate(&block_reader).unwrap());
+        }
 
         // Message from a node ahead of us
         assert_eq!(
-            Action::action(&block_reader, Height::from(200), &id_4),
+            Action::action(&block_reader, &requested, Height::from(200), &id_4),
             Action::Defer
         );
 
@@ -1096,28 +1341,30 @@ mod tests {
         assert_eq!(
             Action::action(
                 &block_reader,
+                &requested,
                 Height::from(100),
-                &dummy_idkg_transcript_id_for_tests(234)
+                &create_transcript_id(234)
             ),
             Action::Drop
         );
         assert_eq!(
             Action::action(
                 &block_reader,
+                &requested,
                 Height::from(10),
-                &dummy_idkg_transcript_id_for_tests(234)
+                &create_transcript_id(234)
             ),
             Action::Drop
         );
 
         // Messages for transcripts currently requested
-        let action = Action::action(&block_reader, Height::from(100), &id_1);
+        let action = Action::action(&block_reader, &requested, Height::from(100), &id_1);
         match action {
             Action::Process(_) => {}
             _ => panic!("Unexpected action: {:?}", action),
         }
 
-        let action = Action::action(&block_reader, Height::from(10), &id_2);
+        let action = Action::action(&block_reader, &requested, Height::from(10), &id_2);
         match action {
             Action::Process(_) => {}
             _ => panic!("Unexpected action: {:?}", action),
@@ -1130,13 +1377,14 @@ mod tests {
     fn test_ecdsa_send_dealings() {
         ic_test_utilities::artifact_pool_config::with_test_pool_config(|pool_config| {
             with_test_replica_logger(|logger| {
-                let (mut ecdsa_pool, pre_signer) = create_dependencies(pool_config, logger);
+                let (mut ecdsa_pool, pre_signer) =
+                    create_pre_signer_dependencies(pool_config, logger);
                 let (id_1, id_2, id_3, id_4, id_5) = (
-                    dummy_idkg_transcript_id_for_tests(1),
-                    dummy_idkg_transcript_id_for_tests(2),
-                    dummy_idkg_transcript_id_for_tests(3),
-                    dummy_idkg_transcript_id_for_tests(4),
-                    dummy_idkg_transcript_id_for_tests(5),
+                    create_transcript_id(1),
+                    create_transcript_id(2),
+                    create_transcript_id(3),
+                    create_transcript_id(4),
+                    create_transcript_id(5),
                 );
 
                 // Set up the ECDSA pool. Pool has dealings for transcripts 1, 2, 3.
@@ -1145,9 +1393,9 @@ mod tests {
                 let dealing_2 = create_dealing(id_2, NODE_2);
                 let dealing_3 = create_dealing(id_3, NODE_3);
                 let change_set = vec![
-                    EcdsaChangeAction::AddToValidated(EcdsaMessage::EcdsaDealing(dealing_1)),
-                    EcdsaChangeAction::AddToValidated(EcdsaMessage::EcdsaDealing(dealing_2)),
-                    EcdsaChangeAction::AddToValidated(EcdsaMessage::EcdsaDealing(dealing_3)),
+                    EcdsaChangeAction::AddToValidated(EcdsaMessage::EcdsaSignedDealing(dealing_1)),
+                    EcdsaChangeAction::AddToValidated(EcdsaMessage::EcdsaSignedDealing(dealing_2)),
+                    EcdsaChangeAction::AddToValidated(EcdsaMessage::EcdsaSignedDealing(dealing_3)),
                 ];
                 ecdsa_pool.apply_changes(change_set);
 
@@ -1156,14 +1404,25 @@ mod tests {
                 let t1 = create_transcript_param(id_1, &[NODE_1], &[NODE_2]);
                 let t2 = create_transcript_param(id_4, &[NODE_1], &[NODE_3]);
                 let t3 = create_transcript_param(id_5, &[NODE_1], &[NODE_4]);
-                let block_reader = TestEcdsaBlockReader::new(Height::from(100), vec![t1, t2, t3]);
+                let block_reader =
+                    TestEcdsaBlockReader::for_pre_signer_test(Height::from(100), vec![t1, t2, t3]);
+                let transcript_loader: TestEcdsaTranscriptLoader = Default::default();
 
                 // Since transcript 1 is already in progress, we should issue
                 // dealings only for transcripts 4, 5
-                let change_set = pre_signer.send_dealings(&ecdsa_pool, &block_reader);
+                let change_set =
+                    pre_signer.send_dealings(&ecdsa_pool, &transcript_loader, &block_reader);
                 assert_eq!(change_set.len(), 2);
-                assert!(is_dealing_added_to_validated(&change_set, &id_4));
-                assert!(is_dealing_added_to_validated(&change_set, &id_5));
+                assert!(is_dealing_added_to_validated(
+                    &change_set,
+                    &id_4,
+                    block_reader.tip_height()
+                ));
+                assert!(is_dealing_added_to_validated(
+                    &change_set,
+                    &id_5,
+                    block_reader.tip_height()
+                ));
             })
         })
     }
@@ -1174,11 +1433,8 @@ mod tests {
     fn test_ecdsa_non_dealers_dont_send_dealings() {
         ic_test_utilities::artifact_pool_config::with_test_pool_config(|pool_config| {
             with_test_replica_logger(|logger| {
-                let (ecdsa_pool, pre_signer) = create_dependencies(pool_config, logger);
-                let (id_1, id_2) = (
-                    dummy_idkg_transcript_id_for_tests(1),
-                    dummy_idkg_transcript_id_for_tests(2),
-                );
+                let (ecdsa_pool, pre_signer) = create_pre_signer_dependencies(pool_config, logger);
+                let (id_1, id_2) = (create_transcript_id(1), create_transcript_id(2));
 
                 // transcript 1 has NODE_1 as a dealer
                 let t1 = create_transcript_param(id_1, &[NODE_1], &[NODE_1]);
@@ -1187,11 +1443,58 @@ mod tests {
                 let t2 = create_transcript_param(id_2, &[NODE_2], &[NODE_2]);
 
                 // Transcript 2 should not result in a dealing
-                let block_reader = TestEcdsaBlockReader::new(Height::from(100), vec![t1, t2]);
+                let block_reader =
+                    TestEcdsaBlockReader::for_pre_signer_test(Height::from(100), vec![t1, t2]);
+                let transcript_loader: TestEcdsaTranscriptLoader = Default::default();
 
-                let change_set = pre_signer.send_dealings(&ecdsa_pool, &block_reader);
+                let change_set =
+                    pre_signer.send_dealings(&ecdsa_pool, &transcript_loader, &block_reader);
                 assert_eq!(change_set.len(), 1);
-                assert!(is_dealing_added_to_validated(&change_set, &id_1));
+                assert!(is_dealing_added_to_validated(
+                    &change_set,
+                    &id_1,
+                    block_reader.tip_height()
+                ));
+            })
+        })
+    }
+
+    // Tests that complaints are generated and added to the pool if loading transcript
+    // results in complaints.
+    #[test]
+    fn test_ecdsa_send_dealings_with_complaints() {
+        ic_test_utilities::artifact_pool_config::with_test_pool_config(|pool_config| {
+            with_test_replica_logger(|logger| {
+                let (ecdsa_pool, pre_signer) = create_pre_signer_dependencies(pool_config, logger);
+                let (id_1, id_2, id_3) = (
+                    create_transcript_id(1),
+                    create_transcript_id(2),
+                    create_transcript_id(3),
+                );
+
+                // Set up the transcript creation request
+                // The block requests transcripts 1, 2, 3
+                let t1 = create_transcript_param(id_1, &[NODE_1], &[NODE_2]);
+                let t2 = create_transcript_param(id_2, &[NODE_1], &[NODE_3]);
+                let t3 = create_transcript_param(id_3, &[NODE_1], &[NODE_4]);
+                let block_reader =
+                    TestEcdsaBlockReader::for_pre_signer_test(Height::from(100), vec![t1, t2, t3]);
+                let transcript_loader =
+                    TestEcdsaTranscriptLoader::new(TestTranscriptLoadStatus::Complaints);
+
+                let change_set =
+                    pre_signer.send_dealings(&ecdsa_pool, &transcript_loader, &block_reader);
+                let complaints = transcript_loader.returned_complaints();
+                assert_eq!(change_set.len(), complaints.len());
+                assert_eq!(change_set.len(), 3);
+                for complaint in complaints {
+                    assert!(is_complaint_added_to_validated(
+                        &change_set,
+                        &complaint.content.idkg_complaint.transcript_id,
+                        &NODE_1,
+                        &NODE_1,
+                    ));
+                }
             })
         })
     }
@@ -1203,60 +1506,59 @@ mod tests {
     fn test_ecdsa_validate_dealings() {
         ic_test_utilities::artifact_pool_config::with_test_pool_config(|pool_config| {
             with_test_replica_logger(|logger| {
-                let (mut ecdsa_pool, pre_signer) = create_dependencies(pool_config, logger);
+                let (mut ecdsa_pool, pre_signer) =
+                    create_pre_signer_dependencies(pool_config, logger);
                 let time_source = FastForwardTimeSource::new();
                 let (id_1, id_2, id_3, id_4) = (
-                    dummy_idkg_transcript_id_for_tests(1),
-                    dummy_idkg_transcript_id_for_tests(2),
-                    dummy_idkg_transcript_id_for_tests(3),
-                    dummy_idkg_transcript_id_for_tests(4),
+                    create_transcript_id(1),
+                    create_transcript_id(2),
+                    create_transcript_id(3),
+                    create_transcript_id(4),
                 );
 
                 // Set up the transcript creation request
                 // The block requests transcripts 2, 3
                 let t2 = create_transcript_param(id_2, &[NODE_2], &[NODE_1]);
                 let t3 = create_transcript_param(id_3, &[NODE_2], &[NODE_1]);
-                let block_reader = TestEcdsaBlockReader::new(Height::from(100), vec![t2, t3]);
+                let block_reader =
+                    TestEcdsaBlockReader::for_pre_signer_test(Height::from(100), vec![t2, t3]);
 
                 // Set up the ECDSA pool
                 // A dealing from a node ahead of us (deferred)
                 let mut dealing = create_dealing(id_1, NODE_2);
-                dealing.requested_height = Height::from(200);
+                dealing.content.requested_height = Height::from(200);
                 ecdsa_pool.insert(UnvalidatedArtifact {
-                    message: EcdsaMessage::EcdsaDealing(dealing),
+                    message: EcdsaMessage::EcdsaSignedDealing(dealing),
                     peer_id: NODE_2,
                     timestamp: time_source.get_relative_time(),
                 });
 
                 // A dealing for a transcript that is requested by finalized block (accepted)
                 let mut dealing = create_dealing(id_2, NODE_2);
-                dealing.requested_height = Height::from(100);
-                let key = dealing.key();
-                let msg_id_2 = EcdsaDealing::key_to_outer_hash(&key);
+                dealing.content.requested_height = Height::from(100);
+                let msg_id_2 = dealing.message_hash();
                 ecdsa_pool.insert(UnvalidatedArtifact {
-                    message: EcdsaMessage::EcdsaDealing(dealing),
+                    message: EcdsaMessage::EcdsaSignedDealing(dealing),
                     peer_id: NODE_2,
                     timestamp: time_source.get_relative_time(),
                 });
 
                 // A dealing for a transcript that is requested by finalized block (accepted)
                 let mut dealing = create_dealing(id_3, NODE_2);
-                dealing.requested_height = Height::from(10);
-                let key = dealing.key();
-                let msg_id_3 = EcdsaDealing::key_to_outer_hash(&key);
+                dealing.content.requested_height = Height::from(10);
+                let msg_id_3 = dealing.message_hash();
                 ecdsa_pool.insert(UnvalidatedArtifact {
-                    message: EcdsaMessage::EcdsaDealing(dealing),
+                    message: EcdsaMessage::EcdsaSignedDealing(dealing),
                     peer_id: NODE_2,
                     timestamp: time_source.get_relative_time(),
                 });
 
                 // A dealing for a transcript that is not requested by finalized block (dropped)
                 let mut dealing = create_dealing(id_4, NODE_2);
-                dealing.requested_height = Height::from(5);
-                let key = dealing.key();
-                let msg_id_4 = EcdsaDealing::key_to_outer_hash(&key);
+                dealing.content.requested_height = Height::from(5);
+                let msg_id_4 = dealing.message_hash();
                 ecdsa_pool.insert(UnvalidatedArtifact {
-                    message: EcdsaMessage::EcdsaDealing(dealing),
+                    message: EcdsaMessage::EcdsaSignedDealing(dealing),
                     peer_id: NODE_2,
                     timestamp: time_source.get_relative_time(),
                 });
@@ -1273,34 +1575,35 @@ mod tests {
     // Tests that duplicate dealings from a dealer for the same transcript
     // are dropped.
     #[test]
-    fn test_ecdsa_duplicate_dealing_from_dealer() {
+    fn test_ecdsa_duplicate_dealing() {
         ic_test_utilities::artifact_pool_config::with_test_pool_config(|pool_config| {
             with_test_replica_logger(|logger| {
-                let (mut ecdsa_pool, pre_signer) = create_dependencies(pool_config, logger);
+                let (mut ecdsa_pool, pre_signer) =
+                    create_pre_signer_dependencies(pool_config, logger);
                 let time_source = FastForwardTimeSource::new();
-                let id_2 = dummy_idkg_transcript_id_for_tests(2);
+                let id_2 = create_transcript_id(2);
 
                 // Set up the ECDSA pool
                 // Validated pool has: {transcript 2, dealer = NODE_2}
                 let dealing = create_dealing(id_2, NODE_2);
                 let change_set = vec![EcdsaChangeAction::AddToValidated(
-                    EcdsaMessage::EcdsaDealing(dealing),
+                    EcdsaMessage::EcdsaSignedDealing(dealing),
                 )];
                 ecdsa_pool.apply_changes(change_set);
 
                 // Unvalidated pool has: {transcript 2, dealer = NODE_2, height = 100}
                 let mut dealing = create_dealing(id_2, NODE_2);
-                dealing.requested_height = Height::from(100);
-                let key = dealing.key();
-                let msg_id_2 = EcdsaDealing::key_to_outer_hash(&key);
+                dealing.content.requested_height = Height::from(100);
+                let msg_id_2 = dealing.message_hash();
                 ecdsa_pool.insert(UnvalidatedArtifact {
-                    message: EcdsaMessage::EcdsaDealing(dealing),
+                    message: EcdsaMessage::EcdsaSignedDealing(dealing),
                     peer_id: NODE_2,
                     timestamp: time_source.get_relative_time(),
                 });
 
                 let t2 = create_transcript_param(id_2, &[NODE_2], &[NODE_1]);
-                let block_reader = TestEcdsaBlockReader::new(Height::from(100), vec![t2]);
+                let block_reader =
+                    TestEcdsaBlockReader::for_pre_signer_test(Height::from(100), vec![t2]);
 
                 let change_set = pre_signer.validate_dealings(&ecdsa_pool, &block_reader);
                 assert_eq!(change_set.len(), 1);
@@ -1312,49 +1615,48 @@ mod tests {
     // Tests that duplicate dealings from a dealer for the same transcript
     // in the unvalidated pool are dropped.
     #[test]
-    fn test_ecdsa_duplicate_dealing_from_dealer_in_batch() {
+    fn test_ecdsa_duplicate_dealing_in_batch() {
         ic_test_utilities::artifact_pool_config::with_test_pool_config(|pool_config| {
             with_test_replica_logger(|logger| {
-                let (mut ecdsa_pool, pre_signer) = create_dependencies(pool_config, logger);
+                let (mut ecdsa_pool, pre_signer) =
+                    create_pre_signer_dependencies(pool_config, logger);
                 let time_source = FastForwardTimeSource::new();
-                let id_2 = dummy_idkg_transcript_id_for_tests(2);
+                let id_2 = create_transcript_id(2);
 
                 // Set up the ECDSA pool
                 // Unvalidated pool has: {transcript 2, dealer = NODE_2, height = 100}
                 let mut dealing = create_dealing(id_2, NODE_2);
-                dealing.requested_height = Height::from(100);
-                let key = dealing.key();
-                let msg_id_2_a = EcdsaDealing::key_to_outer_hash(&key);
+                dealing.content.requested_height = Height::from(100);
+                let msg_id_2_a = dealing.message_hash();
                 ecdsa_pool.insert(UnvalidatedArtifact {
-                    message: EcdsaMessage::EcdsaDealing(dealing),
+                    message: EcdsaMessage::EcdsaSignedDealing(dealing),
                     peer_id: NODE_2,
                     timestamp: time_source.get_relative_time(),
                 });
 
                 // Unvalidated pool has: {transcript 2, dealer = NODE_2, height = 10}
                 let mut dealing = create_dealing(id_2, NODE_2);
-                dealing.requested_height = Height::from(10);
-                let key = dealing.key();
-                let msg_id_2_b = EcdsaDealing::key_to_outer_hash(&key);
+                dealing.content.requested_height = Height::from(10);
+                let msg_id_2_b = dealing.message_hash();
                 ecdsa_pool.insert(UnvalidatedArtifact {
-                    message: EcdsaMessage::EcdsaDealing(dealing),
+                    message: EcdsaMessage::EcdsaSignedDealing(dealing),
                     peer_id: NODE_2,
                     timestamp: time_source.get_relative_time(),
                 });
 
                 // Unvalidated pool has: {transcript 2, dealer = NODE_3, height = 90}
                 let mut dealing = create_dealing(id_2, NODE_3);
-                dealing.requested_height = Height::from(90);
-                let key = dealing.key();
-                let msg_id_3 = EcdsaDealing::key_to_outer_hash(&key);
+                dealing.content.requested_height = Height::from(90);
+                let msg_id_3 = dealing.message_hash();
                 ecdsa_pool.insert(UnvalidatedArtifact {
-                    message: EcdsaMessage::EcdsaDealing(dealing),
+                    message: EcdsaMessage::EcdsaSignedDealing(dealing),
                     peer_id: NODE_3,
                     timestamp: time_source.get_relative_time(),
                 });
 
                 let t2 = create_transcript_param(id_2, &[NODE_2, NODE_3], &[NODE_1]);
-                let block_reader = TestEcdsaBlockReader::new(Height::from(100), vec![t2]);
+                let block_reader =
+                    TestEcdsaBlockReader::for_pre_signer_test(Height::from(100), vec![t2]);
 
                 // msg_id_2_a, msg_id_2_a should be dropped as duplicates
                 let change_set = pre_signer.validate_dealings(&ecdsa_pool, &block_reader);
@@ -1369,27 +1671,28 @@ mod tests {
     // Tests that dealings from a dealer that is not in the dealer list for the
     // transcript are dropped.
     #[test]
-    fn test_ecdsa_unexpected_dealing_from_dealer() {
+    fn test_ecdsa_unexpected_dealing() {
         ic_test_utilities::artifact_pool_config::with_test_pool_config(|pool_config| {
             with_test_replica_logger(|logger| {
-                let (mut ecdsa_pool, pre_signer) = create_dependencies(pool_config, logger);
+                let (mut ecdsa_pool, pre_signer) =
+                    create_pre_signer_dependencies(pool_config, logger);
                 let time_source = FastForwardTimeSource::new();
-                let id_2 = dummy_idkg_transcript_id_for_tests(2);
+                let id_2 = create_transcript_id(2);
 
                 // Unvalidated pool has: {transcript 2, dealer = NODE_2, height = 100}
                 let mut dealing = create_dealing(id_2, NODE_2);
-                dealing.requested_height = Height::from(100);
-                let key = dealing.key();
-                let msg_id_2 = EcdsaDealing::key_to_outer_hash(&key);
+                dealing.content.requested_height = Height::from(100);
+                let msg_id_2 = dealing.message_hash();
                 ecdsa_pool.insert(UnvalidatedArtifact {
-                    message: EcdsaMessage::EcdsaDealing(dealing),
+                    message: EcdsaMessage::EcdsaSignedDealing(dealing),
                     peer_id: NODE_2,
                     timestamp: time_source.get_relative_time(),
                 });
 
                 // NODE_2 is not in the dealer list
                 let t2 = create_transcript_param(id_2, &[NODE_3], &[NODE_1]);
-                let block_reader = TestEcdsaBlockReader::new(Height::from(100), vec![t2]);
+                let block_reader =
+                    TestEcdsaBlockReader::for_pre_signer_test(Height::from(100), vec![t2]);
 
                 let change_set = pre_signer.validate_dealings(&ecdsa_pool, &block_reader);
                 assert_eq!(change_set.len(), 1);
@@ -1403,24 +1706,26 @@ mod tests {
     fn test_ecdsa_send_support() {
         ic_test_utilities::artifact_pool_config::with_test_pool_config(|pool_config| {
             with_test_replica_logger(|logger| {
-                let (mut ecdsa_pool, pre_signer) = create_dependencies(pool_config, logger);
-                let id = dummy_idkg_transcript_id_for_tests(1);
+                let (mut ecdsa_pool, pre_signer) =
+                    create_pre_signer_dependencies(pool_config, logger);
+                let id = create_transcript_id(1);
 
                 // We haven't sent support yet, and we are in the receiver list
                 let dealing = create_dealing(id, NODE_2);
                 let change_set = vec![EcdsaChangeAction::AddToValidated(
-                    EcdsaMessage::EcdsaDealing(dealing),
+                    EcdsaMessage::EcdsaSignedDealing(dealing),
                 )];
                 ecdsa_pool.apply_changes(change_set);
                 let t = create_transcript_param(id, &[NODE_2], &[NODE_1]);
 
-                let block_reader = TestEcdsaBlockReader::new(Height::from(100), vec![t]);
+                let block_reader =
+                    TestEcdsaBlockReader::for_pre_signer_test(Height::from(100), vec![t]);
                 let change_set = pre_signer.send_dealing_support(&ecdsa_pool, &block_reader);
                 assert_eq!(change_set.len(), 1);
                 assert!(is_dealing_support_added_to_validated(
                     &change_set,
                     &id,
-                    &NODE_2
+                    &NODE_2,
                 ));
                 ecdsa_pool.apply_changes(change_set);
 
@@ -1438,18 +1743,20 @@ mod tests {
     fn test_ecdsa_non_receivers_dont_send_support() {
         ic_test_utilities::artifact_pool_config::with_test_pool_config(|pool_config| {
             with_test_replica_logger(|logger| {
-                let (mut ecdsa_pool, pre_signer) = create_dependencies(pool_config, logger);
-                let id = dummy_idkg_transcript_id_for_tests(1);
+                let (mut ecdsa_pool, pre_signer) =
+                    create_pre_signer_dependencies(pool_config, logger);
+                let id = create_transcript_id(1);
 
                 // We are not in the receiver list for the transcript
                 let dealing = create_dealing(id, NODE_2);
                 let change_set = vec![EcdsaChangeAction::AddToValidated(
-                    EcdsaMessage::EcdsaDealing(dealing),
+                    EcdsaMessage::EcdsaSignedDealing(dealing),
                 )];
                 ecdsa_pool.apply_changes(change_set);
                 let t = create_transcript_param(id, &[NODE_2], &[NODE_3]);
 
-                let block_reader = TestEcdsaBlockReader::new(Height::from(100), vec![t]);
+                let block_reader =
+                    TestEcdsaBlockReader::for_pre_signer_test(Height::from(100), vec![t]);
                 let change_set = pre_signer.send_dealing_support(&ecdsa_pool, &block_reader);
                 assert!(change_set.is_empty());
             })
@@ -1461,16 +1768,18 @@ mod tests {
     fn test_ecdsa_no_support_for_missing_transcript_params() {
         ic_test_utilities::artifact_pool_config::with_test_pool_config(|pool_config| {
             with_test_replica_logger(|logger| {
-                let (mut ecdsa_pool, pre_signer) = create_dependencies(pool_config, logger);
-                let id = dummy_idkg_transcript_id_for_tests(1);
+                let (mut ecdsa_pool, pre_signer) =
+                    create_pre_signer_dependencies(pool_config, logger);
+                let id = create_transcript_id(1);
 
                 let dealing = create_dealing(id, NODE_2);
                 let change_set = vec![EcdsaChangeAction::AddToValidated(
-                    EcdsaMessage::EcdsaDealing(dealing),
+                    EcdsaMessage::EcdsaSignedDealing(dealing),
                 )];
                 ecdsa_pool.apply_changes(change_set);
 
-                let block_reader = TestEcdsaBlockReader::new(Height::from(100), vec![]);
+                let block_reader =
+                    TestEcdsaBlockReader::for_pre_signer_test(Height::from(100), vec![]);
                 let change_set = pre_signer.send_dealing_support(&ecdsa_pool, &block_reader);
                 assert!(change_set.is_empty());
             })
@@ -1483,20 +1792,22 @@ mod tests {
     fn test_ecdsa_validate_dealing_support() {
         ic_test_utilities::artifact_pool_config::with_test_pool_config(|pool_config| {
             with_test_replica_logger(|logger| {
-                let (mut ecdsa_pool, pre_signer) = create_dependencies(pool_config, logger);
+                let (mut ecdsa_pool, pre_signer) =
+                    create_pre_signer_dependencies(pool_config, logger);
                 let time_source = FastForwardTimeSource::new();
                 let (id_1, id_2, id_3, id_4) = (
-                    dummy_idkg_transcript_id_for_tests(1),
-                    dummy_idkg_transcript_id_for_tests(2),
-                    dummy_idkg_transcript_id_for_tests(3),
-                    dummy_idkg_transcript_id_for_tests(4),
+                    create_transcript_id(1),
+                    create_transcript_id(2),
+                    create_transcript_id(3),
+                    create_transcript_id(4),
                 );
 
                 // Set up the transcript creation request
                 // The block requests transcripts 2, 3
                 let t2 = create_transcript_param(id_2, &[NODE_2], &[NODE_3]);
                 let t3 = create_transcript_param(id_3, &[NODE_2], &[NODE_3]);
-                let block_reader = TestEcdsaBlockReader::new(Height::from(100), vec![t2, t3]);
+                let block_reader =
+                    TestEcdsaBlockReader::for_pre_signer_test(Height::from(100), vec![t2, t3]);
 
                 // Set up the ECDSA pool
                 // A share from a node ahead of us (share deferred)
@@ -1511,16 +1822,15 @@ mod tests {
                 // A dealing for a transcript that is requested by finalized block,
                 // and we already have the dealing(share accepted)
                 let mut dealing = create_dealing(id_2, NODE_2);
-                dealing.requested_height = Height::from(25);
+                dealing.content.requested_height = Height::from(25);
                 let change_set = vec![EcdsaChangeAction::AddToValidated(
-                    EcdsaMessage::EcdsaDealing(dealing),
+                    EcdsaMessage::EcdsaSignedDealing(dealing),
                 )];
                 ecdsa_pool.apply_changes(change_set);
 
                 let mut support = create_support(id_2, NODE_2, NODE_3);
                 support.content.requested_height = Height::from(25);
-                let key = support.key();
-                let msg_id_2 = EcdsaDealingSupport::key_to_outer_hash(&key);
+                let msg_id_2 = support.message_hash();
                 ecdsa_pool.insert(UnvalidatedArtifact {
                     message: EcdsaMessage::EcdsaDealingSupport(support),
                     peer_id: NODE_3,
@@ -1541,8 +1851,7 @@ mod tests {
                 // (share dropped)
                 let mut support = create_support(id_4, NODE_2, NODE_3);
                 support.content.requested_height = Height::from(5);
-                let key = support.key();
-                let msg_id_4 = EcdsaDealingSupport::key_to_outer_hash(&key);
+                let msg_id_4 = support.message_hash();
                 ecdsa_pool.insert(UnvalidatedArtifact {
                     message: EcdsaMessage::EcdsaDealingSupport(support),
                     peer_id: NODE_3,
@@ -1563,15 +1872,16 @@ mod tests {
     fn test_ecdsa_duplicate_support_from_node() {
         ic_test_utilities::artifact_pool_config::with_test_pool_config(|pool_config| {
             with_test_replica_logger(|logger| {
-                let (mut ecdsa_pool, pre_signer) = create_dependencies(pool_config, logger);
+                let (mut ecdsa_pool, pre_signer) =
+                    create_pre_signer_dependencies(pool_config, logger);
                 let time_source = FastForwardTimeSource::new();
-                let id = dummy_idkg_transcript_id_for_tests(1);
+                let id = create_transcript_id(1);
 
                 // Set up the ECDSA pool
                 // Validated pool has: support {transcript 2, dealer = NODE_2, signer = NODE_3}
                 let dealing = create_dealing(id, NODE_2);
                 let change_set = vec![EcdsaChangeAction::AddToValidated(
-                    EcdsaMessage::EcdsaDealing(dealing),
+                    EcdsaMessage::EcdsaSignedDealing(dealing),
                 )];
                 ecdsa_pool.apply_changes(change_set);
 
@@ -1585,8 +1895,7 @@ mod tests {
                 // NODE_3}
                 let mut support = create_support(id, NODE_2, NODE_3);
                 support.content.requested_height = Height::from(100);
-                let key = support.key();
-                let msg_id = EcdsaDealingSupport::key_to_outer_hash(&key);
+                let msg_id = support.message_hash();
                 ecdsa_pool.insert(UnvalidatedArtifact {
                     message: EcdsaMessage::EcdsaDealingSupport(support),
                     peer_id: NODE_3,
@@ -1594,7 +1903,8 @@ mod tests {
                 });
 
                 let t = create_transcript_param(id, &[NODE_2], &[NODE_3]);
-                let block_reader = TestEcdsaBlockReader::new(Height::from(100), vec![t]);
+                let block_reader =
+                    TestEcdsaBlockReader::for_pre_signer_test(Height::from(100), vec![t]);
 
                 let change_set = pre_signer.validate_dealing_support(&ecdsa_pool, &block_reader);
                 assert_eq!(change_set.len(), 1);
@@ -1609,17 +1919,17 @@ mod tests {
     fn test_ecdsa_duplicate_support_from_node_in_batch() {
         ic_test_utilities::artifact_pool_config::with_test_pool_config(|pool_config| {
             with_test_replica_logger(|logger| {
-                let (mut ecdsa_pool, pre_signer) = create_dependencies(pool_config, logger);
+                let (mut ecdsa_pool, pre_signer) =
+                    create_pre_signer_dependencies(pool_config, logger);
                 let time_source = FastForwardTimeSource::new();
-                let id = dummy_idkg_transcript_id_for_tests(1);
+                let id = create_transcript_id(1);
 
                 // Set up the ECDSA pool
                 // Unvalidated pool has: support {transcript 2, dealer = NODE_2, signer =
                 // NODE_3}
                 let mut support = create_support(id, NODE_2, NODE_3);
                 support.content.requested_height = Height::from(100);
-                let key = support.key();
-                let msg_id_1_a = EcdsaDealingSupport::key_to_outer_hash(&key);
+                let msg_id_1_a = support.message_hash();
                 ecdsa_pool.insert(UnvalidatedArtifact {
                     message: EcdsaMessage::EcdsaDealingSupport(support),
                     peer_id: NODE_3,
@@ -1630,8 +1940,7 @@ mod tests {
                 // NODE_3}
                 let mut support = create_support(id, NODE_2, NODE_3);
                 support.content.requested_height = Height::from(10);
-                let key = support.key();
-                let msg_id_1_b = EcdsaDealingSupport::key_to_outer_hash(&key);
+                let msg_id_1_b = support.message_hash();
                 ecdsa_pool.insert(UnvalidatedArtifact {
                     message: EcdsaMessage::EcdsaDealingSupport(support),
                     peer_id: NODE_3,
@@ -1642,14 +1951,13 @@ mod tests {
                 // NODE_4}
                 let dealing = create_dealing(id, NODE_2);
                 let change_set = vec![EcdsaChangeAction::AddToValidated(
-                    EcdsaMessage::EcdsaDealing(dealing),
+                    EcdsaMessage::EcdsaSignedDealing(dealing),
                 )];
                 ecdsa_pool.apply_changes(change_set);
 
                 let mut support = create_support(id, NODE_2, NODE_4);
                 support.content.requested_height = Height::from(10);
-                let key = support.key();
-                let msg_id_2 = EcdsaDealingSupport::key_to_outer_hash(&key);
+                let msg_id_2 = support.message_hash();
                 ecdsa_pool.insert(UnvalidatedArtifact {
                     message: EcdsaMessage::EcdsaDealingSupport(support),
                     peer_id: NODE_4,
@@ -1657,7 +1965,8 @@ mod tests {
                 });
 
                 let t = create_transcript_param(id, &[NODE_2], &[NODE_3, NODE_4]);
-                let block_reader = TestEcdsaBlockReader::new(Height::from(100), vec![t]);
+                let block_reader =
+                    TestEcdsaBlockReader::for_pre_signer_test(Height::from(100), vec![t]);
 
                 let change_set = pre_signer.validate_dealing_support(&ecdsa_pool, &block_reader);
                 assert_eq!(change_set.len(), 3);
@@ -1674,16 +1983,16 @@ mod tests {
     fn test_ecdsa_unexpected_support_from_node() {
         ic_test_utilities::artifact_pool_config::with_test_pool_config(|pool_config| {
             with_test_replica_logger(|logger| {
-                let (mut ecdsa_pool, pre_signer) = create_dependencies(pool_config, logger);
+                let (mut ecdsa_pool, pre_signer) =
+                    create_pre_signer_dependencies(pool_config, logger);
                 let time_source = FastForwardTimeSource::new();
-                let id = dummy_idkg_transcript_id_for_tests(1);
+                let id = create_transcript_id(1);
 
                 // Unvalidated pool has: support {transcript 2, dealer = NODE_2, signer =
                 // NODE_3}
                 let mut support = create_support(id, NODE_2, NODE_3);
                 support.content.requested_height = Height::from(10);
-                let key = support.key();
-                let msg_id = EcdsaDealingSupport::key_to_outer_hash(&key);
+                let msg_id = support.message_hash();
                 ecdsa_pool.insert(UnvalidatedArtifact {
                     message: EcdsaMessage::EcdsaDealingSupport(support),
                     peer_id: NODE_3,
@@ -1692,7 +2001,8 @@ mod tests {
 
                 // NODE_3 is not in the receiver list
                 let t = create_transcript_param(id, &[NODE_2], &[NODE_4]);
-                let block_reader = TestEcdsaBlockReader::new(Height::from(100), vec![t]);
+                let block_reader =
+                    TestEcdsaBlockReader::for_pre_signer_test(Height::from(100), vec![t]);
                 let change_set = pre_signer.validate_dealing_support(&ecdsa_pool, &block_reader);
                 assert_eq!(change_set.len(), 1);
                 assert!(is_handle_invalid(&change_set, &msg_id));
@@ -1705,45 +2015,46 @@ mod tests {
     fn test_ecdsa_purge_unvalidated_dealings() {
         ic_test_utilities::artifact_pool_config::with_test_pool_config(|pool_config| {
             with_test_replica_logger(|logger| {
-                let (mut ecdsa_pool, pre_signer) = create_dependencies(pool_config, logger);
+                let (mut ecdsa_pool, pre_signer) =
+                    create_pre_signer_dependencies(pool_config, logger);
                 let time_source = FastForwardTimeSource::new();
                 let (id_1, id_2, id_3) = (
-                    dummy_idkg_transcript_id_for_tests(1),
-                    dummy_idkg_transcript_id_for_tests(2),
-                    dummy_idkg_transcript_id_for_tests(3),
+                    create_transcript_id(1),
+                    create_transcript_id(2),
+                    create_transcript_id(3),
                 );
 
                 // Dealing 1: height <= current_height, in_progress (not purged)
                 let mut dealing_1 = create_dealing(id_1, NODE_2);
-                dealing_1.requested_height = Height::from(20);
+                dealing_1.content.requested_height = Height::from(20);
                 ecdsa_pool.insert(UnvalidatedArtifact {
-                    message: EcdsaMessage::EcdsaDealing(dealing_1),
+                    message: EcdsaMessage::EcdsaSignedDealing(dealing_1),
                     peer_id: NODE_2,
                     timestamp: time_source.get_relative_time(),
                 });
 
                 // Dealing 2: height <= current_height, !in_progress (purged)
                 let mut dealing_2 = create_dealing(id_2, NODE_2);
-                dealing_2.requested_height = Height::from(20);
-                let key = dealing_2.key();
-                let msg_id_2 = EcdsaDealing::key_to_outer_hash(&key);
+                dealing_2.content.requested_height = Height::from(20);
+                let msg_id_2 = dealing_2.message_hash();
                 ecdsa_pool.insert(UnvalidatedArtifact {
-                    message: EcdsaMessage::EcdsaDealing(dealing_2),
+                    message: EcdsaMessage::EcdsaSignedDealing(dealing_2),
                     peer_id: NODE_2,
                     timestamp: time_source.get_relative_time(),
                 });
 
                 // Dealing 3: height > current_height (not purged)
                 let mut dealing_3 = create_dealing(id_3, NODE_2);
-                dealing_3.requested_height = Height::from(200);
+                dealing_3.content.requested_height = Height::from(200);
                 ecdsa_pool.insert(UnvalidatedArtifact {
-                    message: EcdsaMessage::EcdsaDealing(dealing_3),
+                    message: EcdsaMessage::EcdsaSignedDealing(dealing_3),
                     peer_id: NODE_2,
                     timestamp: time_source.get_relative_time(),
                 });
 
                 let t = create_transcript_param(id_1, &[NODE_2], &[NODE_4]);
-                let block_reader = TestEcdsaBlockReader::new(Height::from(100), vec![t]);
+                let block_reader =
+                    TestEcdsaBlockReader::for_pre_signer_test(Height::from(100), vec![t]);
                 let change_set = pre_signer.purge_artifacts(&ecdsa_pool, &block_reader);
                 assert_eq!(change_set.len(), 1);
                 assert!(is_removed_from_unvalidated(&change_set, &msg_id_2));
@@ -1756,36 +2067,37 @@ mod tests {
     fn test_ecdsa_purge_validated_dealings() {
         ic_test_utilities::artifact_pool_config::with_test_pool_config(|pool_config| {
             with_test_replica_logger(|logger| {
-                let (mut ecdsa_pool, pre_signer) = create_dependencies(pool_config, logger);
+                let (mut ecdsa_pool, pre_signer) =
+                    create_pre_signer_dependencies(pool_config, logger);
                 let (id_1, id_2, id_3) = (
-                    dummy_idkg_transcript_id_for_tests(1),
-                    dummy_idkg_transcript_id_for_tests(2),
-                    dummy_idkg_transcript_id_for_tests(3),
+                    create_transcript_id(1),
+                    create_transcript_id(2),
+                    create_transcript_id(3),
                 );
 
                 // Dealing 1: height <= current_height, in_progress (not purged)
                 let mut dealing_1 = create_dealing(id_1, NODE_2);
-                dealing_1.requested_height = Height::from(20);
+                dealing_1.content.requested_height = Height::from(20);
 
                 // Dealing 2: height <= current_height, !in_progress (purged)
                 let mut dealing_2 = create_dealing(id_2, NODE_2);
-                dealing_2.requested_height = Height::from(20);
-                let key = dealing_2.key();
-                let msg_id_2 = EcdsaDealing::key_to_outer_hash(&key);
+                dealing_2.content.requested_height = Height::from(20);
+                let msg_id_2 = dealing_2.message_hash();
 
                 // Dealing 3: height > current_height (not purged)
                 let mut dealing_3 = create_dealing(id_3, NODE_2);
-                dealing_3.requested_height = Height::from(200);
+                dealing_3.content.requested_height = Height::from(200);
 
                 let change_set = vec![
-                    EcdsaChangeAction::AddToValidated(EcdsaMessage::EcdsaDealing(dealing_1)),
-                    EcdsaChangeAction::AddToValidated(EcdsaMessage::EcdsaDealing(dealing_2)),
-                    EcdsaChangeAction::AddToValidated(EcdsaMessage::EcdsaDealing(dealing_3)),
+                    EcdsaChangeAction::AddToValidated(EcdsaMessage::EcdsaSignedDealing(dealing_1)),
+                    EcdsaChangeAction::AddToValidated(EcdsaMessage::EcdsaSignedDealing(dealing_2)),
+                    EcdsaChangeAction::AddToValidated(EcdsaMessage::EcdsaSignedDealing(dealing_3)),
                 ];
                 ecdsa_pool.apply_changes(change_set);
 
                 let t = create_transcript_param(id_1, &[NODE_2], &[NODE_4]);
-                let block_reader = TestEcdsaBlockReader::new(Height::from(100), vec![t]);
+                let block_reader =
+                    TestEcdsaBlockReader::for_pre_signer_test(Height::from(100), vec![t]);
                 let change_set = pre_signer.purge_artifacts(&ecdsa_pool, &block_reader);
                 assert_eq!(change_set.len(), 1);
                 assert!(is_removed_from_validated(&change_set, &msg_id_2));
@@ -1798,12 +2110,13 @@ mod tests {
     fn test_ecdsa_purge_unvalidated_dealing_support() {
         ic_test_utilities::artifact_pool_config::with_test_pool_config(|pool_config| {
             with_test_replica_logger(|logger| {
-                let (mut ecdsa_pool, pre_signer) = create_dependencies(pool_config, logger);
+                let (mut ecdsa_pool, pre_signer) =
+                    create_pre_signer_dependencies(pool_config, logger);
                 let time_source = FastForwardTimeSource::new();
                 let (id_1, id_2, id_3) = (
-                    dummy_idkg_transcript_id_for_tests(1),
-                    dummy_idkg_transcript_id_for_tests(2),
-                    dummy_idkg_transcript_id_for_tests(3),
+                    create_transcript_id(1),
+                    create_transcript_id(2),
+                    create_transcript_id(3),
                 );
 
                 // Support 1: height <= current_height, in_progress (not purged)
@@ -1818,8 +2131,7 @@ mod tests {
                 // Dealing 2: height <= current_height, !in_progress (purged)
                 let mut support_2 = create_support(id_2, NODE_2, NODE_3);
                 support_2.content.requested_height = Height::from(20);
-                let key = support_2.key();
-                let msg_id_2 = EcdsaDealingSupport::key_to_outer_hash(&key);
+                let msg_id_2 = support_2.message_hash();
                 ecdsa_pool.insert(UnvalidatedArtifact {
                     message: EcdsaMessage::EcdsaDealingSupport(support_2),
                     peer_id: NODE_2,
@@ -1836,7 +2148,8 @@ mod tests {
                 });
 
                 let t = create_transcript_param(id_1, &[NODE_2], &[NODE_4]);
-                let block_reader = TestEcdsaBlockReader::new(Height::from(100), vec![t]);
+                let block_reader =
+                    TestEcdsaBlockReader::for_pre_signer_test(Height::from(100), vec![t]);
                 let change_set = pre_signer.purge_artifacts(&ecdsa_pool, &block_reader);
                 assert_eq!(change_set.len(), 1);
                 assert!(is_removed_from_unvalidated(&change_set, &msg_id_2));
@@ -1849,11 +2162,12 @@ mod tests {
     fn test_ecdsa_purge_validated_dealing_support() {
         ic_test_utilities::artifact_pool_config::with_test_pool_config(|pool_config| {
             with_test_replica_logger(|logger| {
-                let (mut ecdsa_pool, pre_signer) = create_dependencies(pool_config, logger);
+                let (mut ecdsa_pool, pre_signer) =
+                    create_pre_signer_dependencies(pool_config, logger);
                 let (id_1, id_2, id_3) = (
-                    dummy_idkg_transcript_id_for_tests(1),
-                    dummy_idkg_transcript_id_for_tests(2),
-                    dummy_idkg_transcript_id_for_tests(3),
+                    create_transcript_id(1),
+                    create_transcript_id(2),
+                    create_transcript_id(3),
                 );
 
                 // Support 1: height <= current_height, in_progress (not purged)
@@ -1863,8 +2177,7 @@ mod tests {
                 // Dealing 2: height <= current_height, !in_progress (purged)
                 let mut support_2 = create_support(id_2, NODE_2, NODE_3);
                 support_2.content.requested_height = Height::from(20);
-                let key = support_2.key();
-                let msg_id_2 = EcdsaDealingSupport::key_to_outer_hash(&key);
+                let msg_id_2 = support_2.message_hash();
 
                 // Dealing 3: height > current_height (not purged)
                 let mut support_3 = create_support(id_3, NODE_2, NODE_3);
@@ -1878,7 +2191,8 @@ mod tests {
                 ecdsa_pool.apply_changes(change_set);
 
                 let t = create_transcript_param(id_1, &[NODE_2], &[NODE_4]);
-                let block_reader = TestEcdsaBlockReader::new(Height::from(100), vec![t]);
+                let block_reader =
+                    TestEcdsaBlockReader::for_pre_signer_test(Height::from(100), vec![t]);
                 let change_set = pre_signer.purge_artifacts(&ecdsa_pool, &block_reader);
                 assert_eq!(change_set.len(), 1);
                 assert!(is_removed_from_validated(&change_set, &msg_id_2));

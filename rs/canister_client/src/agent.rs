@@ -12,8 +12,8 @@ use ic_protobuf::types::v1 as pb;
 use ic_types::{
     consensus::catchup::CatchUpPackageParam,
     messages::{
-        Blob, HttpQueryContent, HttpReadStateContent, HttpRequestEnvelope, HttpStatusResponse,
-        HttpSubmitContent, MessageId, ReplicaHealthStatus,
+        Blob, HttpCallContent, HttpQueryContent, HttpReadStateContent, HttpRequestEnvelope,
+        HttpStatusResponse, MessageId, ReplicaHealthStatus,
     },
     CanisterId, PrincipalId,
 };
@@ -77,6 +77,7 @@ impl ClonableKeyPair {
 }
 
 pub type SignF = Arc<dyn Fn(&[u8]) -> Result<Vec<u8>, Box<dyn Error>> + Send + Sync>;
+pub type SignFID = Arc<dyn Fn(&MessageId) -> Result<Vec<u8>, Box<dyn Error>> + Send + Sync>;
 
 #[derive(Clone)]
 pub struct Secp256k1KeyPair {
@@ -113,6 +114,13 @@ pub enum Sender {
     Anonymous,
     /// Principal ID (no signature)
     PrincipalId(PrincipalId),
+    /// Signed from the node itself, with its key.
+    Node {
+        /// DER encoded public key
+        pub_key: Vec<u8>,
+        /// Function that signs the message id
+        sign: SignFID,
+    },
 }
 
 impl Sender {
@@ -147,17 +155,25 @@ impl Sender {
             Self::ExternalHsm { pub_key, .. } => PrincipalId::new_self_authenticating(pub_key),
             Self::Anonymous => PrincipalId::new_anonymous(),
             Self::PrincipalId(id) => *id,
+            Self::Node { pub_key, .. } => {
+                PrincipalId::new_self_authenticating(&ed25519_public_key_to_der(pub_key.clone()))
+            }
         }
     }
 
     pub fn sign_message_id(&self, msg_id: &MessageId) -> Result<Option<Vec<u8>>, Box<dyn Error>> {
-        let mut sig_data = vec![];
-        sig_data.extend_from_slice(DOMAIN_IC_REQUEST);
-        sig_data.extend_from_slice(msg_id.as_bytes());
-        self.sign(&sig_data)
+        match self {
+            Self::Node { sign, .. } => sign(msg_id).map(Some),
+            _ => {
+                let mut sig_data = vec![];
+                sig_data.extend_from_slice(DOMAIN_IC_REQUEST);
+                sig_data.extend_from_slice(msg_id.as_bytes());
+                self.sign(&sig_data)
+            }
+        }
     }
 
-    pub fn sign(&self, msg: &[u8]) -> Result<Option<Vec<u8>>, Box<dyn Error>> {
+    fn sign(&self, msg: &[u8]) -> Result<Option<Vec<u8>>, Box<dyn Error>> {
         match self {
             Self::KeyPair(keypair) => Ok(Some(keypair.get().sign(msg).to_bytes().to_vec())),
             Self::SigKeys(sig_keys) => match sig_keys {
@@ -177,6 +193,7 @@ impl Sender {
             Self::ExternalHsm { sign, .. } => sign(msg).map(Some),
             Self::Anonymous => Ok(None),
             Self::PrincipalId(_) => Ok(None),
+            Self::Node { .. } => unreachable!("Wrong case of agent.sign()"),
         }
     }
 
@@ -193,6 +210,7 @@ impl Sender {
             Self::ExternalHsm { pub_key, .. } => Some(pub_key.clone()),
             Self::Anonymous => None,
             Self::PrincipalId(_) => None,
+            Self::Node { pub_key, .. } => Some(ed25519_public_key_to_der(pub_key.clone())),
         }
     }
 }
@@ -413,6 +431,12 @@ impl Agent {
                     "replied" => {
                         return Ok(request_status.reply);
                     }
+                    "done" => {
+                        return Err(
+                            "The call has completed but the reply/reject data has been pruned."
+                                .to_string(),
+                        );
+                    }
                     "unknown" | "received" | "processing" => {}
                     _ => {
                         return Err(format!(
@@ -533,21 +557,21 @@ pub fn ed25519_public_key_to_der(mut key: Vec<u8>) -> Vec<u8> {
 /// Prerequisite: `content` contains a `sender` field that is compatible with
 /// the `keypair` argument.
 pub fn sign_submit(
-    content: HttpSubmitContent,
+    content: HttpCallContent,
     sender: &Sender,
-) -> Result<(HttpRequestEnvelope<HttpSubmitContent>, MessageId), Box<dyn Error>> {
+) -> Result<(HttpRequestEnvelope<HttpCallContent>, MessageId), Box<dyn Error>> {
     // Open question: should this also set the `sender` field of the `content`? The
     // two are linked, but it's a bit weird for a function that presents itself
     // as 'wrapping a content into an envelope' to mess up with the content.
 
     let message_id = match &content {
-        HttpSubmitContent::Call { update } => update.id(),
+        HttpCallContent::Call { update } => update.id(),
     };
 
     let pub_key_der = sender.sender_pubkey_der().map(Blob);
     let sender_sig = sender.sign_message_id(&message_id)?.map(Blob);
 
-    let envelope = HttpRequestEnvelope::<HttpSubmitContent> {
+    let envelope = HttpRequestEnvelope::<HttpCallContent> {
         content,
         sender_pubkey: pub_key_der,
         sender_sig,
@@ -606,8 +630,7 @@ fn bytes_to_cbor(bytes: Vec<u8>) -> Result<CBOR, String> {
                 bytes
                     .iter()
                     .copied()
-                    .map(std::ascii::escape_default)
-                    .flatten()
+                    .flat_map(std::ascii::escape_default)
                     .collect()
             )
             .expect("ASCII is legal utf8"),
@@ -649,7 +672,7 @@ mod tests {
             let mut rng = ChaChaRng::seed_from_u64(789_u64);
             ed25519_dalek::Keypair::generate(&mut rng)
         };
-        let content = HttpSubmitContent::Call {
+        let content = HttpCallContent::Call {
             update: HttpCanisterUpdate {
                 canister_id: Blob(vec![51]),
                 method_name: "foo".to_string(),
@@ -709,7 +732,7 @@ mod tests {
             )
             .expect("DER encoding failed"),
         ));
-        let content = HttpSubmitContent::Call {
+        let content = HttpCallContent::Call {
             update: HttpCanisterUpdate {
                 canister_id: Blob(vec![51]),
                 method_name: "foo".to_string(),
@@ -750,7 +773,7 @@ mod tests {
         let expiry_time = test_start_time + Duration::from_secs(4 * 60);
 
         // Set up an arbitrary legal input
-        let content = HttpSubmitContent::Call {
+        let content = HttpCallContent::Call {
             update: HttpCanisterUpdate {
                 canister_id: Blob(vec![51]),
                 method_name: "foo".to_string(),

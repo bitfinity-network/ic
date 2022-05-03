@@ -174,6 +174,8 @@ message NeuronInfo {
   uint64 stake_e8s = 8;
   // Timestamp when this neuron joined the community fund.
   optional uint64 joined_community_fund_timestamp_seconds = 9;
+  // If this neuron is a known neuron, this is data associated with it, including the neuron's name and (optionally) a description.
+  optional KnownNeuronData known_neuron_data = 10;
 }
 
 // A transfer performed from some account to stake a new neuron.
@@ -326,6 +328,9 @@ message Neuron {
   // irreversible decision that can only be made by the neuron's
   // controller.
   optional uint64 joined_community_fund_timestamp_seconds = 17;
+
+  // If set, the neuron belongs to the "known neurons". It has been given a name and maybe a description.
+  optional KnownNeuronData known_neuron_data = 18;
 }
 
 // The types of votes the Neuron can issue.
@@ -427,7 +432,7 @@ enum NnsFunction {
   // used to set the "default" list of subnetworks that principals
   // without special authorization are allowed to use.
   NNS_FUNCTION_SET_AUTHORIZED_SUBNETWORKS = 14;
-  // Change the Firewall configuration in the registry.
+  // Change the Firewall configuration in the registry. (TODO: Remove when IC-1026 is fully integrated)
   NNS_FUNCTION_SET_FIREWALL_CONFIG = 15;
   // Change a Node Operator's allowance in the registry.
   NNS_FUNCTION_UPDATE_NODE_OPERATOR_CONFIG = 16;
@@ -443,6 +448,16 @@ enum NnsFunction {
   NNS_FUNCTION_ADD_OR_REMOVE_DATA_CENTERS = 21;
   // Update the config for all unassigned nodes.
   NNS_FUNCTION_UPDATE_UNASSIGNED_NODES_CONFIG = 22;
+  // Remove Node Operator from the registry.
+  NNS_FUNCTION_REMOVE_NODE_OPERATORS = 23;
+  // Update the routing table in the registry.
+  NNS_FUNCTION_REROUTE_CANISTER_RANGE = 24;
+  // Add firewall rules in the registry
+  NNS_FUNCTION_ADD_FIREWALL_RULES = 25;
+  // Remove firewall rules in the registry
+  NNS_FUNCTION_REMOVE_FIREWALL_RULES = 26;
+  // Update firewall rules in the registry
+  NNS_FUNCTION_UPDATE_FIREWALL_RULES = 27;
 }
 
 // Payload of a proposal that calls a function on another NNS
@@ -479,7 +494,7 @@ message AddOrRemoveNodeProvider {
 }
 
 // This proposal payload is used to reward a node provider by minting
-// ICPTs directly to the node provider's ledger account, or into a new
+// ICPs directly to the node provider's ledger account, or into a new
 // neuron created on behalf of the node provider.
 message RewardNodeProvider {
   // The NodeProvider to reward.
@@ -530,6 +545,10 @@ message RewardNodeProvider {
 
 message RewardNodeProviders {
   repeated RewardNodeProvider rewards = 1;
+
+  // If true, reward Node Providers with the rewards returned by the Registry's
+  // get_node_providers_monthly_xdr_rewards method
+  optional bool use_registry_derived_rewards = 2;
 }
 
 // Changes the default followees to match the one provided.
@@ -544,9 +563,11 @@ message SetDefaultFollowees {
 //
 // Making a proposal implicitly votes yes.
 message Proposal {
-  // Text with the title of the proposal.
-   // Can have a max of 256 bytes.
+  // Must be present (enforced at the application layer, not by PB).
+  // A brief description of what the proposal does.
+  // Size in bytes must be in the interval [5, 256].
   optional string title = 20;
+
   // Text providing a short description of the proposal, composed
   // using a maximum of 15000 bytes of characters.
   string summary = 1;
@@ -610,6 +631,8 @@ message Proposal {
     SetDefaultFollowees set_default_followees = 18;
     // Reward multiple NodeProvider
     RewardNodeProviders reward_node_providers = 19;
+    // Register Known Neuron
+    KnownNeuron register_known_neuron = 21;
   }
 }
 
@@ -639,6 +662,7 @@ message ManageNeuron {
   // The dissolve delay of a neuron can be increased up to a maximum
   // of 8 years.
   message IncreaseDissolveDelay {
+    option (ic_base_types.pb.v1.tui_signed_message) = true;
     uint32 additional_dissolve_delay_seconds = 1 [(ic_base_types.pb.v1.tui_signed_display_q2_2021) = true];
   }
   message StartDissolving {}
@@ -650,15 +674,18 @@ message ManageNeuron {
   // WebAuthn key that is maintained inside a user device, such as a
   // smartphone.
   message AddHotKey {
+    option (ic_base_types.pb.v1.tui_signed_message) = true;
     ic_base_types.pb.v1.PrincipalId new_hot_key = 1 [(ic_base_types.pb.v1.tui_signed_display_q2_2021) = true];
   }
   // Remove a hot key that has been previously assigned to the neuron.
   message RemoveHotKey {
+    option (ic_base_types.pb.v1.tui_signed_message) = true;
     ic_base_types.pb.v1.PrincipalId hot_key_to_remove = 1 [(ic_base_types.pb.v1.tui_signed_display_q2_2021) = true];
   }
   // An (idempotent) alternative to IncreaseDissolveDelay where the dissolve delay
   // is passed as an absolute timestamp in seconds since the unix epoch.
   message SetDissolveTimestamp {
+    option (ic_base_types.pb.v1.tui_signed_message) = true;
     uint64 dissolve_timestamp_seconds = 1 [(ic_base_types.pb.v1.tui_signed_display_q2_2021) = true];
   }
   // Join the Internet Computer's community fund with this neuron's
@@ -701,15 +728,26 @@ message ManageNeuron {
     uint64 amount_e8s = 1;
   }
 
+  // Merge another neuron into this neuron.
+  message Merge {
+    // The neuron to merge stake and maturity from.
+    ic_nns_common.pb.v1.NeuronId source_neuron_id = 1;
+  }
+
   // When the maturity of a neuron has risen above a threshold, it can
   // be instructed to spawn a new neuron. This creates a new neuron
   // that locks a new balance of ICP on the ledger. The new neuron can
   // remain controlled by the same principal as its parent, or be
   // assigned to a new principal.
   message Spawn {
+    option (ic_base_types.pb.v1.tui_signed_message) = true;
     // If not set, the spawned neuron will have the same controller as
     // this neuron.
     ic_base_types.pb.v1.PrincipalId new_controller = 1 [(ic_base_types.pb.v1.tui_signed_display_q2_2021) = true];
+    // The nonce with which to create the subaccount.
+    optional uint64 nonce = 2;
+    // The percentage to spawn, from 1 to 100 (inclusive).
+    optional uint32 percentage_to_spawn = 3;
   }
 
   // Merge the maturity of a neuron into the current stake.
@@ -717,8 +755,9 @@ message ManageNeuron {
   // the existing stake. The resulting amount to merge must be greater than
   // or equal to the transaction fee.
   message MergeMaturity {
-    // The percentage to merge, from 1 to 100
-    uint32 percentage_to_merge = 1;
+    option (ic_base_types.pb.v1.tui_signed_message) = true;
+    // The percentage to merge, from 1 to 100 (inclusive).
+    uint32 percentage_to_merge = 1 [(ic_base_types.pb.v1.tui_signed_display_q2_2021) = true];
   }
 
   // Disburse a portion of this neuron's stake into another neuron.
@@ -733,7 +772,7 @@ message ManageNeuron {
     uint64 dissolve_delay_seconds = 3;
     // Whether the new neuron has been kyc verified.
     bool kyc_verified = 4;
-    // The nonce with whitch to create the subaccount.
+    // The nonce with which to create the subaccount.
     uint64 nonce = 5;
   }
 
@@ -760,15 +799,17 @@ message ManageNeuron {
   // If the list 'followees' is empty, this removes following for a
   // specific topic.
   message Follow {
+    option (ic_base_types.pb.v1.tui_signed_message) = true;
     // Topic UNSPECIFIED means add following for the 'catch all'.
-    Topic topic = 1;
-    repeated ic_nns_common.pb.v1.NeuronId followees = 2;
+    Topic topic = 1 [(ic_base_types.pb.v1.tui_signed_display_q2_2021) = true];
+    repeated ic_nns_common.pb.v1.NeuronId followees = 2 [(ic_base_types.pb.v1.tui_signed_display_q2_2021) = true];
   }
   // Have the neuron vote to either adopt or reject a proposal with a specified
   // id.
   message RegisterVote {
-    ic_nns_common.pb.v1.ProposalId proposal = 1;
-    Vote vote = 2;
+    option (ic_base_types.pb.v1.tui_signed_message) = true;
+    ic_nns_common.pb.v1.ProposalId proposal = 1 [(ic_base_types.pb.v1.tui_signed_display_q2_2021) = true];
+    Vote vote = 2 [(ic_base_types.pb.v1.tui_signed_display_q2_2021) = true];
   }
 
   // Claim a new neuron or refresh the stake of an existing neuron.
@@ -807,6 +848,7 @@ message ManageNeuron {
     DisburseToNeuron disburse_to_neuron = 9;
     ClaimOrRefresh claim_or_refresh = 10;
     MergeMaturity merge_maturity = 13;
+    Merge merge = 14;
   }
 }
 
@@ -845,6 +887,8 @@ message ManageNeuronResponse {
     ic_nns_common.pb.v1.NeuronId created_neuron_id = 1;
   }
 
+  message MergeResponse {}
+
   message DisburseToNeuronResponse {
     // The ID of the Neuron created from disbursing a Neuron
     ic_nns_common.pb.v1.NeuronId created_neuron_id = 1;
@@ -866,6 +910,7 @@ message ManageNeuronResponse {
     DisburseToNeuronResponse disburse_to_neuron = 9;
     ClaimOrRefreshResponse claim_or_refresh = 10;
     MergeMaturityResponse merge_maturity = 11;
+    MergeResponse merge = 12;
   }
 }
 
@@ -902,7 +947,10 @@ message GovernanceError {
      // Some canister side resource is exhausted, so this operation cannot be
      // performed.
      ERROR_TYPE_RESOURCE_EXHAUSTED = 10;
-     // Some precondition for executing this method was not met.
+     // Some precondition for executing this method was not met (e.g. the
+     // neuron's desolve time is too short). There could be a change in the
+     // state of the system such that the operation becomes allowed (e.g. the
+     // owner of the neuron increases its desolve delay).
      ERROR_TYPE_PRECONDITION_FAILED = 11;
      // Executing this method failed for some reason external to the
      // governance canister.
@@ -914,7 +962,10 @@ message GovernanceError {
      ERROR_TYPE_INSUFFICIENT_FUNDS = 14;
      // The principal provided was invalid.
      ERROR_TYPE_INVALID_PRINCIPAL = 15;
-     // The proposal's parameters violate size restrictions.
+     // The proposal is defective in some way (e.g. title is too long). If the
+     // same proposal is submitted again without modification, it will be
+     // rejected regardless of changes in the system's state (e.g. increasing
+     // the neuron's desolve delay will not make the proposal acceptable).
      ERROR_TYPE_INVALID_PROPOSAL = 16;
      // The neuron attempted to join the community fund while already
      // a member.
@@ -1131,7 +1182,7 @@ message NetworkEconomics {
   // The fee does not apply for ManageNeuron proposals.
   uint64 reject_cost_e8s = 1;
 
-  // The minium number of E8s that can be staked in a neuron.
+  // The minimum number of E8s that can be staked in a neuron.
   uint64 neuron_minimum_stake_e8s = 2;
 
   // The number of E8s (10E-8 of an ICP token) that it costs to
@@ -1203,6 +1254,17 @@ message RewardEvent {
   uint64 distributed_e8s_equivalent = 4;
 }
 
+message KnownNeuron {
+  ic_nns_common.pb.v1.NeuronId id = 1;
+  KnownNeuronData known_neuron_data = 2;
+}
+
+// Known neurons have extra information (a name and optionally a description) that can be used to identify them.
+message KnownNeuronData {
+  string name = 1;
+  optional string description = 2;
+}
+
 // This represents the whole NNS governance system. It contains all
 // information about the NNS governance system that must be kept
 // across upgrades of the NNS governance system.
@@ -1244,6 +1306,8 @@ message Governance {
       ManageNeuron.DisburseToNeuron disburse_to_neuron = 5;
       ManageNeuron.MergeMaturity merge_maturity = 7;
       ManageNeuron.ClaimOrRefresh claim_or_refresh_neuron = 8;
+      ManageNeuron.Configure configure = 9;
+      ManageNeuron.Merge merge = 10;
     }
   }
 
@@ -1384,6 +1448,18 @@ message ListNeuronsResponse {
   // hot key, or controller or hot key of some followee on the
   // `ManageNeuron` topic).
   repeated Neuron full_neurons = 2;
+}
+
+// A response to "ListKnownNeurons"
+message ListKnownNeuronsResponse {
+  // List of known neurons.
+  repeated KnownNeuron known_neurons = 1;
+}
+
+// Response to list_node_providers
+message ListNodeProvidersResponse {
+  // List of all "NodeProviders"
+  repeated NodeProvider node_providers = 1;
 }
 
 // The arguments to the method `claim_or_refresh_neuron_from_account`.

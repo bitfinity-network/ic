@@ -1,4 +1,21 @@
-use tecdsa::*;
+use ic_crypto_internal_threshold_sig_ecdsa::*;
+use rand::Rng;
+
+#[test]
+fn poly_zero_times_zero_is_zero() -> ThresholdEcdsaResult<()> {
+    for curve in EccCurveType::all() {
+        let zero = EccScalar::zero(curve);
+
+        for coeffs in 0..10 {
+            let zpoly = Polynomial::new(curve, vec![zero; coeffs])?;
+            assert!(zpoly.is_zero());
+            let zpoly2 = zpoly.mul(&zpoly)?;
+            assert!(zpoly2.is_zero());
+        }
+    }
+
+    Ok(())
+}
 
 #[test]
 fn poly_a_constant_poly_is_constant() -> ThresholdEcdsaResult<()> {
@@ -117,7 +134,7 @@ fn poly_interpolate_fails_if_insufficient_points() -> ThresholdEcdsaResult<()> {
 }
 
 #[test]
-fn poly_interpolate_is_resilient_to_duplicate_points() -> ThresholdEcdsaResult<()> {
+fn poly_interpolate_errors_on_duplicate_inputs() -> ThresholdEcdsaResult<()> {
     let mut rng = rand::thread_rng();
 
     for curve in EccCurveType::all() {
@@ -140,9 +157,7 @@ fn poly_interpolate_is_resilient_to_duplicate_points() -> ThresholdEcdsaResult<(
                 samples.push((dup_r, dup_p_r));
             }
 
-            let interp = Polynomial::interpolate(curve, &samples)?;
-
-            assert_eq!(poly, interp);
+            assert!(Polynomial::interpolate(curve, &samples).is_err());
         }
     }
 
@@ -205,41 +220,6 @@ fn poly_threshold_secret_sharing() -> ThresholdEcdsaResult<()> {
 }
 
 #[test]
-fn poly_get_coeff() -> ThresholdEcdsaResult<()> {
-    let curve = EccCurveType::K256;
-    let num_coefficients = 5;
-
-    let coeffs = vec![
-        EccScalar::from_u64(curve, 1),
-        EccScalar::from_u64(curve, 2),
-        EccScalar::from_u64(curve, 3),
-        EccScalar::from_u64(curve, 4),
-        EccScalar::from_u64(curve, 5),
-    ];
-
-    let poly = Polynomial::new(curve, coeffs.clone())?;
-
-    for i in 0..num_coefficients {
-        assert!(poly.get_coefficients(i).is_err());
-    }
-
-    for i in num_coefficients..(num_coefficients * 2) {
-        let c = poly.get_coefficients(i).unwrap();
-        assert_eq!(c.len(), i);
-
-        for (i, c) in c.iter().enumerate() {
-            if i < num_coefficients {
-                assert_eq!(*c, coeffs[i]);
-            } else {
-                assert!(c.is_zero());
-            }
-        }
-    }
-
-    Ok(())
-}
-
-#[test]
 fn poly_simple_commitments() -> ThresholdEcdsaResult<()> {
     let mut rng = rand::thread_rng();
 
@@ -276,11 +256,16 @@ fn poly_pedersen_commitments() -> ThresholdEcdsaResult<()> {
 fn poly_lagrange_coefficients_at_zero_are_correct() {
     let curve = EccCurveType::K256;
 
-    fn int_to_scalars(curve: EccCurveType, x: &[i64]) -> Vec<EccScalar> {
-        x.iter().map(|x| EccScalar::from_i64(curve, *x)).collect()
+    fn int_to_scalars(curve: EccCurveType, ints: &[i64]) -> Vec<EccScalar> {
+        let mut scalars = Vec::with_capacity(ints.len());
+        for i in ints {
+            let s = EccScalar::from_u64(curve, i.abs() as u64);
+            scalars.push(if i.is_negative() { s.negate() } else { s });
+        }
+        scalars
     }
 
-    let x_values = int_to_scalars(curve, &[2, 3, 4, 7]);
+    let x_values = [1, 2, 3, 6];
 
     let lagrange_numerators = int_to_scalars(curve, &[3 * 4 * 7, 2 * 4 * 7, 2 * 3 * 7, 2 * 3 * 4]);
 
@@ -300,10 +285,33 @@ fn poly_lagrange_coefficients_at_zero_are_correct() {
         .map(|(numerator, denominator)| numerator.mul(&denominator.invert().unwrap()).unwrap())
         .collect::<Vec<EccScalar>>();
 
-    let observed = lagrange_coefficients_at_zero(&x_values)
-        .expect("Failed even though coordinates were distinct");
+    let zero = EccScalar::zero(curve);
+
+    let observed = LagrangeCoefficients::at_value(&zero, &x_values)
+        .expect("Failed even though coordinates were distinct")
+        .coefficients()
+        .to_vec();
 
     assert_eq!(computed, observed);
+}
+
+fn interpolation_at_zero(x: &[NodeIndex], y: &[EccPoint]) -> ThresholdEcdsaResult<EccPoint> {
+    let curve_type = y[0].curve_type();
+    let coefficients = LagrangeCoefficients::at_zero(curve_type, x)?;
+    coefficients.interpolate_point(y)
+}
+
+fn random_node_indexes(count: usize) -> Vec<NodeIndex> {
+    let mut rng = rand::thread_rng();
+
+    let mut set = std::collections::BTreeSet::new();
+
+    while set.len() != count {
+        let r = rng.gen::<NodeIndex>();
+        set.insert(r);
+    }
+
+    set.iter().cloned().collect()
 }
 
 #[test]
@@ -311,25 +319,84 @@ fn poly_point_interpolation_at_zero() -> ThresholdEcdsaResult<()> {
     let mut rng = rand::thread_rng();
 
     for curve in EccCurveType::all() {
-        let g = EccCurve::new(curve).generator_g()?;
-
         for num_coefficients in 1..30 {
             let sk = EccScalar::random(curve, &mut rng)?;
-            let pk = g.scalar_mul(&sk)?;
+            let pk = EccPoint::mul_by_g(&sk)?;
 
             let poly = Polynomial::random_with_constant(sk, num_coefficients, &mut rng)?;
 
-            let mut samples = Vec::with_capacity(num_coefficients);
+            let x = random_node_indexes(num_coefficients);
+            let mut y = Vec::with_capacity(num_coefficients);
 
-            for _i in 0..num_coefficients {
-                let x = EccScalar::random(curve, &mut rng)?;
-                let p_x = poly.evaluate_at(&x)?;
-                let g_p_x = g.scalar_mul(&p_x)?;
-                samples.push((x, g_p_x));
+            for r in &x {
+                let p_r = poly.evaluate_at(&EccScalar::from_node_index(curve, *r))?;
+                let g_p_r = EccPoint::mul_by_g(&p_r)?;
+                y.push(g_p_r);
             }
 
-            let g0 = EccPoint::interpolation_at_zero(&samples)?;
+            let g0 = interpolation_at_zero(&x, &y)?;
             assert_eq!(g0, pk);
+        }
+    }
+
+    Ok(())
+}
+
+#[test]
+fn poly_point_interpolation_at_value() -> ThresholdEcdsaResult<()> {
+    let mut rng = rand::thread_rng();
+
+    for curve in EccCurveType::all() {
+        for num_coefficients in 1..30 {
+            let value = EccScalar::random(curve, &mut rng)?;
+
+            let poly = Polynomial::random(curve, num_coefficients, &mut rng)?;
+
+            let x = random_node_indexes(num_coefficients);
+            let mut y = Vec::with_capacity(num_coefficients);
+
+            for r in &x {
+                let p_r = poly.evaluate_at(&EccScalar::from_node_index(curve, *r))?;
+                let g_p_r = EccPoint::mul_by_g(&p_r)?;
+                y.push(g_p_r);
+            }
+
+            let coefficients = LagrangeCoefficients::at_value(&value, &x)?;
+
+            assert_eq!(
+                coefficients.interpolate_point(&y)?,
+                EccPoint::mul_by_g(&poly.evaluate_at(&value)?)?
+            );
+        }
+    }
+
+    Ok(())
+}
+
+#[test]
+fn poly_scalar_interpolation_at_value() -> ThresholdEcdsaResult<()> {
+    let mut rng = rand::thread_rng();
+
+    for curve in EccCurveType::all() {
+        for num_coefficients in 1..30 {
+            let value = EccScalar::random(curve, &mut rng)?;
+
+            let poly = Polynomial::random(curve, num_coefficients, &mut rng)?;
+
+            let x = random_node_indexes(num_coefficients);
+            let mut y = Vec::with_capacity(num_coefficients);
+
+            for r in &x {
+                let p_r = poly.evaluate_at(&EccScalar::from_node_index(curve, *r))?;
+                y.push(p_r);
+            }
+
+            let coefficients = LagrangeCoefficients::at_value(&value, &x)?;
+
+            assert_eq!(
+                coefficients.interpolate_scalar(&y)?,
+                poly.evaluate_at(&value)?
+            );
         }
     }
 
@@ -341,28 +408,22 @@ fn poly_point_interpolation_at_zero_rejects_duplicates() -> ThresholdEcdsaResult
     let mut rng = rand::thread_rng();
 
     for curve in EccCurveType::all() {
-        let g = EccCurve::new(curve).generator_g()?;
-
         for num_coefficients in 1..10 {
             let sk = EccScalar::random(curve, &mut rng)?;
             let poly = Polynomial::random_with_constant(sk, num_coefficients, &mut rng)?;
 
-            let mut samples = Vec::with_capacity(num_coefficients);
+            let mut x = random_node_indexes(num_coefficients);
+            let mut y = Vec::with_capacity(num_coefficients + 1);
 
-            let dup_x = EccScalar::random(curve, &mut rng)?;
-            let dup_g_p_x = g.scalar_mul(&poly.evaluate_at(&dup_x)?)?;
+            x.push(x[rng.gen::<usize>() % x.len()]);
 
-            samples.push((dup_x, dup_g_p_x));
-
-            for _i in 0..num_coefficients {
-                let x = EccScalar::random(curve, &mut rng)?;
-                let g_p_x = g.scalar_mul(&poly.evaluate_at(&x)?)?;
-                samples.push((x, g_p_x));
+            for r in &x {
+                let g_p_r =
+                    EccPoint::mul_by_g(&poly.evaluate_at(&EccScalar::from_node_index(curve, *r))?)?;
+                y.push(g_p_r);
             }
 
-            samples.push((dup_x, dup_g_p_x));
-
-            assert!(EccPoint::interpolation_at_zero(&samples).is_err());
+            assert!(interpolation_at_zero(&x, &y).is_err());
         }
     }
 
@@ -374,23 +435,22 @@ fn poly_point_interpolation_at_zero_fails_with_insufficient_shares() -> Threshol
     let mut rng = rand::thread_rng();
 
     for curve in EccCurveType::all() {
-        let g = EccCurve::new(curve).generator_g()?;
-
-        for num_coefficients in 1..20 {
+        for num_coefficients in 2..20 {
             let sk = EccScalar::random(curve, &mut rng)?;
-            let pk = g.scalar_mul(&sk)?;
+            let pk = EccPoint::mul_by_g(&sk)?;
 
             let poly = Polynomial::random_with_constant(sk, num_coefficients, &mut rng)?;
-            let mut samples = Vec::with_capacity(num_coefficients - 1);
+            let x = random_node_indexes(num_coefficients - 1);
+            let mut y = Vec::with_capacity(num_coefficients - 1);
 
-            for _i in 0..num_coefficients - 1 {
-                let x = EccScalar::random(curve, &mut rng)?;
-                let g_p_x = g.scalar_mul(&poly.evaluate_at(&x)?)?;
-                samples.push((x, g_p_x));
+            for r in &x {
+                let g_p_r =
+                    EccPoint::mul_by_g(&poly.evaluate_at(&EccScalar::from_node_index(curve, *r))?)?;
+                y.push(g_p_r);
             }
 
             // Interpolation fails to recover the correct value with insufficient values
-            match EccPoint::interpolation_at_zero(&samples) {
+            match interpolation_at_zero(&x, &y) {
                 Err(e) => assert_eq!(e, ThresholdEcdsaError::InterpolationError),
                 Ok(pt) => assert_ne!(pt, pk),
             }

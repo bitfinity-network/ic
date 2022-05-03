@@ -1,28 +1,23 @@
-use ic_fondue::prod_tests::cli::CliArgs;
-use ic_fondue::prod_tests::driver_setup::create_driver_context_from_cli;
-use ic_fondue::prod_tests::evaluation::evaluate;
-use ic_fondue::prod_tests::pot_dsl::*;
-use ic_tests::nns_fault_tolerance_test;
-use ic_tests::nns_follow_test::{self, test as follow_test};
-use ic_tests::nns_voting_test::{self, test as voting_test};
-use ic_tests::node_restart_test::{self, test as node_restart_test};
-use ic_tests::security::nns_voting_fuzzing_poc_test;
-use ic_tests::token_balance_test::{self, test as token_balance_test};
+use clap::Parser;
+use ic_fondue::pot::execution::TestResult;
+use ic_tests::driver::cli::CliArgs;
+use ic_tests::driver::driver_setup::{create_driver_context_from_cli, initialize_env, mk_logger};
+use ic_tests::driver::evaluation::evaluate;
+use ic_tests::driver::ic::VmAllocationStrategy;
+use ic_tests::driver::pot_dsl::*;
+use ic_tests::driver::test_env::TestEnv;
 use ic_tests::{
-    basic_health_test::{self, basic_health_test},
-    execution,
-};
-use ic_tests::{
-    cycles_minting_test, nns_canister_upgrade_test, registry_authentication_test,
-    ssh_access_to_nodes, subnet_creation, transaction_ledger_correctness_test, wasm_generator_test,
+    api_test, basic_health_test, boundary_nodes_integration, consensus, execution, ledger_tests,
+    message_routing, networking, nns_tests, orchestrator, rosetta_test, spec_compliance, tecdsa,
+    wasm_generator_test, workload_counter_canister_test,
 };
 use regex::Regex;
 use std::collections::HashMap;
-
-use structopt::StructOpt;
+use std::fs;
+use std::time::Duration;
 
 fn main() -> anyhow::Result<()> {
-    let cli_args = CliArgs::from_args();
+    let cli_args = CliArgs::parse();
     let validated_args = cli_args.validate()?;
 
     let mut writer = None;
@@ -45,14 +40,20 @@ fn main() -> anyhow::Result<()> {
         &validated_args.skip_pattern,
     );
 
-    let context = create_driver_context_from_cli(validated_args, get_hostname());
+    let system_env = validated_args.working_dir.join("system_env");
+    fs::create_dir(&system_env)?;
+    let logger = mk_logger();
+    let env = TestEnv::new(system_env, logger.clone())?;
+    initialize_env(&env, validated_args.clone())?;
+
+    let context = create_driver_context_from_cli(validated_args, env, get_hostname());
     let result = evaluate(&context, suite);
 
     if let Some(mut w) = writer {
         serde_json::to_writer_pretty(&mut w, &result)?;
     }
 
-    if !result.succeeded {
+    if result.result == TestResult::Failed {
         anyhow::bail!(format!("Test suite {} failed", result.name))
     } else {
         Ok(())
@@ -125,17 +126,56 @@ fn resolve_execution_mode(
 
 fn get_test_suites() -> HashMap<String, Suite> {
     let mut m = HashMap::new();
-    m.insert(
-        "main_suite".to_string(),
+    m.add_suite(
         suite(
-            "main_suite",
+            "pre_master",
             vec![
-                pot(
-                    "basic_health_pot",
-                    basic_health_test::config(),
+                pot_with_setup(
+                    "api_test",
+                    api_test::setup_two_ics,
                     par(vec![
-                        t("basic_health_test", basic_health_test),
-                        t("basic_health_test2", basic_health_test),
+                        sys_t("ics_have_correct_subnet_count", api_test::ics_have_correct_subnet_count),
+                        // sys_t("vm_control", api_test::vm_control), disabled due to flakiness
+                        sys_t("upload_file_to_farm", api_test::upload_file_to_farm),
+                        sys_t("install_counter_canister", api_test::install_counter_canister),
+                    ]),
+                ),
+                /* 
+                Disabled due to flakiness
+                pot_with_setup(
+                    "btc_pot",
+                    btc_integration::btc::config,
+                    par(vec![
+                        sys_t("btc_test", btc_integration::btc::test),
+                    ]),
+                ),
+                pot_with_setup(
+                    "http_pot",
+                    http_from_canister::basic_http::config,
+                    par(vec![
+                        sys_t("basic_http", http_from_canister::basic_http::test),
+                    ]),
+                ),*/
+                pot_with_setup(
+                    "boundary_nodes_pot",
+                    boundary_nodes_integration::boundary_nodes::config,
+                    par(vec![
+                        sys_t("boundary_nodes_test", boundary_nodes_integration::boundary_nodes::test),
+                        sys_t("boundary_nodes_nginx_test", boundary_nodes_integration::boundary_nodes::nginx_test),
+                    ]),
+                ),
+                pot(
+                    "firewall_pot",
+                    networking::firewall::config(),
+                    par(vec![
+                        t("change_to_firewall_rules_takes_effect", networking::firewall::change_to_firewall_rules_takes_effect),
+                    ]),
+                ),
+                pot(
+                    "create_subnet",
+                    nns_tests::create_subnet::config(),
+                    par(vec![
+                        t("create_subnet", nns_tests::create_subnet::test),
                     ]),
                 ),
                 execution::upgraded_pots::general_execution_pot(),
@@ -143,139 +183,443 @@ fn get_test_suites() -> HashMap<String, Suite> {
                 execution::upgraded_pots::inter_canister_queries(),
                 execution::upgraded_pots::compute_allocation_pot(),
                 pot(
+                    "global_reboot_pot",
+                    message_routing::global_reboot_test::config(),
+                    par(vec![t("global_reboot_test", message_routing::global_reboot_test::test)]),
+                ),
+                pot(
+                    "node_removal_from_registry_pot",
+                    nns_tests::node_removal_from_registry::config(),
+                    par(vec![t("node_removal_from_registry_test", nns_tests::node_removal_from_registry::test)]),
+                ),
+                pot(
+                    "node_assign_pot",
+                    orchestrator::node_assign_test::config(),
+                    par(vec![t("node_assign_test", orchestrator::node_assign_test::test)]),
+                ),
+                pot(
+                    "node_graceful_leaving_pot",
+                    consensus::node_graceful_leaving_test::config(),
+                    par(vec![t("node_graceful_leaving_test", consensus::node_graceful_leaving_test::test)]),
+                ),
+                pot(
                     "nns_follow_pot",
-                    nns_follow_test::config(),
-                    par(vec![t("follow_test", follow_test)]),
+                    nns_tests::nns_follow::config(),
+                    par(vec![t("follow_test", nns_tests::nns_follow::test)]),
                 ),
                 pot(
                     "nns_voting_pot",
-                    nns_voting_test::config(),
-                    par(vec![t("voting_test", voting_test)]),
+                    nns_tests::nns_voting::config(),
+                    par(vec![t("voting_test", nns_tests::nns_voting::test)]),
                 ),
                 pot(
                     "nns_token_balance_pot",
-                    token_balance_test::config(),
-                    par(vec![t("token_balance_test", token_balance_test)]),
-                ),
-                pot(
-                    "node_restart_pot",
-                    node_restart_test::config(),
-                    par(vec![t("node_restart_test", node_restart_test)]),
+                    ledger_tests::token_balance::config(),
+                    par(vec![t("token_balance_test", ledger_tests::token_balance::test)]),
                 ),
                 pot(
                     "cycles_minting_pot",
-                    cycles_minting_test::config(),
-                    par(vec![t("cycles_minting_test", cycles_minting_test::test)]),
-                ),
+                    nns_tests::cycles_minting::config(),
+                    par(vec![t("cycles_minting_test", nns_tests::cycles_minting::test)]),
+                ).with_ttl(Duration::from_secs(60 * 15 /* 15 minutes */)),
                 pot(
-                    "nns_subnet_creation_pot",
-                    subnet_creation::config(),
+                    "nns_voting_fuzzing_poc_pot",
+                    nns_tests::nns_voting_fuzzing_poc_test::config(),
                     par(vec![t(
-                        "create_subnet_with_assigned_nodes_fails",
-                        subnet_creation::create_subnet_with_assigned_nodes_fails,
+                        "nns_voting_fuzzing_poc_test",
+                        nns_tests::nns_voting_fuzzing_poc_test::test,
                     )]),
                 ),
                 pot(
-                    "nns_voting_fuzzing_poc_pot",
-                    nns_voting_fuzzing_poc_test::config(),
+                    "nns_canister_uninstall_pot",
+                    nns_tests::nns_uninstall_canister_by_proposal::config(),
                     par(vec![t(
-                        "nns_voting_fuzzing_poc_test",
-                        nns_voting_fuzzing_poc_test::test,
+                        "nns_uninstall_canister_by_proposal_test",
+                        nns_tests::nns_uninstall_canister_by_proposal::test,
                     )]),
                 ),
                 pot(
                     "nns_canister_upgrade_pot",
-                    nns_canister_upgrade_test::config(),
+                    nns_tests::nns_canister_upgrade::config(),
                     par(vec![t(
                         "nns_canister_upgrade_test",
-                        nns_canister_upgrade_test::test,
+                        nns_tests::nns_canister_upgrade::test,
                     )]),
                 ),
                 pot(
                     "certified_registry_pot",
-                    registry_authentication_test::config(),
+                    execution::registry_authentication_test::config(),
                     par(vec![t(
                         "registry_authentication_test",
-                        registry_authentication_test::test,
+                        execution::registry_authentication_test::test,
                     )]),
                 ),
                 pot(
                     "transaction_ledger_correctness_pot",
-                    transaction_ledger_correctness_test::config(),
+                    ledger_tests::transaction_ledger_correctness::config(),
                     par(vec![t(
                         "transaction_ledger_correctness_test",
-                        transaction_ledger_correctness_test::test,
+                        ledger_tests::transaction_ledger_correctness::test,
+                    )]),
+                ),
+                pot(
+                    "unassigned_node_upgrade_test_pot",
+                    orchestrator::unassigned_node_upgrade_test::config(),
+                    par(vec![t(
+                        "unassigned_node_upgrade_test",
+                        orchestrator::unassigned_node_upgrade_test::test,
                     )]),
                 ),
                 pot(
                     "ssh_access_to_nodes_pot",
-                    ssh_access_to_nodes::config(),
+                    orchestrator::ssh_access_to_nodes::config(),
                     seq(vec![
                         t(
                             "root_cannot_authenticate",
-                            ssh_access_to_nodes::root_cannot_authenticate,
+                            orchestrator::ssh_access_to_nodes::root_cannot_authenticate,
                         ),
                         t(
                             "readonly_cannot_authenticate_without_a_key",
-                            ssh_access_to_nodes::readonly_cannot_authenticate_without_a_key,
+                            orchestrator::ssh_access_to_nodes::readonly_cannot_authenticate_without_a_key,
                         ),
                         t(
                             "readonly_cannot_authenticate_with_random_key",
-                            ssh_access_to_nodes::readonly_cannot_authenticate_with_random_key,
+                            orchestrator::ssh_access_to_nodes::readonly_cannot_authenticate_with_random_key,
                         ),
                         t(
                             "keys_in_the_subnet_record_can_be_updated",
-                            ssh_access_to_nodes::keys_in_the_subnet_record_can_be_updated,
+                            orchestrator::ssh_access_to_nodes::keys_in_the_subnet_record_can_be_updated,
                         ),
                         t(
                             "keys_for_unassigned_nodes_can_be_updated",
-                            ssh_access_to_nodes::keys_for_unassigned_nodes_can_be_updated,
+                            orchestrator::ssh_access_to_nodes::keys_for_unassigned_nodes_can_be_updated,
                         ),
                         t(
                             "multiple_keys_can_access_one_account",
-                            ssh_access_to_nodes::multiple_keys_can_access_one_account,
+                            orchestrator::ssh_access_to_nodes::multiple_keys_can_access_one_account,
                         ),
                         t(
                             "multiple_keys_can_access_one_account_on_unassigned_nodes",
-                            ssh_access_to_nodes::multiple_keys_can_access_one_account_on_unassigned_nodes,
+                            orchestrator::ssh_access_to_nodes::multiple_keys_can_access_one_account_on_unassigned_nodes,
                         ),
                         t(
                             "updating_readonly_does_not_remove_backup_keys",
-                            ssh_access_to_nodes::updating_readonly_does_not_remove_backup_keys,
+                            orchestrator::ssh_access_to_nodes::updating_readonly_does_not_remove_backup_keys,
                         ),
                         t(
-                            "can_add_50_readonly_and_backup_keys",
-                            ssh_access_to_nodes::can_add_100_readonly_and_backup_keys,
+                            "can_add_max_number_of_readonly_and_backup_keys",
+                            orchestrator::ssh_access_to_nodes::can_add_max_number_of_readonly_and_backup_keys,
                         ),
                         t(
-                            "cannot_add_51_readonly_or_backup_keys",
-                            ssh_access_to_nodes::cannot_add_101_readonly_or_backup_keys,
+                            "cannot_add_more_than_max_number_of_readonly_or_backup_keys",
+                            orchestrator::ssh_access_to_nodes::cannot_add_more_than_max_number_of_readonly_or_backup_keys,
                         ),
                     ]),
-                ),
-                pot(
-                    "nns_fault_tolerance_pot",
-                    nns_fault_tolerance_test::config(),
-                    par(vec![t(
-                        "nns_fault_tolerance_test",
-                        nns_fault_tolerance_test::test,
-                    )]),
                 ),
             ],
         ),
     );
-    m.insert(
-        "wasm_generator_suite".to_string(),
-        suite(
-            "wasm_generator_suite",
-            // This pot, unlike all pots from the main suite, requires an additional step,
-            // which has to be completed before running a driver binary.
-            vec![pot(
-                "wasm_generator_pot",
-                wasm_generator_test::config(),
-                par(vec![t("wasm_generator_pot", wasm_generator_test::test)]),
-            )],
-        ),
-    );
+
+    let xnet_slo_3_subnets = message_routing::xnet_slo_test::config_hotfix_slo_3_subnets();
+    m.add_suite(suite(
+        "hotfix",
+        vec![pot(
+            "xnet_slo_3_subnets_pot",
+            xnet_slo_3_subnets.build(),
+            par(vec![t(
+                "xnet_slo_3_subnets_test",
+                xnet_slo_3_subnets.test(),
+            )]),
+        )
+        .with_ttl(Duration::from_secs(10 * 60))],
+    ));
+
+    let xnet_slo_3_subnets = message_routing::xnet_slo_test::config_prod_slo_3_subnets();
+    let xnet_slo_29_subnets = message_routing::xnet_slo_test::config_prod_slo_29_subnets();
+    m.add_suite(suite(
+        "prod_slo",
+        vec![
+            pot(
+                "xnet_slo_3_subnets_pot",
+                xnet_slo_3_subnets.build(),
+                par(vec![t(
+                    "xnet_slo_3_subnets_test",
+                    xnet_slo_3_subnets.test(),
+                )]),
+            )
+            .with_ttl(Duration::from_secs(30 * 60)),
+            pot(
+                "xnet_slo_29_subnets_pot",
+                xnet_slo_29_subnets.build(),
+                par(vec![t(
+                    "xnet_slo_29_subnets_test",
+                    xnet_slo_29_subnets.test(),
+                )]),
+            )
+            .with_ttl(Duration::from_secs(50 * 60)),
+        ],
+    ));
+
+    let xnet_nightly_3_subnets = message_routing::xnet_slo_test::config_nightly_3_subnets();
+    let xnet_nightly_29_subnets = message_routing::xnet_slo_test::config_nightly_29_subnets();
+    m.add_suite(suite(
+        "nightly",
+        vec![
+            pot(
+                "xnet_slo_3_subnets_pot",
+                xnet_nightly_3_subnets.build(),
+                par(vec![t(
+                    "xnet_slo_3_subnets_test",
+                    xnet_nightly_3_subnets.test(),
+                )]),
+            )
+            .with_ttl(Duration::from_secs(30 * 60)),
+            pot(
+                "xnet_slo_29_subnets_pot",
+                xnet_nightly_29_subnets.build(),
+                par(vec![t(
+                    "xnet_slo_29_subnets_test",
+                    xnet_nightly_29_subnets.test(),
+                )]),
+            )
+            .with_ttl(Duration::from_secs(50 * 60)),
+            pot(
+                "two_third_latency_pot",
+                workload_counter_canister_test::two_third_latency_config(),
+                par(vec![t(
+                    "workload_counter_canister_test",
+                    workload_counter_canister_test::two_third_latency_test,
+                )]),
+            )
+            .with_ttl(Duration::from_secs(50 * 60)) //test should last 10min only
+            .with_vm_allocation(VmAllocationStrategy::DistributeAcrossDcs),
+        ],
+    ));
+
+    m.add_suite(suite(
+        "hourly",
+        vec![
+            pot_with_setup(
+                "basic_health_pot_single_host",
+                basic_health_test::config_single_host,
+                par(vec![sys_t("basic_health_test", basic_health_test::test)]),
+            ),
+            pot(
+                "node_reassignment_pot",
+                orchestrator::node_reassignment_test::config(),
+                par(vec![t(
+                    "node_reassignment_test",
+                    orchestrator::node_reassignment_test::test,
+                )]),
+            ),
+            pot(
+                "nns_fault_tolerance_pot",
+                ledger_tests::token_fault_tolerance::config(),
+                par(vec![t(
+                    "token_fault_tolerance_test",
+                    ledger_tests::token_fault_tolerance::test,
+                )]),
+            ),
+            pot(
+                "create_subnet",
+                nns_tests::create_subnet::config(),
+                par(vec![t("create_subnet", nns_tests::create_subnet::test)]),
+            ),
+            pot(
+                "upgrade_reject_pot",
+                orchestrator::upgrade_reject::config(),
+                par(vec![t(
+                    "upgrade_reject_test",
+                    orchestrator::upgrade_reject::test,
+                )]),
+            ),
+            pot(
+                "tecdsa_add_nodes_pot",
+                tecdsa::tecdsa_add_nodes_test::config(),
+                par(vec![t(
+                    "test_tecdsa_add_nodes",
+                    tecdsa::tecdsa_add_nodes_test::test,
+                )]),
+            ),
+            pot(
+                "tecdsa_remove_nodes_pot",
+                tecdsa::tecdsa_remove_nodes_test::config(),
+                par(vec![t(
+                    "test_tecdsa_remove_nodes",
+                    tecdsa::tecdsa_remove_nodes_test::test,
+                )]),
+            )
+            .with_ttl(Duration::from_secs(15 * 60)), // 15 minutes
+            pot(
+                "rejoin",
+                message_routing::rejoin_test::config(),
+                par(vec![t("rejoin", message_routing::rejoin_test::test)]),
+            ),
+            pot_with_setup(
+                "tecdsa_signature_same_subnet_pot",
+                tecdsa::tecdsa_signature_test::config,
+                seq(vec![t(
+                    "test_threshold_ecdsa_signature_same_subnet",
+                    tecdsa::tecdsa_signature_test::test_threshold_ecdsa_signature_same_subnet,
+                )])
+            ),
+            /* This test is WIP (#CON-779)
+            pot_with_setup(
+                "tecdsa_signature_from_other_subnet_pot",
+                tecdsa::tecdsa_signature_test::config,
+                seq(vec![t(
+                    "test_threshold_ecdsa_signature_from_other_subnet",
+                    tecdsa::tecdsa_signature_test::test_threshold_ecdsa_signature_from_other_subnet,
+                )])
+            ),*/
+            pot_with_setup(
+                "tecdsa_signature_fails_without_cycles_pot",
+                tecdsa::tecdsa_signature_test::config,
+                seq(vec![t(
+                    "test_threshold_ecdsa_signature_fails_without_cycles",
+                    tecdsa::tecdsa_signature_test::test_threshold_ecdsa_signature_fails_without_cycles,
+                )])
+            ),
+            /* This test is WIP (#CON-779)
+            pot_with_setup(
+                "tecdsa_signature_from_nns_without_cycles_pot",
+                tecdsa::tecdsa_signature_test::config,
+                seq(vec![t(
+                    "test_threshold_ecdsa_signature_from_nns_without_cycles",
+                    tecdsa::tecdsa_signature_test::test_threshold_ecdsa_signature_from_nns_without_cycles,
+                )])
+            ),*/
+            pot(
+                "update_registry_idkg_key_pot",
+                orchestrator::update_registry_idkg_key::config(),
+                par(vec![t(
+                    "update_registry_idkg_key_test",
+                    orchestrator::update_registry_idkg_key::test,
+                )]),
+            ),
+            pot(
+                "nns_backup_pot",
+                orchestrator::nns_backup::config(),
+                par(vec![t("nns_backup_test", orchestrator::nns_backup::test)]),
+            )
+            .with_ttl(Duration::from_secs(7200)),
+            pot(
+                "workload_counter_canister_pot",
+                workload_counter_canister_test::config(),
+                par(vec![t(
+                    "workload_counter_canister_test",
+                    workload_counter_canister_test::short_test,
+                )]),
+            ),
+        ],
+    ));
+
+    // The tests in this suite require canisters to be build prior to
+    // running the tests which is why we separate it out.
+    m.add_suite(suite(
+        "wasm_generator",
+        vec![pot(
+            "wasm_generator_pot",
+            wasm_generator_test::config(),
+            par(vec![t("wasm_generator_test", wasm_generator_test::test)]),
+        )
+        .with_ttl(Duration::from_secs(7200))],
+    ));
+
+    m.add_suite(suite(
+        "subnet_recovery",
+        vec![
+            pot_with_setup(
+                "subnet_recovery_app_same_nodes",
+                orchestrator::subnet_recovery_app_subnet::setup_same_nodes,
+                par(vec![sys_t(
+                    "subnet_recovery_app_same_nodes",
+                    orchestrator::subnet_recovery_app_subnet::test,
+                )]),
+            )
+            .with_ttl(Duration::from_secs(1800)),
+            pot_with_setup(
+                "subnet_recovery_app_failover_nodes",
+                orchestrator::subnet_recovery_app_subnet::setup_failover_nodes,
+                par(vec![sys_t(
+                    "subnet_recovery_app_failover_nodes",
+                    orchestrator::subnet_recovery_app_subnet::test,
+                )]),
+            )
+            .with_ttl(Duration::from_secs(1800)),
+        ],
+    ));
+
+    m.add_suite(suite(
+        "upgrade_compatibility",
+        vec![
+            pot(
+                "upgrade_downgrade_app_subnet",
+                orchestrator::upgrade_downgrade::config(),
+                par(vec![t(
+                    "upgrade_downgrade_app_subnet",
+                    orchestrator::upgrade_downgrade::upgrade_downgrade_app_subnet,
+                )]),
+            )
+            .with_ttl(Duration::from_secs(1800)),
+            pot(
+                "upgrade_downgrade_nns_subnet",
+                orchestrator::upgrade_downgrade::config(),
+                par(vec![t(
+                    "upgrade_downgrade_nns_subnet",
+                    orchestrator::upgrade_downgrade::upgrade_downgrade_nns_subnet,
+                )]),
+            )
+            .with_ttl(Duration::from_secs(1800)),
+        ],
+    ));
+
+    m.add_suite(suite(
+        "rosetta",
+        vec![pot(
+            "rosetta_pot",
+            rosetta_test::config(),
+            par(vec![t(
+                "rosetta_test_everything",
+                rosetta_test::test_everything,
+            )]),
+        )
+        .with_ttl(Duration::from_secs(60 * 12))], // 12 minutes
+    ));
+
+    m.add_suite(suite(
+        "spec_compliance",
+        vec![
+            pot(
+                "spec_compliance_with_system_subnet",
+                spec_compliance::ic_with_system_subnet(),
+                seq(vec![t(
+                    "with_system_subnet",
+                    spec_compliance::test_system_subnet,
+                )]),
+            ),
+            pot(
+                "spec_compliance_with_app_subnet",
+                spec_compliance::ic_with_app_subnet(),
+                seq(vec![t("with_app_subnet", spec_compliance::test_app_subnet)]),
+            ),
+        ],
+    ));
+
     m
+}
+
+trait TestCatalog {
+    fn add_suite(&mut self, suite: Suite);
+}
+
+impl TestCatalog for HashMap<String, Suite> {
+    fn add_suite(&mut self, suite: Suite) {
+        use std::collections::hash_map::Entry;
+        if let Entry::Vacant(e) = self.entry(suite.name.clone()) {
+            e.insert(suite);
+        } else {
+            panic!("Redefinition of suite {:?}", suite.name)
+        }
+    }
 }

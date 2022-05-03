@@ -24,8 +24,8 @@ use ic_interfaces::{
     ingress_manager::IngressSelector,
     messaging::{MessageRouting, MessageRoutingError},
     registry::RegistryClient,
-    state_manager::StateManager,
 };
+use ic_interfaces_state_manager::StateManager;
 use ic_logger::{debug, trace, ReplicaLogger};
 use ic_metrics::MetricsRegistry;
 use ic_replicated_state::ReplicatedState;
@@ -349,9 +349,10 @@ impl Finalizer {
 mod tests {
     //! Finalizer unit tests
     use super::*;
-    use crate::consensus::generate_responses_to_subnet_calls;
+    use crate::consensus::batch_delivery::generate_responses_to_setup_initial_dkg_calls;
     use crate::consensus::mocks::{dependencies, dependencies_with_subnet_params, Dependencies};
-    use ic_interfaces::state_manager::Labeled;
+    use ic_ic00_types::SetupInitialDKGResponse;
+    use ic_interfaces_state_manager::Labeled;
     use ic_logger::replica_logger::no_op_logger;
     use ic_metrics::MetricsRegistry;
     use ic_registry_subnet_type::SubnetType;
@@ -361,15 +362,14 @@ mod tests {
     use ic_test_utilities::{
         ingress_selector::FakeIngressSelector,
         message_routing::FakeMessageRouting,
-        registry::SubnetRecordBuilder,
         state_manager::{FakeStateManager, MockStateManager},
         types::ids::{node_test_id, subnet_test_id},
     };
+    use ic_test_utilities_registry::SubnetRecordBuilder;
     use ic_types::{
         crypto::threshold_sig::ni_dkg::{
             NiDkgId, NiDkgTag, NiDkgTargetId, NiDkgTargetSubnet, NiDkgTranscript,
         },
-        ic00::SetupInitialDKGResponse,
         messages::{CallbackId, Request},
     };
     use std::collections::BTreeMap;
@@ -647,11 +647,16 @@ mod tests {
         .collect::<BTreeMap<_, _>>();
 
         // Run the function
-        let result = generate_responses_to_subnet_calls(
-            &state_manager,
-            Height::from(1),
+        use ic_interfaces_state_manager::StateReader;
+        let state = state_manager.get_state_at(Height::from(1)).unwrap();
+        let setup_initial_dkg_contexts = &state
+            .get_ref()
+            .metadata
+            .subnet_call_context_manager
+            .setup_initial_dkg_contexts;
+        let result = generate_responses_to_setup_initial_dkg_calls(
+            setup_initial_dkg_contexts,
             &transcripts_for_new_subnets,
-            ic_test_utilities::mock_time(),
             &no_op_logger(),
         );
         assert_eq!(result.len(), 1);

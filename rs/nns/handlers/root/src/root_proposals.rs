@@ -1,8 +1,3 @@
-use crate::canister_management::do_change_nns_canister;
-use crate::common::{
-    CanisterIdRecord, CanisterStatusResult, ChangeNnsCanisterProposalPayload, LOG_PREFIX,
-};
-
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::convert::TryFrom;
@@ -13,7 +8,11 @@ use candid::{CandidType, Deserialize};
 use dfn_core::api::{call, now, CanisterId};
 #[cfg(target_arch = "wasm32")]
 use dfn_core::println;
-use ic_base_types::{CanisterInstallMode, NodeId, PrincipalId, SubnetId};
+use ic_base_types::{NodeId, PrincipalId, SubnetId};
+use ic_ic00_types::CanisterInstallMode;
+use ic_nervous_system_root::{
+    change_canister, CanisterIdRecord, CanisterStatusResult, ChangeCanisterProposal, LOG_PREFIX,
+};
 use ic_nns_common::registry::get_value;
 use ic_nns_constants::GOVERNANCE_CANISTER_ID;
 use ic_protobuf::registry::{
@@ -86,7 +85,7 @@ pub struct GovernanceUpgradeRootProposal {
     /// governance canister.
     pub current_wasm_sha: Vec<u8>,
     /// The proposal payload to ugprade the governance canister.
-    pub payload: ChangeNnsCanisterProposalPayload,
+    pub payload: ChangeCanisterProposal,
     /// The sha of the binary the proposer wants to upgrade to.
     pub proposed_wasm_sha: Vec<u8>,
     /// The principal id of the proposer (must be one of the node
@@ -174,7 +173,7 @@ async fn get_current_governance_canister_wasm() -> Vec<u8> {
 pub async fn submit_root_proposal_to_upgrade_governance_canister(
     caller: PrincipalId,
     expected_governance_wasm_sha: Vec<u8>,
-    payload: ChangeNnsCanisterProposalPayload,
+    proposal: ChangeCanisterProposal,
 ) -> Result<(), String> {
     let now = now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -186,9 +185,9 @@ pub async fn submit_root_proposal_to_upgrade_governance_canister(
     // - That the wasm has some bytes in it.
     // - That it targets the governance canister.
     // - That it is an upgrade (reinstall is not supported).
-    if payload.wasm_module.is_empty()
-        || payload.canister_id != GOVERNANCE_CANISTER_ID
-        || payload.mode != CanisterInstallMode::Upgrade
+    if proposal.wasm_module.is_empty()
+        || proposal.canister_id != GOVERNANCE_CANISTER_ID
+        || proposal.mode != CanisterInstallMode::Upgrade
     {
         let message = format!(
             "{}Invalid proposal. Proposal must be an upgrade proposal \
@@ -267,7 +266,7 @@ pub async fn submit_root_proposal_to_upgrade_governance_canister(
         // Store the proposal, the current list of principals that can vote,
         // together with the version number and as many votes for 'yes' as the
         // number of nodes the caller's principal operates, in the nns subnetwork.
-        let proposed_wasm_sha = ic_crypto_sha::Sha256::hash(&payload.wasm_module).to_vec();
+        let proposed_wasm_sha = ic_crypto_sha::Sha256::hash(&proposal.wasm_module).to_vec();
 
         proposals.borrow_mut().insert(
             caller,
@@ -275,7 +274,7 @@ pub async fn submit_root_proposal_to_upgrade_governance_canister(
                 nns_subnet_id,
                 current_wasm_sha: current_governance_wasm_sha.clone(),
                 proposed_wasm_sha: proposed_wasm_sha.clone(),
-                payload,
+                payload: proposal,
                 proposer: caller,
                 node_operator_ballots,
                 subnet_membership_registry_version,
@@ -439,7 +438,7 @@ pub async fn vote_on_root_proposal_to_upgrade_governance_canister(
             println!("{}", message);
             return Err(message);
         }
-        do_change_nns_canister(payload).await;
+        change_canister(payload).await;
         Ok(())
     } else if proposal.is_byzantine_majority_no() {
         PROPOSALS.with(|proposals| proposals.borrow_mut().remove(&proposer));
@@ -490,7 +489,7 @@ pub fn get_pending_root_proposals_to_upgrade_governance_canister(
 /// figure out which subnet has the governance canister's id.
 async fn get_nns_subnet_id() -> Result<SubnetId, String> {
     let routing_table = RoutingTable::try_from(
-        get_value::<RoutingTablePb>(&make_routing_table_record_key().as_bytes().to_vec(), None)
+        get_value::<RoutingTablePb>(make_routing_table_record_key().as_bytes(), None)
             .await
             .map_err(|e| {
                 format!(
@@ -513,12 +512,10 @@ async fn get_nns_subnet_id() -> Result<SubnetId, String> {
 /// Returns the membership for the nns subnetwork, and the version at which it
 /// was fetched.
 async fn get_nns_membership(subnet_id: &SubnetId) -> Result<(Vec<NodeId>, u64), String> {
-    let (subnet_registry_entry, version) = get_value::<SubnetRecordPb>(
-        &make_subnet_record_key(*subnet_id).as_bytes().to_vec(),
-        None,
-    )
-    .await
-    .map_err(|e| format!("Error getting membership of nns subnet. Error: {:?}", e))?;
+    let (subnet_registry_entry, version) =
+        get_value::<SubnetRecordPb>(make_subnet_record_key(*subnet_id).as_bytes(), None)
+            .await
+            .map_err(|e| format!("Error getting membership of nns subnet. Error: {:?}", e))?;
 
     Ok((
         subnet_registry_entry
@@ -537,17 +534,15 @@ async fn get_node_operator_pid_of_node(
     node_id: &NodeId,
     version: u64,
 ) -> Result<PrincipalId, String> {
-    let (node_record, _) = get_value::<NodeRecordPb>(
-        &make_node_record_key(*node_id).as_bytes().to_vec(),
-        Some(version),
-    )
-    .await
-    .map_err(|e| {
-        format!(
-            "Error getting the node record from the registry. Error: {:?}",
-            e
-        )
-    })?;
+    let (node_record, _) =
+        get_value::<NodeRecordPb>(make_node_record_key(*node_id).as_bytes(), Some(version))
+            .await
+            .map_err(|e| {
+                format!(
+                    "Error getting the node record from the registry. Error: {:?}",
+                    e
+                )
+            })?;
     PrincipalId::try_from(node_record.node_operator_id).map_err(|e| {
         format!(
             "Error decoding the node operator id from the node record. Error: {:?}",

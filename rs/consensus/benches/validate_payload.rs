@@ -11,22 +11,24 @@
 //!   the message validates successfully
 
 use criterion::{criterion_group, criterion_main, Criterion};
-use ic_artifact_pool::consensus_pool::ConsensusPoolImpl;
+use ic_artifact_pool::{consensus_pool::ConsensusPoolImpl, ingress_pool::IngressPoolImpl};
 use ic_config::state_manager::Config as StateManagerConfig;
 use ic_consensus::consensus::{
     payload_builder::{PayloadBuilder, PayloadBuilderImpl},
     pool_reader::PoolReader,
 };
 use ic_consensus_message::ConsensusMessageHashable;
+use ic_constants::MAX_INGRESS_TTL;
 use ic_execution_environment::IngressHistoryReaderImpl;
+use ic_ic00_types::IC_00;
 use ic_ingress_manager::IngressManager;
 use ic_interfaces::{
     consensus::PayloadValidationError,
     consensus_pool::{ChangeAction, ChangeSet, ConsensusPool, MutableConsensusPool},
-    state_manager::{CertificationScope, StateManager},
     time_source::TimeSource,
     validation::ValidationResult,
 };
+use ic_interfaces_state_manager::{CertificationScope, StateManager};
 use ic_logger::replica_logger::no_op_logger;
 use ic_metrics::MetricsRegistry;
 use ic_registry_subnet_type::SubnetType;
@@ -35,7 +37,6 @@ use ic_test_utilities::{
     consensus::{fake::*, make_genesis, MockConsensusCache},
     crypto::temp_crypto_component_with_fake_registry,
     cycles_account_manager::CyclesAccountManagerBuilder,
-    registry::{setup_registry, SubnetRecordBuilder},
     self_validating_payload_builder::FakeSelfValidatingPayloadBuilder,
     state::ReplicatedStateBuilder,
     state_manager::MockStateManager,
@@ -44,16 +45,17 @@ use ic_test_utilities::{
     xnet_payload_builder::FakeXNetPayloadBuilder,
     FastForwardTimeSource,
 };
+use ic_test_utilities_registry::{setup_registry, SubnetRecordBuilder};
 use ic_types::{
-    batch::{BatchPayload, IngressPayload, SelfValidatingPayload, ValidationContext, XNetPayload},
+    batch::{BatchPayload, IngressPayload, ValidationContext},
     consensus::certification::*,
     consensus::*,
     crypto::Signed,
-    ic00::IC_00,
-    ingress::{IngressStatus, MAX_INGRESS_TTL},
-    Height, PrincipalId, RegistryVersion, Time, UserId,
+    ingress::IngressStatus,
+    signature::*,
+    Height, NumBytes, PrincipalId, RegistryVersion, Time, UserId,
 };
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 type SignedCertificationContent =
@@ -92,6 +94,7 @@ where
             no_op_logger(),
             &metrics_registry,
             &StateManagerConfig::new(tmpdir.path().to_path_buf()),
+            None,
             ic_types::malicious_flags::MaliciousFlags::default(),
         );
         setup_ingress_state(now, &mut state_manager);
@@ -104,7 +107,7 @@ where
         let mut consensus_pool = ConsensusPoolImpl::new_from_cup_without_bytes(
             subnet_test_id(0),
             make_genesis(summary),
-            pool_config,
+            pool_config.clone(),
             ic_metrics::MetricsRegistry::new(),
             no_op_logger(),
         );
@@ -116,11 +119,17 @@ where
         ));
         let mut state_manager = MockStateManager::new();
         state_manager.expect_get_state_at().return_const(Ok(
-            ic_interfaces::state_manager::Labeled::new(
+            ic_interfaces_state_manager::Labeled::new(
                 Height::new(0),
                 Arc::new(ReplicatedStateBuilder::default().build()),
             ),
         ));
+
+        let ingress_pool = Arc::new(RwLock::new(IngressPoolImpl::new(
+            pool_config,
+            metrics_registry.clone(),
+            no_op_logger(),
+        )));
 
         let registry_client = setup_registry(
             subnet_id,
@@ -130,6 +139,7 @@ where
         let ingress_manager = Arc::new(IngressManager::new(
             Arc::new(MockConsensusCache::new()),
             Box::new(ingress_hist_reader),
+            ingress_pool,
             registry_client.clone(),
             ingress_signature_crypto,
             metrics_registry.clone(),
@@ -185,6 +195,7 @@ fn setup_ingress_state(now: Time, state_manager: &mut StateManagerImpl) {
                 time: now,
             },
             now,
+            NumBytes::from(u64::MAX),
         );
     }
 
@@ -243,13 +254,15 @@ fn add_past_blocks(
         let mut block = Block::from_parent(&parent);
         block.rank = Rank(i as u64);
         let ingress = prepare_ingress_payload(now, message_count, i as u8);
-        let xnet = XNetPayload::default();
-        let self_validating = SelfValidatingPayload::default();
         block.payload = Payload::new(
             ic_crypto::crypto_hash,
             (
-                BatchPayload::new(ingress, xnet, self_validating),
+                BatchPayload {
+                    ingress,
+                    ..BatchPayload::default()
+                },
                 dkg::Dealings::new_empty(block.payload.as_ref().dkg_interval_start_height()),
+                None,
             )
                 .into(),
         );
@@ -307,13 +320,15 @@ fn validate_payload_benchmark(criterion: &mut Criterion) {
 
                 let seed = CERTIFIED_HEIGHT + PAST_PAYLOAD_HEIGHT + 10;
                 let ingress = prepare_ingress_payload(now, message_count, seed as u8);
-                let xnet = XNetPayload::default();
-                let self_validating = SelfValidatingPayload::default();
                 let payload = Payload::new(
                     ic_crypto::crypto_hash,
                     (
-                        BatchPayload::new(ingress, xnet, self_validating),
+                        BatchPayload {
+                            ingress,
+                            ..BatchPayload::default()
+                        },
                         dkg::Dealings::new_empty(tip.payload.as_ref().dkg_interval_start_height()),
+                        None,
                     )
                         .into(),
                 );

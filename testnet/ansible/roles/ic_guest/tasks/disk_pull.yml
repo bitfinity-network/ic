@@ -6,15 +6,17 @@
     # check if disk image is available on the new or the old location for the given hash
     CDN_URL="https://download.dfinity.systems"
 
-    disk_types=(generic replica)
+    disk_types=(generic replica boundary)
     declare -A image_cdn=(
       [replica]="${CDN_URL}/ic/{{ ic_git_revision }}/guest-os/disk-img-dev"
       [generic]="${CDN_URL}/ic/{{ ic_git_revision }}/generic-guest-os/disk-img"
+      [boundary]="${CDN_URL}/ic/{{ ic_git_revision }}/boundary-os/disk-img"
     )
 
     declare -A image_dir=(
       [replica]="/var/local/ic/disk/{{ ic_deployment_name }}/{{ ic_git_revision }}"
       [generic]="/var/local/ic/disk/{{ ic_deployment_name }}/{{ ic_git_revision }}/generic"
+      [boundary]="/var/local/ic/disk/{{ ic_deployment_name }}/{{ ic_git_revision }}/boundary"
     )
 
     function curl_disk_img() {
@@ -36,7 +38,7 @@
       sha256sum -c SHA256SUMS
     }
 
-    # download the IC-OS disk images for replica and generic (boundary nodes), in parallel
+    # download the IC-OS disk images for replica, boundary and generic, in parallel
     set +x
     source /usr/bin/env_parallel.bash
     env_parallel curl_disk_img ::: "${disk_types[@]}"
@@ -54,11 +56,11 @@
     # if the unpacked file does not exist or if the archive is newer than the unpacked file
     set -eExuo pipefail
 
-    disk_types=(generic replica)
-
+    disk_types=(generic replica boundary)
     declare -A image_dir=(
-      [replica]="/var/local/ic/disk/{{ ic_deployment_name }}/{{ ic_git_revision }}"
-      [generic]="/var/local/ic/disk/{{ ic_deployment_name }}/{{ ic_git_revision }}/generic"
+        [replica]="/var/local/ic/disk/{{ ic_deployment_name }}/{{ ic_git_revision }}"
+        [generic]="/var/local/ic/disk/{{ ic_deployment_name }}/{{ ic_git_revision }}/generic"
+        [boundary]="/var/local/ic/disk/{{ ic_deployment_name }}/{{ ic_git_revision }}/boundary"
     )
 
     # unarchive each disk type

@@ -13,7 +13,7 @@ use rand::{CryptoRng, Rng};
 #[cfg(test)]
 mod tests;
 
-impl<R: Rng + CryptoRng, S: SecretKeyStore, C: SecretKeyStore> BasicSignatureCspVault
+impl<R: Rng + CryptoRng + Send + Sync, S: SecretKeyStore, C: SecretKeyStore> BasicSignatureCspVault
     for LocalCspVault<R, S, C>
 {
     fn sign(
@@ -31,9 +31,9 @@ impl<R: Rng + CryptoRng, S: SecretKeyStore, C: SecretKeyStore> BasicSignatureCsp
                 })?;
 
         match algorithm_id {
-            AlgorithmId::Ed25519 => match secret_key {
+            AlgorithmId::Ed25519 => match &secret_key {
                 CspSecretKey::Ed25519(secret_key) => {
-                    let sig_bytes = ed25519::sign(message, &secret_key).map_err(|_e| {
+                    let sig_bytes = ed25519::sign(message, secret_key).map_err(|_e| {
                         CspBasicSignatureError::MalformedSecretKey {
                             algorithm: AlgorithmId::Ed25519,
                         }

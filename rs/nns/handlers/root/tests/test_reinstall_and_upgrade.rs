@@ -3,10 +3,9 @@ use candid::Encode;
 use canister_test::{Project, Runtime};
 use dfn_candid::candid;
 
-use ic_base_types::CanisterInstallMode::{self, Install, Reinstall, Upgrade};
-use ic_nns_handler_root::common::CanisterStatusType::Running;
-use ic_nns_handler_root::common::{
-    CanisterIdRecord, CanisterStatusResult, ChangeNnsCanisterProposalPayload,
+use ic_ic00_types::CanisterInstallMode::{self, Install, Reinstall, Upgrade};
+use ic_nervous_system_root::{
+    CanisterIdRecord, CanisterStatusResult, CanisterStatusType::Running, ChangeCanisterProposal,
 };
 use ic_nns_handler_root::init::RootCanisterInitPayload;
 use ic_nns_test_utils::itest_helpers::{
@@ -64,12 +63,9 @@ async fn install_stable_memory_reader(
         .await
         .unwrap();
 
-    let proposal_payload = ChangeNnsCanisterProposalPayload::new(
-        stop_before_installing,
-        mode,
-        universal.canister_id(),
-    )
-    .with_wasm(STABLE_MEMORY_READER_WASM.clone());
+    let proposal =
+        ChangeCanisterProposal::new(stop_before_installing, mode, universal.canister_id())
+            .with_wasm(STABLE_MEMORY_READER_WASM.clone());
 
     // The upgrade should work
     assert!(
@@ -77,7 +73,7 @@ async fn install_stable_memory_reader(
             &fake_proposal_canister,
             &root,
             "change_nns_canister",
-            Encode!(&proposal_payload).unwrap()
+            Encode!(&proposal).unwrap()
         )
         .await
     );
@@ -154,8 +150,8 @@ fn test_reinstall_loses_stable_memory_stop() {
 
 #[test]
 fn test_init_payload_is_passed_through_upgrades() {
-    let proj = Project::new(env!("CARGO_MANIFEST_DIR"));
-    let test_wasm = proj.cargo_bin("upgrade-test-canister").bytes();
+    let proj = Project::new(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    let test_wasm = proj.cargo_bin("upgrade-test-canister", &[]).bytes();
     let test_wasm_sha256 = ic_crypto_sha::Sha256::hash(&test_wasm);
     let test_byte_array = b"just_testing";
 
@@ -178,10 +174,9 @@ fn test_init_payload_is_passed_through_upgrades() {
             .await
             .unwrap();
 
-        let proposal_payload =
-            ChangeNnsCanisterProposalPayload::new(false, Upgrade, universal.canister_id())
-                .with_wasm(test_wasm)
-                .with_arg(test_byte_array.to_vec());
+        let proposal = ChangeCanisterProposal::new(false, Upgrade, universal.canister_id())
+            .with_wasm(test_wasm)
+            .with_arg(test_byte_array.to_vec());
 
         // The upgrade should work
         assert!(
@@ -189,7 +184,7 @@ fn test_init_payload_is_passed_through_upgrades() {
                 &fake_proposal_canister,
                 &root,
                 "change_nns_canister",
-                Encode!(&proposal_payload).unwrap()
+                Encode!(&proposal).unwrap()
             )
             .await
         );

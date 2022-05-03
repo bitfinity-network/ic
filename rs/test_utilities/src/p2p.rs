@@ -1,22 +1,20 @@
 //! This file contains the helper functions required to setup testing framework.
 
-use crate::{
-    registry::{setup_registry_non_final, SubnetRecordBuilder},
-    types::ids::node_test_id,
+use crate::types::ids::node_test_id;
+use ic_config::{
+    logger::{default_logtarget, Config as LoggerConfig, LogFormat},
+    transport::{TransportConfig, TransportFlowConfig},
 };
-use ic_config::logger::{default_logtarget, Config as LoggerConfig, LogFormat};
-use ic_interfaces::{p2p::P2PRunner, registry::RegistryClient};
+use ic_interfaces::registry::RegistryClient;
 use ic_logger::*;
 use ic_metrics::MetricsRegistry;
+use ic_p2p::P2PThreadJoiner;
 use ic_protobuf::registry::node::v1::{
     connection_endpoint::Protocol, ConnectionEndpoint, FlowEndpoint, NodeRecord,
 };
-use ic_registry_common::proto_registry_data_provider::ProtoRegistryDataProvider;
-use ic_types::{
-    replica_config::ReplicaConfig,
-    transport::{TransportConfig, TransportFlowConfig},
-    NodeId, RegistryVersion, SubnetId,
-};
+use ic_registry_proto_data_provider::ProtoRegistryDataProvider;
+use ic_test_utilities_registry::{setup_registry_non_final, SubnetRecordBuilder};
+use ic_types::{replica_config::ReplicaConfig, NodeId, RegistryVersion, SubnetId};
 
 use ic_registry_keys::make_node_record_key;
 use std::collections::HashMap;
@@ -37,7 +35,7 @@ pub fn get_nodes_from_registry(
     registry: Arc<dyn RegistryClient>,
     subnet_id: SubnetId,
 ) -> Vec<(NodeId, NodeRecord)> {
-    use ic_registry_client::helper::subnet::SubnetTransportRegistry;
+    use ic_registry_client_helpers::subnet::SubnetTransportRegistry;
     let latest_version = registry.get_latest_version();
     registry
         .get_subnet_transport_infos(subnet_id, latest_version)
@@ -67,7 +65,7 @@ pub struct P2PTestContext {
     pub subnet_id: SubnetId,               // Dummy test subnet ID
     pub metrics_registry: MetricsRegistry, // monitor metrics from various ICP layers
     pub test_synchronizer: P2PTestSynchronizer, // Provide basic inter-test synchronization
-    pub p2p: Box<dyn P2PRunner>,           // p2p object to drive the ICP stack
+    pub _p2p_thread_joiner: P2PThreadJoiner, // p2p object to drive the ICP stack
 }
 
 impl P2PTestContext {
@@ -76,7 +74,7 @@ impl P2PTestContext {
         subnet_id: SubnetId,
         metrics_registry: MetricsRegistry,
         test_synchronizer: P2PTestSynchronizer,
-        p2p: Box<dyn P2PRunner>,
+        p2p_thread_joiner: P2PThreadJoiner,
     ) -> Self {
         P2PTestContext {
             node_num,
@@ -84,7 +82,7 @@ impl P2PTestContext {
             subnet_id,
             metrics_registry,
             test_synchronizer,
-            p2p,
+            _p2p_thread_joiner: p2p_thread_joiner,
         }
     }
 }
@@ -109,7 +107,7 @@ pub struct P2PTestSynchronizer {
     test_dir_path: std::path::PathBuf,
     pub node_id: NodeId,
     num_replicas: u16,
-    node_port_allocation: Arc<Vec<u16>>,
+    _node_port_allocation: Arc<Vec<u16>>,
 }
 
 impl P2PTestSynchronizer {
@@ -117,14 +115,14 @@ impl P2PTestSynchronizer {
         test_dir_path: std::path::PathBuf,
         node_id: NodeId,
         num_replicas: u16,
-        node_port_allocation: Arc<Vec<u16>>,
+        _node_port_allocation: Arc<Vec<u16>>,
     ) -> Self {
         P2PTestSynchronizer {
             test_id: std::process::id(),
             test_dir_path,
             node_id,
             num_replicas,
-            node_port_allocation,
+            _node_port_allocation,
         }
     }
 

@@ -168,24 +168,35 @@
 
 use crate::consensus::{
     metrics::{timed_call, EcdsaClientMetrics},
+    utils::RoundRobin,
     ConsensusCrypto,
 };
+use crate::ecdsa::complaints::{EcdsaComplaintHandler, EcdsaComplaintHandlerImpl};
 use crate::ecdsa::pre_signer::{EcdsaPreSigner, EcdsaPreSignerImpl};
+use crate::ecdsa::signer::{EcdsaSigner, EcdsaSignerImpl};
+use crate::ecdsa::utils::EcdsaBlockReaderImpl;
 
-use ic_interfaces::consensus_pool::ConsensusPoolCache;
+use ic_interfaces::consensus_pool::ConsensusBlockCache;
 use ic_interfaces::ecdsa::{Ecdsa, EcdsaChangeSet, EcdsaGossip, EcdsaPool};
 use ic_logger::ReplicaLogger;
 use ic_metrics::MetricsRegistry;
 use ic_types::{
     artifact::{EcdsaMessageAttribute, EcdsaMessageId, Priority, PriorityFn},
-    consensus::ecdsa::{EcdsaBlockReader, EcdsaBlockReaderImpl},
-    Height, NodeId,
+    consensus::ecdsa::EcdsaBlockReader,
+    malicious_flags::MaliciousFlags,
+    Height, NodeId, SubnetId,
 };
 
 use std::sync::Arc;
 
-mod payload_builder;
-mod pre_signer;
+pub(crate) mod complaints;
+pub(crate) mod payload_builder;
+pub(crate) mod pre_signer;
+pub(crate) mod signer;
+pub(crate) mod utils;
+
+pub use payload_builder::get_initial_dealings;
+pub(crate) use payload_builder::{create_data_payload, create_summary_payload};
 
 /// Similar to consensus, we don't fetch artifacts too far ahead in future.
 const LOOK_AHEAD: u64 = 10;
@@ -194,6 +205,9 @@ const LOOK_AHEAD: u64 = 10;
 /// ECDSA payloads.
 pub struct EcdsaImpl {
     pre_signer: Box<dyn EcdsaPreSigner>,
+    signer: Box<dyn EcdsaSigner>,
+    complaint_handler: Box<dyn EcdsaComplaintHandler>,
+    schedule: RoundRobin,
     metrics: EcdsaClientMetrics,
     logger: ReplicaLogger,
 }
@@ -202,67 +216,95 @@ impl EcdsaImpl {
     /// Builds a new threshold ECDSA component
     pub fn new(
         node_id: NodeId,
-        consensus_cache: Arc<dyn ConsensusPoolCache>,
+        subnet_id: SubnetId,
+        consensus_block_cache: Arc<dyn ConsensusBlockCache>,
         crypto: Arc<dyn ConsensusCrypto>,
         metrics_registry: MetricsRegistry,
         logger: ReplicaLogger,
+        malicious_flags: MaliciousFlags,
     ) -> Self {
         let pre_signer = Box::new(EcdsaPreSignerImpl::new(
             node_id,
-            consensus_cache,
+            subnet_id,
+            consensus_block_cache.clone(),
+            crypto.clone(),
+            metrics_registry.clone(),
+            logger.clone(),
+            malicious_flags,
+        ));
+        let signer = Box::new(EcdsaSignerImpl::new(
+            node_id,
+            consensus_block_cache.clone(),
+            crypto.clone(),
+            metrics_registry.clone(),
+            logger.clone(),
+        ));
+        let complaint_handler = Box::new(EcdsaComplaintHandlerImpl::new(
+            node_id,
+            consensus_block_cache,
             crypto,
             metrics_registry.clone(),
             logger.clone(),
         ));
         Self {
             pre_signer,
+            signer,
+            complaint_handler,
+            schedule: RoundRobin::default(),
             metrics: EcdsaClientMetrics::new(metrics_registry),
             logger,
         }
-    }
-
-    fn call_with_metrics<F>(&self, sub_component: &str, on_state_change_fn: F) -> EcdsaChangeSet
-    where
-        F: FnOnce() -> EcdsaChangeSet,
-    {
-        let _timer = self
-            .metrics
-            .on_state_change_duration
-            .with_label_values(&[sub_component])
-            .start_timer();
-        (on_state_change_fn)()
     }
 }
 
 impl Ecdsa for EcdsaImpl {
     fn on_state_change(&self, ecdsa_pool: &dyn EcdsaPool) -> EcdsaChangeSet {
-        let mut changes: Vec<EcdsaChangeSet> = Vec::new();
         let metrics = self.metrics.clone();
+        let pre_signer = || {
+            timed_call(
+                "pre_signer",
+                || {
+                    self.pre_signer
+                        .on_state_change(ecdsa_pool, self.complaint_handler.as_transcript_loader())
+                },
+                &metrics.on_state_change_duration,
+            )
+        };
+        let signer = || {
+            timed_call(
+                "signer",
+                || {
+                    self.signer
+                        .on_state_change(ecdsa_pool, self.complaint_handler.as_transcript_loader())
+                },
+                &metrics.on_state_change_duration,
+            )
+        };
+        let complaint_handler = || {
+            timed_call(
+                "complaint_handler",
+                || self.complaint_handler.on_state_change(ecdsa_pool),
+                &metrics.on_state_change_duration,
+            )
+        };
 
-        changes.push(timed_call(
-            "pre_signer",
-            || self.pre_signer.on_state_change(ecdsa_pool),
-            &metrics.on_state_change_duration,
-        ));
-
-        let mut ret = Vec::new();
-        changes.iter_mut().for_each(|mut change_set| {
-            ret.append(&mut change_set);
-        });
-        ret
+        let calls: [&'_ dyn Fn() -> EcdsaChangeSet; 3] = [&pre_signer, &signer, &complaint_handler];
+        self.schedule.call_next(&calls)
     }
 }
 
 /// `EcdsaGossipImpl` implements the priority function and other gossip related
 /// functionality
 pub struct EcdsaGossipImpl {
-    consensus_cache: Arc<dyn ConsensusPoolCache>,
+    consensus_block_cache: Arc<dyn ConsensusBlockCache>,
 }
 
 impl EcdsaGossipImpl {
     /// Builds a new EcdsaGossipImpl component
-    pub fn new(consensus_cache: Arc<dyn ConsensusPoolCache>) -> Self {
-        Self { consensus_cache }
+    pub fn new(consensus_block_cache: Arc<dyn ConsensusBlockCache>) -> Self {
+        Self {
+            consensus_block_cache,
+        }
     }
 }
 
@@ -271,8 +313,8 @@ impl EcdsaGossip for EcdsaGossipImpl {
         &self,
         _ecdsa_pool: &dyn EcdsaPool,
     ) -> PriorityFn<EcdsaMessageId, EcdsaMessageAttribute> {
-        let block_reader = EcdsaBlockReaderImpl::new(self.consensus_cache.finalized_block());
-        let cached_finalized_height = block_reader.height();
+        let block_reader = EcdsaBlockReaderImpl::new(self.consensus_block_cache.finalized_chain());
+        let cached_finalized_height = block_reader.tip_height();
         Box::new(move |_, attr: &'_ EcdsaMessageAttribute| {
             compute_priority(attr, cached_finalized_height)
         })
@@ -290,21 +332,18 @@ impl EcdsaGossip for EcdsaGossipImpl {
 // But this would require more processing per call to priority function, and
 // cause extra lock contention for the main processing paths.
 fn compute_priority(attr: &EcdsaMessageAttribute, cached_finalized_height: Height) -> Priority {
-    match attr {
-        EcdsaMessageAttribute::EcdsaDealing(height) => {
-            if *height < cached_finalized_height + Height::from(LOOK_AHEAD) {
-                Priority::Fetch
-            } else {
-                Priority::Stash
-            }
-        }
-        EcdsaMessageAttribute::EcdsaDealingSupport(height) => {
-            if *height < cached_finalized_height + Height::from(LOOK_AHEAD) {
-                Priority::Fetch
-            } else {
-                Priority::Stash
-            }
-        }
+    let height = match attr {
+        EcdsaMessageAttribute::EcdsaSignedDealing(height) => *height,
+        EcdsaMessageAttribute::EcdsaDealingSupport(height) => *height,
+        EcdsaMessageAttribute::EcdsaSigShare(height) => *height,
+        EcdsaMessageAttribute::EcdsaComplaint(height) => *height,
+        EcdsaMessageAttribute::EcdsaOpening(height) => *height,
+    };
+
+    if height < cached_finalized_height + Height::from(LOOK_AHEAD) {
+        Priority::Fetch
+    } else {
+        Priority::Stash
     }
 }
 
@@ -318,19 +357,19 @@ mod tests {
         let cached_finalized_height = Height::from(100);
         let tests = vec![
             (
-                EcdsaMessageAttribute::EcdsaDealing(Height::from(90)),
+                EcdsaMessageAttribute::EcdsaSignedDealing(Height::from(90)),
                 Priority::Fetch,
             ),
             (
-                EcdsaMessageAttribute::EcdsaDealing(Height::from(109)),
+                EcdsaMessageAttribute::EcdsaSignedDealing(Height::from(109)),
                 Priority::Fetch,
             ),
             (
-                EcdsaMessageAttribute::EcdsaDealing(Height::from(110)),
+                EcdsaMessageAttribute::EcdsaSignedDealing(Height::from(110)),
                 Priority::Stash,
             ),
             (
-                EcdsaMessageAttribute::EcdsaDealing(Height::from(120)),
+                EcdsaMessageAttribute::EcdsaSignedDealing(Height::from(120)),
                 Priority::Stash,
             ),
             (

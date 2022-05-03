@@ -2,13 +2,13 @@ pub(crate) mod chunkable;
 
 use super::StateManagerImpl;
 use crate::EXTRA_CHECKPOINTS_TO_KEEP;
-use ic_crypto::crypto_hash;
+use ic_crypto_hash::crypto_hash;
 use ic_interfaces::{
     artifact_manager::{ArtifactAcceptance, ArtifactClient, ArtifactProcessor, ProcessingResult},
     artifact_pool::{ArtifactPoolError, UnvalidatedArtifact},
-    state_manager::{StateManager, CERT_CERTIFIED},
     time_source::TimeSource,
 };
+use ic_interfaces_state_manager::{StateManager, CERT_CERTIFIED};
 use ic_logger::{info, warn};
 use ic_types::{
     artifact::{
@@ -68,7 +68,7 @@ impl ArtifactClient<StateSyncArtifact> for StateManagerImpl {
             .state_layout
             .checkpoint(height)
             .expect("failed to create checkpoint layout");
-        let state = crate::checkpoint::load_checkpoint(&ro_layout, self.own_subnet_type, None)
+        let state = crate::checkpoint::load_checkpoint_parallel(&ro_layout, self.own_subnet_type)
             .expect("failed to recover checkpoint");
         self.on_synced_checkpoint(state, height, msg.manifest, msg.root_hash);
 
@@ -159,7 +159,7 @@ impl ArtifactClient<StateSyncArtifact> for StateManagerImpl {
     ) -> Option<
         Box<dyn Fn(&StateSyncArtifactId, &StateSyncAttribute) -> Priority + Send + Sync + 'static>,
     > {
-        use ic_interfaces::state_manager::StateReader;
+        use ic_interfaces_state_manager::StateReader;
 
         let latest_height = self.latest_state_height();
         let fetch_state = self.states.read().fetch_state.clone();

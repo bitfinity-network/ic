@@ -1,9 +1,10 @@
+use crate::request_types::TransactionOperationResults;
 use crate::{
-    convert::from_hex, errors::ApiError, request_types::RequestType,
+    convert::from_hex, errors, errors::ApiError, request_types::RequestType,
     transaction_id::TransactionIdentifier,
 };
 use ic_types::{
-    messages::{HttpCanisterUpdate, HttpReadStateContent, HttpRequestEnvelope, HttpSubmitContent},
+    messages::{HttpCallContent, HttpCanisterUpdate, HttpReadStateContent, HttpRequestEnvelope},
     CanisterId,
 };
 use serde::{Deserialize, Serialize};
@@ -11,6 +12,7 @@ use std::{
     convert::{TryFrom, TryInto},
     fmt::Display,
 };
+use strum_macros::{Display, EnumIter};
 
 // This file is generated from https://github.com/coinbase/rosetta-specifications using openapi-generator
 // Then heavily tweaked because openapi-generator no longer generates valid rust
@@ -27,8 +29,7 @@ pub struct ConstructionSubmitResponse {
     /// If a transaction only contains neuron management operations
     /// the constant identifier will be returned.
     pub transaction_identifier: TransactionIdentifier,
-
-    pub metadata: Object,
+    pub metadata: TransactionOperationResults,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -55,7 +56,7 @@ pub struct AccountBalanceRequest {
 
     #[serde(rename = "metadata")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<NeuronInfoRequest>,
+    pub metadata: Option<AccountBalanceMetadata>,
 }
 
 impl AccountBalanceRequest {
@@ -547,14 +548,14 @@ pub type Request = (RequestType, Vec<EnvelopePair>);
 /// a particular ingress window.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EnvelopePair {
-    pub update: HttpRequestEnvelope<HttpSubmitContent>,
+    pub update: HttpRequestEnvelope<HttpCallContent>,
     pub read_state: HttpRequestEnvelope<HttpReadStateContent>,
 }
 
 impl EnvelopePair {
     pub fn update_content(&self) -> &HttpCanisterUpdate {
         match self.update.content {
-            HttpSubmitContent::Call { ref update } => update,
+            HttpCallContent::Call { ref update } => update,
         }
     }
 }
@@ -566,7 +567,7 @@ pub enum AccountType {
     Ledger,
     Neuron {
         #[serde(default)]
-        neuron_identifier: u64,
+        neuron_index: u64,
     },
 }
 
@@ -585,15 +586,13 @@ pub struct ConstructionDeriveRequestMetadata {
 #[test]
 fn test_construction_derive_request_metadata() {
     let r0 = ConstructionDeriveRequestMetadata {
-        account_type: AccountType::Neuron {
-            neuron_identifier: 1,
-        },
+        account_type: AccountType::Neuron { neuron_index: 1 },
     };
 
     let s = serde_json::to_string(&r0).unwrap();
     let r1 = serde_json::from_str(s.as_str()).unwrap();
 
-    assert_eq!(s, r#"{"account_type":"neuron","neuron_identifier":1}"#);
+    assert_eq!(s, r#"{"account_type":"neuron","neuron_index":1}"#);
     assert_eq!(r0, r1);
 }
 
@@ -1169,7 +1168,7 @@ pub struct Error {
 
 impl Error {
     pub fn new(err_type: &ApiError) -> Self {
-        Self::from(err_type)
+        errors::convert_to_error(err_type)
     }
 
     pub fn serialization_error_json_str() -> String {
@@ -1437,6 +1436,56 @@ impl NetworkStatusResponse {
     }
 }
 
+#[derive(Display, Debug, Clone, PartialEq, EnumIter, Serialize, Deserialize)]
+#[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
+pub enum OperationType {
+    #[serde(rename = "TRANSACTION")]
+    #[strum(serialize = "TRANSACTION")]
+    Transaction,
+    #[serde(rename = "MINT")]
+    #[strum(serialize = "MINT")]
+    Mint,
+    #[serde(rename = "BURN")]
+    #[strum(serialize = "BURN")]
+    Burn,
+    #[serde(rename = "FEE")]
+    #[strum(serialize = "FEE")]
+    Fee,
+    #[serde(rename = "STAKE")]
+    #[strum(serialize = "STAKE")]
+    Stake,
+    #[serde(rename = "START_DISSOLVING")]
+    #[strum(serialize = "START_DISSOLVING")]
+    StartDissolving,
+    #[serde(rename = "STOP_DISSOLVING")]
+    #[strum(serialize = "STOP_DISSOLVING")]
+    StopDissolving,
+    #[serde(rename = "SET_DISSOLVE_TIMESTAMP")]
+    #[strum(serialize = "SET_DISSOLVE_TIMESTAMP")]
+    SetDissolveTimestamp,
+    #[serde(rename = "DISBURSE")]
+    #[strum(serialize = "DISBURSE")]
+    Disburse,
+    #[serde(rename = "ADD_HOTKEY")]
+    #[strum(serialize = "ADD_HOTKEY")]
+    AddHotkey,
+    #[serde(rename = "REMOVE_HOTKEY")]
+    #[strum(serialize = "REMOVE_HOTKEY")]
+    RemoveHotkey,
+    #[serde(rename = "SPAWN")]
+    #[strum(serialize = "SPAWN")]
+    Spawn,
+    #[serde(rename = "MERGE_MATURITY")]
+    #[strum(serialize = "MERGE_MATURITY")]
+    MergeMaturity,
+    #[serde(rename = "NEURON_INFO")]
+    #[strum(serialize = "NEURON_INFO")]
+    NeuronInfo,
+    #[serde(rename = "FOLLOW")]
+    #[strum(serialize = "FOLLOW")]
+    Follow,
+}
+
 /// Operations contain all balance-changing information within a transaction.
 /// They are always one-sided (only affect 1 AccountIdentifier) and can succeed
 /// or fail independently from a Transaction.
@@ -1453,6 +1502,7 @@ pub struct Operation {
     /// in a call tree.
     #[serde(rename = "related_operations")]
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub related_operations: Option<Vec<OperationIdentifier>>,
 
     /// The network-specific type of the operation. Ensure that any type that
@@ -1460,7 +1510,7 @@ pub struct Operation {
     /// This can be very useful to downstream consumers that parse all block
     /// data.
     #[serde(rename = "type")]
-    pub _type: String,
+    pub _type: OperationType,
 
     /// The network-specific status of the operation. Status is not defined on
     /// the transaction object because blockchains with smart contracts may have
@@ -1472,25 +1522,29 @@ pub struct Operation {
 
     #[serde(rename = "account")]
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub account: Option<AccountIdentifier>,
 
     #[serde(rename = "amount")]
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub amount: Option<Amount>,
 
     #[serde(rename = "coin_change")]
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub coin_change: Option<CoinChange>,
 
     #[serde(rename = "metadata")]
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub metadata: Option<Object>,
 }
 
 impl Operation {
     pub fn new(
         op_id: i64,
-        _type: String,
+        _type: OperationType,
         status: Option<String>,
         account: Option<AccountIdentifier>,
         amount: Option<Amount>,
@@ -1889,7 +1943,7 @@ pub struct Transaction {
     pub operations: Vec<Operation>,
 
     /// Transactions that are related to other transactions (like a cross-shard
-    /// transaction) should include the tranaction_identifier of these
+    /// transaction) should include the transaction_identifier of these
     /// transactions in the metadata.
     #[serde(rename = "metadata")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2133,53 +2187,143 @@ impl Version {
     }
 }
 
-/// A NeuronInfoRequest is utilized to make query to the governance
-/// canister about the current neuron information.
-/// If the verified_query is set to true, the information is
-/// retrieved through an IC update call which may take significantly
-/// longer to execute, but gives strong guarantees that the received
-/// data has not been tampered with.
-/// Otherwise the information is retrieved through a fast query call.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
-pub struct NeuronInfoRequest {
-    #[serde(rename = "neuron_id")]
-    pub neuron_id: Option<u64>,
+pub struct NeuronSubaccountComponents {
+    #[serde(rename = "public_key")]
+    pub public_key: PublicKey,
 
-    #[serde(rename = "public_key_and_neuron_index")]
-    pub public_key_and_neuron_index: Option<(PublicKey, u64)>,
-
-    #[serde(rename = "verified_query")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub verified_query: Option<bool>,
+    #[serde(rename = "neuron_index")]
+    #[serde(default)]
+    pub neuron_index: u64,
 }
 
-use ic_nns_common::pb::v1::NeuronId;
-use ic_nns_governance::pb::v1::manage_neuron::NeuronIdOrSubaccount;
+/// We use this type to make query to the governance
+/// canister about the current neuron information.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
+#[serde(tag = "account_type")]
+pub enum BalanceAccountType {
+    #[serde(rename = "ledger")]
+    Ledger,
+    #[serde(rename = "neuron")]
+    Neuron {
+        #[serde(rename = "neuron_id")]
+        neuron_id: Option<u64>,
 
-impl NeuronInfoRequest {
-    pub fn get_neuron_id_or_subaccount(&self) -> Result<NeuronIdOrSubaccount, ApiError> {
-        if let Some((pk, nidx)) = self.public_key_and_neuron_index.clone() {
-            if self.neuron_id.is_some() {
-                return Err(ApiError::invalid_request(
-                    "Only one of neuron_id or public_key_and_neuron_index must be present",
-                ));
-            }
+        #[serde(flatten)]
+        subaccount_components: Option<NeuronSubaccountComponents>,
 
-            let neuron_subaccount =
-                crate::convert::neuron_subaccount_bytes_from_public_key(&pk, nidx)?;
+        /// If is set to true, the information is
+        /// retrieved through an IC update call which may take significantly
+        /// longer to execute, but gives strong guarantees that the received
+        /// data has not been tampered with.
+        /// Otherwise the information is retrieved through a fast query call.
+        #[serde(rename = "verified_query")]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        verified_query: Option<bool>,
+    },
+}
 
-            return Ok(NeuronIdOrSubaccount::Subaccount(neuron_subaccount.to_vec()));
-        }
-
-        if let Some(nid) = self.neuron_id {
-            return Ok(NeuronIdOrSubaccount::NeuronId(NeuronId { id: nid }));
-        }
-
-        Err(ApiError::invalid_request(
-            "neuron_id or public_key must be present",
-        ))
+impl Default for BalanceAccountType {
+    fn default() -> Self {
+        Self::Ledger
     }
+}
+
+/// The type of metadata for the /account/balance endpoint.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
+pub struct AccountBalanceMetadata {
+    #[serde(rename = "account_type")]
+    #[serde(flatten)]
+    #[serde(default)]
+    pub account_type: BalanceAccountType,
+}
+
+#[test]
+fn test_neuron_info_request_parsing() {
+    let r1: AccountBalanceMetadata =
+        serde_json::from_str(r#"{ "account_type": "neuron", "neuron_id": 5 }"#).unwrap();
+    assert_eq!(
+        r1,
+        AccountBalanceMetadata {
+            account_type: BalanceAccountType::Neuron {
+                neuron_id: Some(5),
+                subaccount_components: None,
+                verified_query: None,
+            }
+        }
+    );
+    let r2: AccountBalanceMetadata = serde_json::from_str(
+        r#"{
+            "account_type": "neuron",
+            "neuron_index": 5,
+            "public_key": {
+              "hex_bytes": "1b400d60aaf34eaf6dcbab9bba46001a23497886cf11066f7846933d30e5ad3f",
+              "curve_type": "edwards25519"
+            }
+        }"#,
+    )
+    .unwrap();
+    assert_eq!(
+        r2,
+        AccountBalanceMetadata {
+            account_type: BalanceAccountType::Neuron {
+                neuron_id: None,
+                subaccount_components: Some(NeuronSubaccountComponents {
+                    neuron_index: 5,
+                    public_key: PublicKey {
+                        hex_bytes:
+                            "1b400d60aaf34eaf6dcbab9bba46001a23497886cf11066f7846933d30e5ad3f"
+                                .to_string(),
+                        curve_type: CurveType::Edwards25519
+                    }
+                }),
+                verified_query: None,
+            }
+        }
+    );
+
+    let r3: AccountBalanceMetadata = serde_json::from_str(
+        r#"{
+            "account_type": "neuron",
+            "public_key": {
+              "hex_bytes": "1b400d60aaf34eaf6dcbab9bba46001a23497886cf11066f7846933d30e5ad3f",
+              "curve_type": "edwards25519"
+            }
+        }"#,
+    )
+    .unwrap();
+    assert_eq!(
+        r3,
+        AccountBalanceMetadata {
+            account_type: BalanceAccountType::Neuron {
+                neuron_id: None,
+                subaccount_components: Some(NeuronSubaccountComponents {
+                    neuron_index: 0,
+                    public_key: PublicKey {
+                        hex_bytes:
+                            "1b400d60aaf34eaf6dcbab9bba46001a23497886cf11066f7846933d30e5ad3f"
+                                .to_string(),
+                        curve_type: CurveType::Edwards25519
+                    }
+                }),
+                verified_query: None,
+            }
+        }
+    );
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "conversion", derive(LabelledGeneric))]
+pub enum NeuronState {
+    #[serde(rename = "NOT_DISSOLVING")]
+    NotDissolving,
+    #[serde(rename = "DISSOLVING")]
+    Dissolving,
+    #[serde(rename = "DISSOLVED")]
+    Dissolved,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2192,12 +2336,15 @@ pub struct NeuronInfoResponse {
 
     #[serde(rename = "retrieved_at_timestamp_seconds")]
     pub retrieved_at_timestamp_seconds: u64,
+
     /// The current state of the neuron.
     #[serde(rename = "state")]
-    pub state: i32,
+    pub state: NeuronState,
+
     /// The current age of the neuron.
     #[serde(rename = "age_seconds")]
     pub age_seconds: u64,
+
     /// The current dissolve delay of the neuron.
     #[serde(rename = "dissolve_delay_seconds")]
     pub dissolve_delay_seconds: u64,
@@ -2205,6 +2352,7 @@ pub struct NeuronInfoResponse {
     /// Current voting power of the neuron.
     #[serde(rename = "voting_power")]
     pub voting_power: u64,
+
     /// When the Neuron was created. A neuron can only vote on proposals
     /// submitted after its creation date.
     #[serde(rename = "created_timestamp_seconds")]

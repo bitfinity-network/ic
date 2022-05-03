@@ -8,21 +8,26 @@
 prod-generic-test:
   extends:
     - .ubuntu-nix-docker
-    - .rules-parent-pipeline-prs-only
+    - .rules-parent-pipeline
   # we modify stage in gen_gitlab_cargo_pipeline.py
-  stage: test
+  stage: prod-tests
+  tags:
+    - ic-prod-tests
+    - docker
+    - ubuntu
   needs:
     - guest-os-diskimg-dev
     - generic-guest-os-diskimg
     - cargo-build-canisters
     - cargo-build-release-linux-native
+    - artifacts-upload-to-s3
   resource_group: $CDPRNET
   artifacts:
     paths:
     - artifacts/results
   timeout: 30m
   retry:
-    max: 2
+    max: 1
     when:
       - always
   variables:
@@ -30,13 +35,12 @@ prod-generic-test:
   script:
     - |
       set -xeuo pipefail
-      # The GIT_REVISION may be provided as a variable when generating the child pipeline.
-      # Otherwise, the latest revision with disk image will be used.
-      GIT_REVISION=${GIT_REVISION:-$("$CI_PROJECT_DIR"/gitlab-ci/src/artifacts/newest_sha_with_disk_image.sh HEAD)}
+      # Fake Git revision until we make testing scripts forget there is git.
+      GIT_REVISION=$("$CI_PROJECT_DIR"/gitlab-ci/src/artifacts/find-build-id.sh)
       export GIT_REVISION
       # Run generic test against $CDPRNET
       # * run it for 120 seconds
       # * require at least 100 RPS
       # * use requests of size 1KB
-      placebo -i "testnet/**/*" -t "${GIT_REVISION}" -i "ic-os/guestos/build-out/disk-img-dev/*" -i "ic-os/generic-guestos/build-out/disk-img/*" -i "artifacts/canisters/*" -i "artifacts/release/*"  -i "artifacts/nix-release/*" -- \
+      capsule -i "gitlab-ci/**/*" -i "testnet/**/*" -t "${GIT_REVISION}" -- \
       testnet/tests/scripts/generic.sh "$CDPRNET" 120 100 1k artifacts/results

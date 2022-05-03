@@ -4,20 +4,24 @@ mod tests;
 
 use crate::metadata_state::subnet_call_context_manager::SubnetCallContextManager;
 use ic_base_types::CanisterId;
+use ic_certification_version::{CertificationVersion, CURRENT_CERTIFICATION_VERSION};
+use ic_constants::MAX_INGRESS_TTL;
+use ic_ic00_types::EcdsaKeyId;
 use ic_protobuf::{
     proxy::{try_from_option_field, ProxyDecodeError},
+    registry::subnet::v1 as pb_subnet,
     state::{
         ingress::v1 as pb_ingress,
         queues::v1 as pb_queues,
         system_metadata::v1::{self as pb_metadata, TimeOfLastAllocationCharge},
     },
 };
-use ic_registry_routing_table::RoutingTable;
-use ic_registry_subnet_features::SubnetFeatures;
+use ic_registry_routing_table::{CanisterMigrations, RoutingTable};
+use ic_registry_subnet_features::{BitcoinFeature, SubnetFeatures};
 use ic_registry_subnet_type::SubnetType;
 use ic_types::{
     crypto::CryptoHash,
-    ingress::{IngressStatus, MAX_INGRESS_TTL},
+    ingress::IngressStatus,
     messages::{MessageId, RequestOrResponse},
     node_id_into_protobuf, node_id_try_from_protobuf, subnet_id_into_protobuf,
     subnet_id_try_from_protobuf,
@@ -25,8 +29,10 @@ use ic_types::{
     xnet::{StreamHeader, StreamIndex, StreamIndexedQueue, StreamSlice},
     CountBytes, CryptoHashOfPartialState, NodeId, NumBytes, PrincipalId, SubnetId,
 };
+use serde::{Deserialize, Serialize};
+use std::ops::Bound::{Included, Unbounded};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     convert::{From, TryFrom, TryInto},
     mem::size_of,
     sync::Arc,
@@ -117,11 +123,23 @@ pub struct SystemMetadata {
     pub time_of_last_allocation_charge: Time,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Full description of the IC network toplogy.
+///
+/// Contains [`Arc`] references, so it is only safe to serialize for read-only
+/// use.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkTopology {
     pub subnets: BTreeMap<SubnetId, SubnetTopology>,
+    #[serde(serialize_with = "ic_utils::serde_arc::serialize_arc")]
+    #[serde(deserialize_with = "ic_utils::serde_arc::deserialize_arc")]
     pub routing_table: Arc<RoutingTable>,
+    #[serde(serialize_with = "ic_utils::serde_arc::serialize_arc")]
+    #[serde(deserialize_with = "ic_utils::serde_arc::deserialize_arc")]
+    pub canister_migrations: Arc<CanisterMigrations>,
     pub nns_subnet_id: SubnetId,
+    /// Mapping from key_id to a list of subnets which can sign with the given
+    /// key.
+    pub ecdsa_keys: BTreeMap<EcdsaKeyId, Vec<SubnetId>>,
 }
 
 impl Default for NetworkTopology {
@@ -129,8 +147,32 @@ impl Default for NetworkTopology {
         Self {
             subnets: Default::default(),
             routing_table: Default::default(),
+            canister_migrations: Default::default(),
             nns_subnet_id: SubnetId::new(PrincipalId::new_anonymous()),
+            ecdsa_keys: Default::default(),
         }
+    }
+}
+
+impl NetworkTopology {
+    /// Returns a list of subnets where the bitcoin testnet feature is enabled.
+    pub fn bitcoin_testnet_subnets(&self) -> Vec<SubnetId> {
+        self.subnets
+            .iter()
+            .filter(|(_, subnet_topology)| {
+                subnet_topology.subnet_features.bitcoin_testnet_feature
+                    == Some(BitcoinFeature::Enabled)
+            })
+            .map(|(subnet_id, _)| *subnet_id)
+            .collect()
+    }
+
+    /// Returns a list of subnets where the ecdsa feature is enabled.
+    pub fn ecdsa_subnets(&self, key_id: &EcdsaKeyId) -> &[SubnetId] {
+        self.ecdsa_keys
+            .get(key_id)
+            .map(|ids| &ids[..])
+            .unwrap_or(&[])
     }
 }
 
@@ -147,6 +189,21 @@ impl From<&NetworkTopology> for pb_metadata::NetworkTopology {
                 .collect(),
             routing_table: Some(item.routing_table.as_ref().into()),
             nns_subnet_id: Some(subnet_id_into_protobuf(item.nns_subnet_id)),
+            canister_migrations: Some(item.canister_migrations.as_ref().into()),
+            ecdsa_keys: item
+                .ecdsa_keys
+                .iter()
+                .map(|(key_id, subnet_ids)| {
+                    let subnet_ids = subnet_ids
+                        .iter()
+                        .map(|id| subnet_id_into_protobuf(*id))
+                        .collect();
+                    pb_metadata::EcdsaKeyEntry {
+                        key_id: Some(key_id.into()),
+                        subnet_ids,
+                    }
+                })
+                .collect(),
         }
     }
 }
@@ -154,7 +211,7 @@ impl From<&NetworkTopology> for pb_metadata::NetworkTopology {
 impl TryFrom<pb_metadata::NetworkTopology> for NetworkTopology {
     type Error = ProxyDecodeError;
     fn try_from(item: pb_metadata::NetworkTopology) -> Result<Self, Self::Error> {
-        let mut subnets = BTreeMap::<SubnetId, SubnetTopology>::new();
+        let mut subnets = BTreeMap::new();
         for entry in item.subnets {
             subnets.insert(
                 subnet_id_try_from_protobuf(try_from_option_field(
@@ -171,6 +228,17 @@ impl TryFrom<pb_metadata::NetworkTopology> for NetworkTopology {
                 Ok(subnet_id) => subnet_id_try_from_protobuf(subnet_id)?,
                 Err(_) => SubnetId::new(PrincipalId::new_anonymous()),
             };
+        let mut ecdsa_keys = BTreeMap::new();
+        for entry in item.ecdsa_keys {
+            let mut subnet_ids = vec![];
+            for subnet_id in entry.subnet_ids {
+                subnet_ids.push(subnet_id_try_from_protobuf(subnet_id)?);
+            }
+            ecdsa_keys.insert(
+                try_from_option_field(entry.key_id, "EcdsaKeyEntry::key_id")?,
+                subnet_ids,
+            );
+        }
 
         Ok(Self {
             subnets,
@@ -179,18 +247,33 @@ impl TryFrom<pb_metadata::NetworkTopology> for NetworkTopology {
                 "NetworkTopology::routing_table",
             )
             .map(Arc::new)?,
+            // `None` value needs to be allowed here because all the existing states don't have this field yet.
+            canister_migrations: item
+                .canister_migrations
+                .map(CanisterMigrations::try_from)
+                .transpose()?
+                .unwrap_or_default()
+                .into(),
             nns_subnet_id,
+            ecdsa_keys,
         })
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubnetTopology {
     /// The public key of the subnet (a DER-encoded BLS key, see
     /// https://sdk.dfinity.org/docs/interface-spec/index.html#certification)
     pub public_key: Vec<u8>,
     pub nodes: BTreeMap<NodeId, NodeTopology>,
     pub subnet_type: SubnetType,
+    pub subnet_features: SubnetFeatures,
+    /// ECDSA keys held by this subnet. Just because a subnet holds an ECDSA key
+    /// doesn't mean the subnet has been enabled to sign with that key. This
+    /// will happen when a key is shared with a second subnet which holds it as
+    /// a backup. An additional NNS proposal will be needed to allow the subnet
+    /// holding the key as backup to actually produce signatures.
+    pub ecdsa_keys_held: BTreeSet<EcdsaKeyId>,
 }
 
 impl From<&SubnetTopology> for pb_metadata::SubnetTopology {
@@ -206,6 +289,8 @@ impl From<&SubnetTopology> for pb_metadata::SubnetTopology {
                 })
                 .collect(),
             subnet_type: i32::from(item.subnet_type),
+            subnet_features: Some(pb_subnet::SubnetFeatures::from(item.subnet_features)),
+            ecdsa_keys_held: item.ecdsa_keys_held.iter().map(|k| k.into()).collect(),
         }
     }
 }
@@ -224,6 +309,11 @@ impl TryFrom<pb_metadata::SubnetTopology> for SubnetTopology {
             );
         }
 
+        let mut ecdsa_keys_held = BTreeSet::new();
+        for key in item.ecdsa_keys_held {
+            ecdsa_keys_held.insert(EcdsaKeyId::try_from(key)?);
+        }
+
         Ok(Self {
             public_key: item.public_key,
             nodes,
@@ -231,11 +321,16 @@ impl TryFrom<pb_metadata::SubnetTopology> for SubnetTopology {
             // field before we actually use it. We pick the value of least
             // privilege just to be sure.
             subnet_type: SubnetType::try_from(item.subnet_type).unwrap_or(SubnetType::Application),
+            subnet_features: item
+                .subnet_features
+                .map(SubnetFeatures::from)
+                .unwrap_or_default(),
+            ecdsa_keys_held,
         })
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeTopology {
     pub ip_address: String,
     pub http_port: u16,
@@ -403,6 +498,11 @@ impl SystemMetadata {
 /// Stream is the state of bi-directional communication session with a remote
 /// subnet.  It contains outgoing messages having that subnet as their
 /// destination and signals for inducted messages received from that subnet.
+///
+/// Conceptually we use a gap-free queue containing one signal for each inducted
+/// message; but because most signals are `Accept` we represent that queue as a
+/// combination of `signals_end` (pointing just beyond the last signal) plus a
+/// collection of `reject_signals`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Stream {
     /// Indexed queue of outgoing messages.
@@ -416,6 +516,9 @@ pub struct Stream {
     /// represented by its end index (pointing just beyond the last signal).
     signals_end: StreamIndex,
 
+    /// Stream indices of rejected messages, in ascending order.
+    reject_signals: VecDeque<StreamIndex>,
+
     /// Estimated stream byte size.
     size_bytes: usize,
 }
@@ -424,10 +527,12 @@ impl Default for Stream {
     fn default() -> Self {
         let messages = Default::default();
         let signals_end = Default::default();
+        let reject_signals = VecDeque::default();
         let size_bytes = Self::size_bytes(&messages);
         Self {
             messages,
             signals_end,
+            reject_signals,
             size_bytes,
         }
     }
@@ -435,6 +540,7 @@ impl Default for Stream {
 
 impl From<&Stream> for pb_queues::Stream {
     fn from(item: &Stream) -> Self {
+        let reject_signals = item.reject_signals.iter().map(|i| i.get()).collect();
         Self {
             messages_begin: item.messages.begin().get(),
             messages: item
@@ -443,6 +549,7 @@ impl From<&Stream> for pb_queues::Stream {
                 .map(|(_, req_or_resp)| req_or_resp.into())
                 .collect(),
             signals_end: item.signals_end.get(),
+            reject_signals,
         }
     }
 }
@@ -457,9 +564,16 @@ impl TryFrom<pb_queues::Stream> for Stream {
         }
         let size_bytes = Self::size_bytes(&messages);
 
+        let reject_signals = item
+            .reject_signals
+            .iter()
+            .map(|i| StreamIndex::new(*i))
+            .collect();
+
         Ok(Self {
             messages,
             signals_end: item.signals_end.into(),
+            reject_signals,
             size_bytes,
         })
     }
@@ -472,6 +586,22 @@ impl Stream {
         Self {
             messages,
             signals_end,
+            reject_signals: VecDeque::new(),
+            size_bytes,
+        }
+    }
+
+    /// Creates a new `Stream` with the given `messages` and `signals_end`.
+    pub fn with_signals(
+        messages: StreamIndexedQueue<RequestOrResponse>,
+        signals_end: StreamIndex,
+        reject_signals: VecDeque<StreamIndex>,
+    ) -> Self {
+        let size_bytes = Self::size_bytes(&messages);
+        Self {
+            messages,
+            signals_end,
+            reject_signals,
             size_bytes,
         }
     }
@@ -489,6 +619,7 @@ impl Stream {
             begin: self.messages.begin(),
             end: self.messages.end(),
             signals_end: self.signals_end,
+            reject_signals: self.reject_signals.clone(),
         }
     }
 
@@ -514,8 +645,13 @@ impl Stream {
         debug_assert_eq!(Self::size_bytes(&self.messages), self.size_bytes);
     }
 
-    /// Garbage collects messages before `new_begin`.
-    pub fn discard_before(&mut self, new_begin: StreamIndex) {
+    /// Garbage collects messages before `new_begin`, collecting and returning all
+    /// messages for which a reject signal was received.
+    pub fn discard_messages_before(
+        &mut self,
+        new_begin: StreamIndex,
+        reject_signals: &VecDeque<StreamIndex>,
+    ) -> Vec<RequestOrResponse> {
         assert!(
             new_begin >= self.messages.begin(),
             "Begin index ({}) has already advanced past requested begin index ({})",
@@ -529,10 +665,49 @@ impl Stream {
             self.messages.end()
         );
 
+        // Skip any reject signals before `self.messages.begin()`.
+        //
+        // This may happen legitimately if the remote subnet has not yet GC-ed a signal
+        // because it has not yet seen our `messages.begin()` advance past it.
+        let messages_begin = self.messages.begin();
+        let mut reject_signals = reject_signals
+            .iter()
+            .skip_while(|&reject_signal| reject_signal < &messages_begin);
+        let mut next_reject_signal = reject_signals.next().unwrap_or(&new_begin);
+
+        // Garbage collect all messages up to `new_begin`.
+        let mut rejected_messages = Vec::new();
         while self.messages.begin() < new_begin {
-            self.size_bytes -= self.messages.pop().unwrap().1.count_bytes();
+            let (index, msg) = self.messages.pop().unwrap();
+
+            // Deduct every discarded message from the stream's byte size.
+            self.size_bytes -= msg.count_bytes();
             debug_assert_eq!(Self::size_bytes(&self.messages), self.size_bytes);
+
+            // If we received a reject signal for this message, collect it in
+            // `rejected_messages`.
+            if next_reject_signal == &index {
+                rejected_messages.push(msg);
+                next_reject_signal = reject_signals.next().unwrap_or(&new_begin);
+            }
         }
+        rejected_messages
+    }
+
+    /// Garbage collects signals before `new_signals_begin`.
+    pub fn discard_signals_before(&mut self, new_signals_begin: StreamIndex) {
+        while let Some(signal_index) = self.reject_signals.front() {
+            if *signal_index < new_signals_begin {
+                self.reject_signals.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Returns a reference to the reject signals.
+    pub fn reject_signals(&self) -> &VecDeque<StreamIndex> {
+        &self.reject_signals
     }
 
     /// Returns the index just beyond the last sent signal.
@@ -543,6 +718,20 @@ impl Stream {
     /// Increments the index of the last sent signal.
     pub fn increment_signals_end(&mut self) {
         self.signals_end.inc_assign()
+    }
+
+    /// Appends the given reject signal to the tail of the reject signals.
+    pub fn push_reject_signal(&mut self, index: StreamIndex) {
+        assert_eq!(index, self.signals_end);
+        if let Some(&last_signal) = self.reject_signals.back() {
+            assert!(
+                last_signal < index,
+                "The signal to be pushed ({}) should be larger than the last signal ({})",
+                index,
+                last_signal
+            );
+        }
+        self.reject_signals.push_back(index)
     }
 
     /// Calculates the byte size of a `Stream` holding the given messages.
@@ -565,6 +754,7 @@ impl From<Stream> for StreamSlice {
                 begin: val.messages.begin(),
                 end: val.messages.end(),
                 signals_end: val.signals_end,
+                reject_signals: val.reject_signals,
             },
             val.messages,
         )
@@ -697,6 +887,11 @@ impl<'a> StreamHandle<'a> {
         }
     }
 
+    /// Returns a reference to the message queue.
+    pub fn messages(&self) -> &StreamIndexedQueue<RequestOrResponse> {
+        self.stream.messages()
+    }
+
     /// Returns the stream's begin index.
     pub fn messages_begin(&self) -> StreamIndex {
         self.stream.messages_begin()
@@ -705,6 +900,11 @@ impl<'a> StreamHandle<'a> {
     /// Returns the stream's end index.
     pub fn messages_end(&self) -> StreamIndex {
         self.stream.messages_end()
+    }
+
+    /// Returns a reference to the reject signals.
+    pub fn reject_signals(&self) -> &VecDeque<StreamIndex> {
+        self.stream.reject_signals()
     }
 
     /// Returns the index just beyond the last sent signal.
@@ -728,8 +928,18 @@ impl<'a> StreamHandle<'a> {
         self.stream.increment_signals_end();
     }
 
-    /// Garbage collects messages before `new_begin`.
-    pub fn discard_before(&mut self, new_begin: StreamIndex) {
+    /// Appends the given reject signal to the tail of the reject signals.
+    pub fn push_reject_signal(&mut self, index: StreamIndex) {
+        self.stream.push_reject_signal(index)
+    }
+
+    /// Garbage collects messages before `new_begin`, collecting and returning all
+    /// messages for which a reject signal was received.
+    pub fn discard_messages_before(
+        &mut self,
+        new_begin: StreamIndex,
+        reject_signals: &VecDeque<StreamIndex>,
+    ) -> Vec<RequestOrResponse> {
         // Update stats for each discarded message.
         for (index, msg) in self.stream.messages().iter() {
             if index >= new_begin {
@@ -748,16 +958,41 @@ impl<'a> StreamHandle<'a> {
             }
         }
 
-        self.stream.discard_before(new_begin);
+        self.stream
+            .discard_messages_before(new_begin, reject_signals)
+    }
+
+    /// Garbage collects signals before `new_signals_begin`.
+    pub fn discard_signals_before(&mut self, new_signals_begin: StreamIndex) {
+        self.stream.discard_signals_before(new_signals_begin);
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 /// State associated with the history of statuses of ingress messages as they
 /// traversed through the system.
 pub struct IngressHistoryState {
-    statuses: Arc<BTreeMap<MessageId, IngressStatus>>,
+    statuses: Arc<BTreeMap<MessageId, Arc<IngressStatus>>>,
+    /// Ingress messages in terminal states (`Completed`, `Failed` or `Done`)
+    /// grouped by their respective expiration times.
     pruning_times: Arc<BTreeMap<Time, BTreeSet<MessageId>>>,
+    /// Transient: points to the earliest time in `pruning_times` with
+    /// associated message IDs that still may be of type completed or
+    /// failed.
+    next_terminal_time: Time,
+    /// Transient: memory usage of the ingress history.
+    memory_usage: usize,
+}
+
+impl Default for IngressHistoryState {
+    fn default() -> Self {
+        Self {
+            statuses: Arc::new(BTreeMap::new()),
+            pruning_times: Arc::new(BTreeMap::new()),
+            next_terminal_time: UNIX_EPOCH,
+            memory_usage: 0,
+        }
+    }
 }
 
 impl From<&IngressHistoryState> for pb_ingress::IngressHistoryState {
@@ -777,6 +1012,11 @@ impl From<&IngressHistoryState> for pb_ingress::IngressHistoryState {
             })
             .collect();
 
+        debug_assert_eq!(
+            IngressHistoryState::compute_memory_usage(&item.statuses),
+            item.memory_usage
+        );
+
         pb_ingress::IngressHistoryState {
             statuses,
             pruning_times,
@@ -787,14 +1027,14 @@ impl From<&IngressHistoryState> for pb_ingress::IngressHistoryState {
 impl TryFrom<pb_ingress::IngressHistoryState> for IngressHistoryState {
     type Error = ProxyDecodeError;
     fn try_from(item: pb_ingress::IngressHistoryState) -> Result<Self, Self::Error> {
-        let mut statuses = BTreeMap::<MessageId, IngressStatus>::new();
+        let mut statuses = BTreeMap::<MessageId, Arc<IngressStatus>>::new();
         let mut pruning_times = BTreeMap::<Time, BTreeSet<MessageId>>::new();
 
         for entry in item.statuses {
             let msg_id = entry.message_id.as_slice().try_into()?;
             let ingres_status = try_from_option_field(entry.status, "IngressStatusEntry::status")?;
 
-            statuses.insert(msg_id, ingres_status);
+            statuses.insert(msg_id, Arc::new(ingres_status));
         }
 
         for entry in item.pruning_times {
@@ -808,39 +1048,78 @@ impl TryFrom<pb_ingress::IngressHistoryState> for IngressHistoryState {
             pruning_times.insert(time, messages);
         }
 
+        let memory_usage = IngressHistoryState::compute_memory_usage(&statuses);
+
         Ok(IngressHistoryState {
             statuses: Arc::new(statuses),
             pruning_times: Arc::new(pruning_times),
+            next_terminal_time: UNIX_EPOCH,
+            memory_usage,
         })
     }
 }
 
 impl IngressHistoryState {
     pub fn new() -> Self {
-        Self {
-            statuses: Arc::new(BTreeMap::new()),
-            pruning_times: Arc::new(BTreeMap::new()),
-        }
+        Self::default()
     }
 
-    /// Inserts a new entry in the ingress history.
-    pub fn insert(&mut self, message_id: MessageId, status: IngressStatus, time: Time) {
+    /// Inserts a new entry in the ingress history. If an entry with `message_id` is
+    /// already present this entry will be overwritten. If `status` is a terminal
+    /// status (`completed`, `failed`, or `done`) the entry will also be enrolled
+    /// to be pruned at `time + MAX_INGRESS_TTL`.
+    pub fn insert(
+        &mut self,
+        message_id: MessageId,
+        status: IngressStatus,
+        time: Time,
+        ingress_memory_capacity: NumBytes,
+    ) {
         // Store the associated expiry time for the given message id only for a
         // "terminal" ingress status. This way we are not risking deleting any status
         // for a message that is still not in a terminal status.
-        if let IngressStatus::Completed { .. } | IngressStatus::Failed { .. } = status {
+        if let IngressStatus::Completed { .. }
+        | IngressStatus::Failed { .. }
+        | IngressStatus::Done { .. } = status
+        {
+            let timeout = time + MAX_INGRESS_TTL;
+
+            // Reset `self.next_terminal_time` in case it is after the current timout
+            // and the entry is completed or failed.
+            if self.next_terminal_time > timeout
+                && matches!(
+                    status,
+                    IngressStatus::Completed { .. } | IngressStatus::Failed { .. }
+                )
+            {
+                self.next_terminal_time = timeout;
+            }
             Arc::make_mut(&mut self.pruning_times)
-                .entry(time + MAX_INGRESS_TTL)
+                .entry(timeout)
                 .or_default()
                 .insert(message_id.clone());
         }
-        Arc::make_mut(&mut self.statuses).insert(message_id, status);
+        self.memory_usage += status.payload_bytes();
+        if let Some(old) = Arc::make_mut(&mut self.statuses).insert(message_id, Arc::new(status)) {
+            self.memory_usage -= old.payload_bytes();
+        }
+
+        if self.memory_usage > ingress_memory_capacity.get() as usize {
+            self.forget_terminal_statuses(ingress_memory_capacity);
+        }
+
+        debug_assert_eq!(
+            Self::compute_memory_usage(&self.statuses),
+            self.memory_usage
+        );
     }
 
     /// Returns an iterator over response statuses, sorted lexicographically by
     /// message id.
     pub fn statuses(&self) -> impl Iterator<Item = (&MessageId, &IngressStatus)> {
-        self.statuses.iter()
+        self.statuses
+            .iter()
+            .map(|(id, status)| (id, status.as_ref()))
     }
 
     /// Returns an iterator over pruning times statuses, sorted
@@ -851,7 +1130,7 @@ impl IngressHistoryState {
 
     /// Retrieves an entry from the ingress history given a `MessageId`.
     pub fn get(&self, message_id: &MessageId) -> Option<&IngressStatus> {
-        self.statuses.get(message_id)
+        self.statuses.get(message_id).map(|status| status.as_ref())
     }
 
     /// Returns the number of statuses kept in the ingress history.
@@ -872,11 +1151,101 @@ impl IngressHistoryState {
         let statuses = Arc::make_mut(&mut self.statuses);
         for t in self.pruning_times.as_ref().keys() {
             for message_id in self.pruning_times.get(t).unwrap() {
-                statuses.remove(message_id);
+                if let Some(removed) = statuses.remove(message_id) {
+                    self.memory_usage -= removed.payload_bytes();
+                }
+            }
+        }
+        self.pruning_times = Arc::new(new_pruning_times);
+
+        debug_assert_eq!(
+            Self::compute_memory_usage(&self.statuses),
+            self.memory_usage
+        );
+    }
+
+    /// Goes over the `pruning_times` from oldest to newest and transitions
+    /// the referenced `Completed` and/or `Failed` statuses to `Done` (i.e.,
+    /// forgets the replies). It will stop at the pruning time where the memory
+    /// usage is below `target_size` for the first time. To handle repeated calls
+    /// efficiently it remembers the pruning time it stopped at.
+    ///
+    /// Note that this function must remain private and should only be
+    /// called from within `insert` to ensure that `next_terminal_time`
+    /// is consistently updated and we don't miss any completed statuses.
+    fn forget_terminal_statuses(&mut self, target_size: NumBytes) {
+        // Before certification version 8 no done statuses are produced
+        if CURRENT_CERTIFICATION_VERSION < CertificationVersion::V8 {
+            return;
+        }
+
+        // In debug builds we store the length of the statuses map here so that
+        // we can later debug_assert that no status disappeared.
+        #[cfg(debug_assertions)]
+        let statuses_len_before = self.statuses.len();
+
+        let target_size = target_size.get() as usize;
+        let statuses = Arc::make_mut(&mut self.statuses);
+
+        for (time, ids) in self
+            .pruning_times
+            .range((Included(self.next_terminal_time), Unbounded))
+        {
+            self.next_terminal_time = *time;
+
+            if self.memory_usage <= target_size {
+                break;
+            }
+
+            for id in ids.iter() {
+                match statuses.get(id).map(Arc::as_ref) {
+                    Some(&IngressStatus::Completed {
+                        receiver,
+                        user_id,
+                        time,
+                        ..
+                    })
+                    | Some(&IngressStatus::Failed {
+                        receiver,
+                        user_id,
+                        time,
+                        ..
+                    }) => {
+                        let done_status = Arc::new(IngressStatus::Done {
+                            receiver,
+                            user_id,
+                            time,
+                        });
+                        self.memory_usage += done_status.payload_bytes();
+
+                        // We can safely unwrap here because we know there must be an
+                        // ingress status with the given `id` in `statuses` in this
+                        // branch.
+                        let old_status = statuses.insert(id.clone(), done_status).unwrap();
+                        self.memory_usage -= old_status.payload_bytes();
+                    }
+                    _ => continue,
+                }
             }
         }
 
-        self.pruning_times = Arc::new(new_pruning_times);
+        #[cfg(debug_assertions)]
+        debug_assert_eq!(self.statuses.len(), statuses_len_before);
+        debug_assert_eq!(
+            Self::compute_memory_usage(&self.statuses),
+            self.memory_usage
+        );
+    }
+
+    /// Returns the memory usage of the statuses in the ingress history. See the
+    /// documentation of `IngressStatus` for how the byte size of an individual
+    /// `IngressStatus` is computed.
+    pub fn memory_usage(&self) -> NumBytes {
+        NumBytes::new(self.memory_usage as u64)
+    }
+
+    fn compute_memory_usage(statuses: &BTreeMap<MessageId, Arc<IngressStatus>>) -> usize {
+        statuses.values().map(|status| status.payload_bytes()).sum()
     }
 }
 

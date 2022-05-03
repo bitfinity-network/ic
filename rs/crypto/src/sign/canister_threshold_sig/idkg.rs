@@ -5,9 +5,8 @@ use ic_interfaces::crypto::IDkgProtocol;
 use ic_logger::{debug, new_logger};
 use ic_types::crypto::canister_threshold_sig::error::{
     IDkgCreateDealingError, IDkgCreateTranscriptError, IDkgLoadTranscriptError,
-    IDkgLoadTranscriptWithOpeningsError, IDkgOpenTranscriptError, IDkgVerifyComplaintError,
-    IDkgVerifyDealingPrivateError, IDkgVerifyDealingPublicError, IDkgVerifyOpeningError,
-    IDkgVerifyTranscriptError,
+    IDkgOpenTranscriptError, IDkgVerifyComplaintError, IDkgVerifyDealingPrivateError,
+    IDkgVerifyDealingPublicError, IDkgVerifyOpeningError, IDkgVerifyTranscriptError,
 };
 use ic_types::crypto::canister_threshold_sig::idkg::{
     IDkgComplaint, IDkgDealing, IDkgMultiSignedDealing, IDkgOpening, IDkgTranscript,
@@ -16,10 +15,16 @@ use ic_types::crypto::canister_threshold_sig::idkg::{
 use ic_types::NodeId;
 use std::collections::BTreeMap;
 
+mod complaint;
 mod dealing;
 mod mocks;
 mod transcript;
 mod utils;
+
+pub use utils::{
+    get_mega_pubkey, mega_public_key_from_proto, MEGaPublicKeyFromProtoError,
+    MegaKeyFromRegistryError,
+};
 
 /// Currently, these are implemented with noop stubs,
 /// while the true implementation is in progress.
@@ -50,6 +55,7 @@ impl<C: CryptoServiceProvider> IDkgProtocol for CryptoComponentFatClient<C> {
     fn verify_dealing_public(
         &self,
         params: &IDkgTranscriptParams,
+        dealer_id: NodeId,
         dealing: &IDkgDealing,
     ) -> Result<(), IDkgVerifyDealingPublicError> {
         let logger = new_logger!(&self.logger;
@@ -59,7 +65,7 @@ impl<C: CryptoServiceProvider> IDkgProtocol for CryptoComponentFatClient<C> {
         debug!(logger;
             crypto.description => "start",
         );
-        let result = mocks::verify_dealing_public(params, dealing);
+        let result = dealing::verify_dealing_public(&self.csp, params, dealer_id, dealing);
         debug!(logger;
             crypto.description => "end",
             crypto.is_ok => result.is_ok(),
@@ -71,6 +77,7 @@ impl<C: CryptoServiceProvider> IDkgProtocol for CryptoComponentFatClient<C> {
     fn verify_dealing_private(
         &self,
         params: &IDkgTranscriptParams,
+        dealer_id: NodeId,
         dealing: &IDkgDealing,
     ) -> Result<(), IDkgVerifyDealingPrivateError> {
         let logger = new_logger!(&self.logger;
@@ -80,7 +87,14 @@ impl<C: CryptoServiceProvider> IDkgProtocol for CryptoComponentFatClient<C> {
         debug!(logger;
             crypto.description => "start",
         );
-        let result = mocks::verify_dealing_private(params, dealing);
+        let result = dealing::verify_dealing_private(
+            &self.csp,
+            &self.node_id,
+            &self.registry_client,
+            params,
+            dealer_id,
+            dealing,
+        );
         debug!(logger;
             crypto.description => "end",
             crypto.is_ok => result.is_ok(),
@@ -125,7 +139,8 @@ impl<C: CryptoServiceProvider> IDkgProtocol for CryptoComponentFatClient<C> {
         debug!(logger;
             crypto.description => "start",
         );
-        let result = mocks::verify_transcript(params, transcript);
+        let result =
+            transcript::verify_transcript(&self.csp, &self.registry_client, params, transcript);
         debug!(logger;
             crypto.description => "end",
             crypto.is_ok => result.is_ok(),
@@ -162,7 +177,7 @@ impl<C: CryptoServiceProvider> IDkgProtocol for CryptoComponentFatClient<C> {
     fn verify_complaint(
         &self,
         transcript: &IDkgTranscript,
-        complainer: NodeId,
+        complainer_id: NodeId,
         complaint: &IDkgComplaint,
     ) -> Result<(), IDkgVerifyComplaintError> {
         let logger = new_logger!(&self.logger;
@@ -172,7 +187,13 @@ impl<C: CryptoServiceProvider> IDkgProtocol for CryptoComponentFatClient<C> {
         debug!(logger;
             crypto.description => "start",
         );
-        let result = mocks::verify_complaint(transcript, complainer, complaint);
+        let result = complaint::verify_complaint(
+            &self.csp,
+            &self.registry_client,
+            transcript,
+            complaint,
+            complainer_id,
+        );
         debug!(logger;
             crypto.description => "end",
             crypto.is_ok => result.is_ok(),
@@ -184,6 +205,7 @@ impl<C: CryptoServiceProvider> IDkgProtocol for CryptoComponentFatClient<C> {
     fn open_transcript(
         &self,
         transcript: &IDkgTranscript,
+        complainer_id: NodeId,
         complaint: &IDkgComplaint,
     ) -> Result<IDkgOpening, IDkgOpenTranscriptError> {
         let logger = new_logger!(&self.logger;
@@ -193,7 +215,14 @@ impl<C: CryptoServiceProvider> IDkgProtocol for CryptoComponentFatClient<C> {
         debug!(logger;
             crypto.description => "start",
         );
-        let result = mocks::open_transcript(transcript, complaint);
+        let result = transcript::open_transcript(
+            &self.csp,
+            &self.node_id,
+            &self.registry_client,
+            transcript,
+            complainer_id,
+            complaint,
+        );
         debug!(logger;
             crypto.description => "end",
             crypto.is_ok => result.is_ok(),
@@ -216,7 +245,7 @@ impl<C: CryptoServiceProvider> IDkgProtocol for CryptoComponentFatClient<C> {
         debug!(logger;
             crypto.description => "start",
         );
-        let result = mocks::verify_opening(transcript, opener, opening, complaint);
+        let result = transcript::verify_opening(&self.csp, transcript, opener, opening, complaint);
         debug!(logger;
             crypto.description => "end",
             crypto.is_ok => result.is_ok(),
@@ -227,9 +256,9 @@ impl<C: CryptoServiceProvider> IDkgProtocol for CryptoComponentFatClient<C> {
 
     fn load_transcript_with_openings(
         &self,
-        transcript: IDkgTranscript,
-        openings: BTreeMap<IDkgComplaint, BTreeMap<NodeId, IDkgOpening>>,
-    ) -> Result<(), IDkgLoadTranscriptWithOpeningsError> {
+        transcript: &IDkgTranscript,
+        openings: &BTreeMap<IDkgComplaint, BTreeMap<NodeId, IDkgOpening>>,
+    ) -> Result<(), IDkgLoadTranscriptError> {
         let logger = new_logger!(&self.logger;
             crypto.trait_name => "IDkgProtocol",
             crypto.method_name => "load_transcript_with_openings",
@@ -237,7 +266,13 @@ impl<C: CryptoServiceProvider> IDkgProtocol for CryptoComponentFatClient<C> {
         debug!(logger;
             crypto.description => "start",
         );
-        let result = mocks::load_transcript_with_openings(transcript, openings);
+        let result = transcript::load_transcript_with_openings(
+            &self.csp,
+            &self.node_id,
+            &self.registry_client,
+            transcript,
+            openings,
+        );
         debug!(logger;
             crypto.description => "end",
             crypto.is_ok => result.is_ok(),

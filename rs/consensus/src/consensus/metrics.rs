@@ -27,7 +27,7 @@ impl BlockMakerMetrics {
                 &["status"],
             ),
             block_size_bytes_estimate: metrics_registry.int_gauge_vec(
-                "consensus_block_size_bytes_estimate", 
+                "consensus_block_size_bytes_estimate",
                 "An estimate about the block size produced by the block maker.",
                 &["payload_type"])
         }
@@ -187,7 +187,6 @@ impl NotaryMetrics {
 pub struct PayloadBuilderMetrics {
     pub get_payload_duration: Histogram,
     pub validate_payload_duration: Histogram,
-    pub ingress_payload_cache_size: IntGauge,
     pub past_payloads_length: Histogram,
 }
 
@@ -207,10 +206,6 @@ impl PayloadBuilderMetrics {
                 // 0.1ms, 0.2ms, 0.5ms, 1ms, 2ms, 5ms, 10ms, 20ms, 50ms, 100ms, 200ms, 500ms,
                 // 1s, 2s, 5s
                 decimal_buckets(-4, 0),
-            ),
-            ingress_payload_cache_size: metrics_registry.int_gauge(
-                "ingress_payload_cache_size",
-                "The number of HashSets in payload builder's ingress payload cache.",
             ),
             past_payloads_length: metrics_registry.histogram(
                 "consensus_past_payloads_length",
@@ -354,7 +349,7 @@ impl EcdsaPreSignerMetrics {
         Self {
             on_state_change_duration: metrics_registry.histogram_vec(
                 "ecdsa_pre_signer_on_state_change_duration_seconds",
-                "The time it took to execute ECDSA on_state_change(), in seconds",
+                "The time it took to execute pre-signer on_state_change(), in seconds",
                 // 0.1ms, 0.2ms, 0.5ms, 1ms, 2ms, 5ms, 10ms, 20ms, 50ms, 100ms, 200ms, 500ms,
                 // 1s, 2s, 5s, 10s, 20s, 50s, 100s, 200s, 500s
                 decimal_buckets(-4, 2),
@@ -382,10 +377,162 @@ impl EcdsaPreSignerMetrics {
     }
 }
 
+#[derive(Clone)]
+pub struct EcdsaSignerMetrics {
+    pub on_state_change_duration: HistogramVec,
+    pub sign_metrics: IntCounterVec,
+    pub sign_errors: IntCounterVec,
+}
+
+impl EcdsaSignerMetrics {
+    pub fn new(metrics_registry: MetricsRegistry) -> Self {
+        Self {
+            on_state_change_duration: metrics_registry.histogram_vec(
+                "ecdsa_signer_on_state_change_duration_seconds",
+                "The time it took to execute signer on_state_change(), in seconds",
+                // 0.1ms, 0.2ms, 0.5ms, 1ms, 2ms, 5ms, 10ms, 20ms, 50ms, 100ms, 200ms, 500ms,
+                // 1s, 2s, 5s, 10s, 20s, 50s, 100s, 200s, 500s
+                decimal_buckets(-4, 2),
+                &["sub_component"],
+            ),
+            sign_metrics: metrics_registry.int_counter_vec(
+                "ecdsa_signer_metrics",
+                "Signing related metrics",
+                &["type"],
+            ),
+            sign_errors: metrics_registry.int_counter_vec(
+                "ecdsa_signer_errors",
+                "Signing related errors",
+                &["type"],
+            ),
+        }
+    }
+    pub fn sign_metrics_inc(&self, label: &str) {
+        self.sign_metrics.with_label_values(&[label]).inc();
+    }
+
+    pub fn sign_errors_inc(&self, label: &str) {
+        self.sign_errors.with_label_values(&[label]).inc();
+    }
+}
+
+pub struct EcdsaPayloadMetrics {
+    pub payload_metrics: IntGaugeVec,
+    pub payload_errors: IntCounterVec,
+    pub transcript_builder_metrics: IntCounterVec,
+    pub transcript_builder_errors: IntCounterVec,
+    pub transcript_builder_duration: HistogramVec,
+}
+
+impl EcdsaPayloadMetrics {
+    pub fn new(metrics_registry: MetricsRegistry) -> Self {
+        Self {
+            payload_metrics: metrics_registry.int_gauge_vec(
+                "ecdsa_payload_metrics",
+                "ECDSA payload related metrics",
+                &["type"],
+            ),
+            payload_errors: metrics_registry.int_counter_vec(
+                "ecdsa_payload_errors",
+                "ECDSA payload related errors",
+                &["type"],
+            ),
+            transcript_builder_metrics: metrics_registry.int_counter_vec(
+                "ecdsa_transcript_builder_metrics",
+                "ECDSA transcript builder metrics",
+                &["type"],
+            ),
+            transcript_builder_errors: metrics_registry.int_counter_vec(
+                "ecdsa_transcript_builder_errors",
+                "ECDSA transcript builder related errors",
+                &["type"],
+            ),
+            transcript_builder_duration: metrics_registry.histogram_vec(
+                "ecdsa_transcript_builder_duration_seconds",
+                "Time taken by transcript builder, in seconds",
+                // 0.1ms, 0.2ms, 0.5ms, 1ms, 2ms, 5ms, 10ms, 20ms, 50ms, 100ms, 200ms, 500ms,
+                // 1s, 2s, 5s, 10s, 20s, 50s, 100s, 200s, 500s
+                decimal_buckets(-4, 2),
+                &["sub_component"],
+            ),
+        }
+    }
+
+    pub fn payload_metrics_set(&self, label: &str, value: i64) {
+        self.payload_metrics.with_label_values(&[label]).set(value);
+    }
+
+    pub fn payload_metrics_inc(&self, label: &str) {
+        self.payload_metrics.with_label_values(&[label]).inc();
+    }
+
+    pub fn payload_errors_inc(&self, label: &str) {
+        self.payload_errors.with_label_values(&[label]).inc();
+    }
+
+    pub fn transcript_builder_metrics_inc(&self, label: &str) {
+        self.transcript_builder_metrics
+            .with_label_values(&[label])
+            .inc();
+    }
+
+    pub fn transcript_builder_metrics_inc_by(&self, value: u64, label: &str) {
+        self.transcript_builder_metrics
+            .with_label_values(&[label])
+            .inc_by(value);
+    }
+
+    pub fn transcript_builder_errors_inc(&self, label: &str) {
+        self.transcript_builder_errors
+            .with_label_values(&[label])
+            .inc();
+    }
+}
+
 pub fn timed_call<F, R>(label: &str, call_fn: F, metric: &HistogramVec) -> R
 where
     F: FnOnce() -> R,
 {
     let _timer = metric.with_label_values(&[label]).start_timer();
     (call_fn)()
+}
+
+#[derive(Clone)]
+pub struct EcdsaComplaintMetrics {
+    pub on_state_change_duration: HistogramVec,
+    pub complaint_metrics: IntCounterVec,
+    pub complaint_errors: IntCounterVec,
+}
+
+impl EcdsaComplaintMetrics {
+    pub fn new(metrics_registry: MetricsRegistry) -> Self {
+        Self {
+            on_state_change_duration: metrics_registry.histogram_vec(
+                "ecdsa_complaint_on_state_change_duration_seconds",
+                "The time it took to execute complaint on_state_change(), in seconds",
+                // 0.1ms, 0.2ms, 0.5ms, 1ms, 2ms, 5ms, 10ms, 20ms, 50ms, 100ms, 200ms, 500ms,
+                // 1s, 2s, 5s, 10s, 20s, 50s, 100s, 200s, 500s
+                decimal_buckets(-4, 2),
+                &["sub_component"],
+            ),
+            complaint_metrics: metrics_registry.int_counter_vec(
+                "ecdsa_complaint_metrics",
+                "Complaint related metrics",
+                &["type"],
+            ),
+            complaint_errors: metrics_registry.int_counter_vec(
+                "ecdsa_complaint_errors",
+                "Complaint related errors",
+                &["type"],
+            ),
+        }
+    }
+
+    pub fn complaint_metrics_inc(&self, label: &str) {
+        self.complaint_metrics.with_label_values(&[label]).inc();
+    }
+
+    pub fn complaint_errors_inc(&self, label: &str) {
+        self.complaint_errors.with_label_values(&[label]).inc();
+    }
 }

@@ -25,7 +25,29 @@ pub struct SummaryPayload {
     pub ecdsa: ecdsa::Summary,
 }
 
+impl SummaryPayload {
+    /// Return the oldest registry version that is still referenced by
+    /// parts of the summary block.
+    ///
+    /// P2P should keep up connections to all nodes registered in any registry
+    /// between the one returned from this function and the current
+    /// `RegistryVersion`.
+    pub fn get_oldest_registry_version_in_use(&self) -> RegistryVersion {
+        let dkg_version = self.dkg.get_oldest_registry_version_in_use();
+        if let Some(ecdsa_version) = self
+            .ecdsa
+            .as_ref()
+            .and_then(|payload| payload.get_oldest_registry_version_in_use())
+        {
+            dkg_version.min(ecdsa_version)
+        } else {
+            dkg_version
+        }
+    }
+}
+
 /// Block payload is either summary or a data payload).
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub enum BlockPayload {
     /// A BlockPayload::Summary contains only a DKG Summary
@@ -207,16 +229,16 @@ impl From<Payload> for BlockPayload {
     }
 }
 
-impl From<dkg::Summary> for BlockPayload {
-    fn from(dkg: dkg::Summary) -> BlockPayload {
-        let ecdsa = ecdsa::Summary::default();
+impl From<(dkg::Summary, ecdsa::Summary)> for BlockPayload {
+    fn from((dkg, ecdsa): (dkg::Summary, ecdsa::Summary)) -> BlockPayload {
         BlockPayload::Summary(SummaryPayload { dkg, ecdsa })
     }
 }
 
-impl From<(BatchPayload, dkg::Dealings)> for BlockPayload {
-    fn from((batch, dealings): (BatchPayload, dkg::Dealings)) -> BlockPayload {
-        let ecdsa = ecdsa::Payload::default();
+impl From<(BatchPayload, dkg::Dealings, ecdsa::Payload)> for BlockPayload {
+    fn from(
+        (batch, dealings, ecdsa): (BatchPayload, dkg::Dealings, ecdsa::Payload),
+    ) -> BlockPayload {
         BlockPayload::Data(DataPayload {
             batch,
             dealings,
@@ -228,7 +250,7 @@ impl From<(BatchPayload, dkg::Dealings)> for BlockPayload {
 impl From<dkg::Payload> for BlockPayload {
     fn from(payload: dkg::Payload) -> BlockPayload {
         match payload {
-            dkg::Payload::Summary(summary) => summary.into(),
+            dkg::Payload::Summary(summary) => (summary, None).into(),
             dkg::Payload::Dealings(dealings) => BlockPayload::Data(DataPayload {
                 batch: BatchPayload::default(),
                 dealings,

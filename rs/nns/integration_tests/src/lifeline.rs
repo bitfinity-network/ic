@@ -1,9 +1,12 @@
 use dfn_candid::{candid, candid_one};
 
 use ic_canister_client::Sender;
+use ic_nervous_system_common_test_keys::{
+    TEST_NEURON_1_OWNER_KEYPAIR, TEST_NEURON_2_OWNER_KEYPAIR,
+};
+use ic_nervous_system_root::{CanisterIdRecord, CanisterStatusResult};
 use ic_nns_common::pb::v1::NeuronId;
 use ic_nns_common::types::ProposalId;
-use ic_nns_constants::ids::{TEST_NEURON_1_OWNER_KEYPAIR, TEST_NEURON_2_OWNER_KEYPAIR};
 use ic_nns_governance::pb::v1::manage_neuron::Command;
 use ic_nns_governance::pb::v1::manage_neuron::NeuronIdOrSubaccount;
 use ic_nns_governance::pb::v1::{
@@ -11,10 +14,9 @@ use ic_nns_governance::pb::v1::{
     NnsFunction, ProposalStatus, Vote,
 };
 use ic_nns_governance::proposal_submission::create_external_update_proposal_candid;
-use ic_nns_handler_root::common::{CanisterIdRecord, CanisterStatusResult};
 use ic_nns_test_utils::ids::{TEST_NEURON_1_ID, TEST_NEURON_2_ID};
 use ic_nns_test_utils::{
-    governance::{get_pending_proposals, wait_for_final_state, UpgradeRootProposalPayload},
+    governance::{get_pending_proposals, wait_for_final_state, UpgradeRootProposal},
     itest_helpers::{local_test_on_nns_subnet, NnsCanisters, NnsInitPayloadsBuilder},
 };
 
@@ -75,7 +77,7 @@ fn test_submit_and_accept_root_canister_upgrade_proposal() {
             "",
             "",
             NnsFunction::NnsRootUpgrade,
-            UpgradeRootProposalPayload {
+            UpgradeRootProposal {
                 wasm_module: wasm_module.clone(),
                 module_arg: magic.to_vec(),
                 stop_upgrade_start: true,
@@ -197,7 +199,7 @@ fn test_submit_and_accept_forced_root_canister_upgrade_proposal() {
             "",
             "",
             NnsFunction::NnsRootUpgrade,
-            UpgradeRootProposalPayload {
+            UpgradeRootProposal {
                 wasm_module: empty_wasm.to_vec(),
                 module_arg: init_arg.to_vec(),
                 stop_upgrade_start: false,

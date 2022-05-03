@@ -3,13 +3,13 @@ use crate::group::{EccCurveType, EccPoint, EccScalar};
 use crate::{ThresholdEcdsaError, ThresholdEcdsaResult};
 use hex_literal::hex;
 
-/// Conditional move matching draft-irtf-cfrg-hash-to-curve-12 notation
+/// Conditional move matching draft-irtf-cfrg-hash-to-curve-14 notation
 ///
 /// CMOV(a, b, c): If c is False, CMOV returns a, otherwise it returns b.
 fn cmov(
     a: &EccFieldElement,
     b: &EccFieldElement,
-    c: bool,
+    c: subtle::Choice,
 ) -> ThresholdEcdsaResult<EccFieldElement> {
     let mut r = *a;
     r.ct_assign(b, c)?;
@@ -19,14 +19,14 @@ fn cmov(
 fn sqrt_ratio(
     u: &EccFieldElement,
     v: &EccFieldElement,
-) -> ThresholdEcdsaResult<(bool, EccFieldElement)> {
+) -> ThresholdEcdsaResult<(subtle::Choice, EccFieldElement)> {
     if u.curve_type() != v.curve_type() {
         return Err(ThresholdEcdsaError::CurveMismatch);
     }
 
     // By the construction of tv6 in sswu this cannot occur, but check just to
     // be safe as otherwise the output of this function is not well defined.
-    if v.is_zero() {
+    if bool::from(v.is_zero()) {
         return Err(ThresholdEcdsaError::InvalidArguments(
             "sqrt_ratio v == 0".to_string(),
         ));
@@ -36,7 +36,7 @@ fn sqrt_ratio(
 
     if curve_type == EccCurveType::P256 || curve_type == EccCurveType::K256 {
         // Fast codepath for curves where p == 3 (mod 4)
-        // See https://www.ietf.org/archive/id/draft-irtf-cfrg-hash-to-curve-12.html#appendix-F.2.1.2
+        // See https://www.ietf.org/archive/id/draft-irtf-cfrg-hash-to-curve-14.html#appendix-F.2.1.2
         let c2 = EccFieldElement::sswu_c2(curve_type);
 
         let tv1 = v.square()?;
@@ -47,25 +47,30 @@ fn sqrt_ratio(
         let y2 = y1.mul(&c2)?;
         let tv3 = y1.square()?;
         let tv3 = tv3.mul(v)?;
-        let is_qr = tv3 == *u;
+        let is_qr = tv3.ct_eq(u)?;
         let y = cmov(&y2, &y1, is_qr)?;
         Ok((is_qr, y))
     } else {
         // Generic but slower codepath for other primes
+        //
+        // There is a faster algorithm for this presented in
+        // https://www.ietf.org/archive/id/draft-irtf-cfrg-hash-to-curve-14.html#appendix-F.2.1.1
+        // that we may want to consider using in the future, should we require
+        // hash2curve support for curves with p == 1 (mod 4)
+
         let z = EccFieldElement::sswu_z(curve_type);
         let vinv = v.invert();
         let uov = u.mul(&vinv)?;
-        let sqrt_uov = uov.sqrt();
-        let uov_is_qr = !sqrt_uov.is_zero();
+        let (uov_is_qr, sqrt_uov) = uov.sqrt();
         let z_uov = z.mul(&uov)?;
-        let sqrt_z_uov = z_uov.sqrt();
+        let (_, sqrt_z_uov) = z_uov.sqrt();
         Ok((uov_is_qr, cmov(&sqrt_z_uov, &sqrt_uov, uov_is_qr)?))
     }
 }
 
 /// Simplified Shallue-van de Woestijne-Ulas method
 ///
-/// https://www.ietf.org/archive/id/draft-irtf-cfrg-hash-to-curve-12.html#name-simplified-swu-method
+/// https://www.ietf.org/archive/id/draft-irtf-cfrg-hash-to-curve-14.html#name-simplified-swu-method
 #[allow(clippy::many_single_char_names)]
 fn sswu(u: &EccFieldElement) -> ThresholdEcdsaResult<(EccFieldElement, EccFieldElement)> {
     let curve = u.curve_type();
@@ -99,7 +104,8 @@ fn sswu(u: &EccFieldElement) -> ThresholdEcdsaResult<(EccFieldElement, EccFieldE
     y = y.mul(&y1)?;
     x = cmov(&x, &tv3, is_gx1_square)?;
     y = cmov(&y, &y1, is_gx1_square)?;
-    let e1 = u.sign() == y.sign();
+    // Same as u.sign() == y.sign() but hopefully less problematic re constant-time
+    let e1 = subtle::Choice::from(u.sign() ^ y.sign() ^ 1);
     y = cmov(&y.negate()?, &y, e1)?;
     x = x.mul(&tv4.invert())?;
 
@@ -129,7 +135,7 @@ fn hash_to_field(
     let field_len = (p_bits + security_level + 7) / 8; // "L" in spec
     let len_in_bytes = count * field_len;
 
-    let uniform_bytes = crate::xmd::expand_message_xmd(input, domain_separator, len_in_bytes);
+    let uniform_bytes = crate::xmd::expand_message_xmd(input, domain_separator, len_in_bytes)?;
 
     let mut out = Vec::with_capacity(count);
 
@@ -156,7 +162,7 @@ pub(crate) fn hash_to_scalar(
     let field_len = (s_bits + security_level + 7) / 8; // "L" in spec
     let len_in_bytes = count * field_len;
 
-    let uniform_bytes = crate::xmd::expand_message_xmd(input, domain_separator, len_in_bytes);
+    let uniform_bytes = crate::xmd::expand_message_xmd(input, domain_separator, len_in_bytes)?;
 
     let mut out = Vec::with_capacity(count);
 

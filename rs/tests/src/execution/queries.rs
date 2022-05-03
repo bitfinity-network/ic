@@ -1,9 +1,10 @@
 /* tag::catalog[]
 end::catalog[] */
 
+use crate::driver::ic::InternetComputer;
 use crate::types::*;
 use crate::util::*;
-use ic_fondue::{ic_manager::IcHandle, internet_computer::InternetComputer};
+use ic_fondue::ic_manager::IcHandle;
 use ic_registry_subnet_type::SubnetType;
 use ic_utils::interfaces::ManagementCanister;
 
@@ -14,7 +15,7 @@ pub fn config() -> InternetComputer {
 }
 
 /// Tests that query replies can be larger than update replies.
-pub fn query_reply_sizes(handle: IcHandle, ctx: &fondue::pot::Context) {
+pub fn query_reply_sizes(handle: IcHandle, ctx: &ic_fondue::pot::Context) {
     // A wasm that exports a query function that has a 3MiB reply.
     let wasm = wabt::wat2wasm(
         r#"(module

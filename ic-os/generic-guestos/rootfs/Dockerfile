@@ -1,18 +1,22 @@
-# GenericOS - Main Image
+# GenericOS - Main Docker Image
 #
 # Build steps:
-# - `docker build -t dfinity/genericos-main -f Dockerfile .`
-# - `docker push dfinity/genericos-main`
+# - `docker build --pull -t dfinity/genericos-main -f Dockerfile .`
 #
 # First build stage:
 # - Construct the actual target image (IC-OS root filesystem)
 #
+# Update below image when new dfinity/genericos-base image gets produced (see deploy-guest-os-baseimg CI job on master/rc).
 FROM dfinity/genericos-base@sha256:058e1ad7c8de4a482416eac322497b9aa44452a606b407aa4ca5d3cb7edaf27c
 
 RUN mkdir -p /boot/{efi,grub}
 
 COPY /etc /etc
 COPY /opt /opt
+
+# Update POSIX permissions in /etc/
+RUN find /etc -type d -exec chmod 0755 {} \+ && \
+    find /etc -type f -not -path "/etc/hostname" -not -path "/etc/hosts" -not -path "/etc/resolv.conf" -exec chmod 0644 {} \+
 
 # Regenerate initramfs (config changed after copying in /etc)
 RUN RESUME=none SOURCE_DATE_EPOCH=0 update-initramfs -c -k all
@@ -42,7 +46,8 @@ RUN systemctl enable \
     nftables \
     systemd-networkd \
     systemd-networkd-wait-online \
-    systemd-resolved
+    systemd-resolved \
+    systemd-journal-gatewayd
 
 # User which will run the dfinity boundary node service.
 RUN adduser --system --disabled-password --home /var/lib/ic --no-create-home dfinity
@@ -77,3 +82,8 @@ RUN adduser --system --disabled-password --home /var/lib/admin --shell /bin/bash
 # RUN rm /etc/ssh/ssh*key*
 # RUN sed -e "s/.*PermitRootLogin.*/PermitRootLogin yes/" -i /etc/ssh/sshd_config
 
+RUN chmod 0440 /etc/sudoers
+
+# Compile locale specification
+RUN apt-get -y update && apt-get -y --no-install-recommends install locales
+RUN localedef -i en_US -c -f UTF-8 -A /usr/share/locale/locale.alias en_US.UTF-8

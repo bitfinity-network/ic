@@ -3,6 +3,7 @@ use crate::{common::LOG_PREFIX, registry::Registry};
 use candid::{CandidType, Deserialize};
 #[cfg(target_arch = "wasm32")]
 use dfn_core::println;
+use serde::Serialize;
 
 use ic_base_types::NodeId;
 use ic_nns_common::registry::{encode_or_panic, get_subnet_ids_from_subnet_list};
@@ -12,7 +13,10 @@ use ic_registry_transport::update;
 impl Registry {
     /// Remove nodes from their subnets
     pub fn do_remove_nodes_from_subnet(&mut self, payload: RemoveNodesFromSubnetPayload) {
-        println!("{}do_remove_nodes_from_subnet: {:?}", LOG_PREFIX, payload);
+        println!(
+            "{}do_remove_nodes_from_subnet started: {:?}",
+            LOG_PREFIX, payload
+        );
 
         let mutations = get_subnet_ids_from_subnet_list(self.get_subnet_list_record())
             .into_iter()
@@ -29,7 +33,7 @@ impl Registry {
 
                 if initial_len != subnet.membership.len() {
                     Some(update(
-                        make_subnet_record_key(subnet_id).as_bytes().to_vec(),
+                        make_subnet_record_key(subnet_id).as_bytes(),
                         encode_or_panic(&subnet),
                     ))
                 } else {
@@ -40,11 +44,16 @@ impl Registry {
 
         // Check invariants before applying mutations
         self.maybe_apply_mutation_internal(mutations);
+
+        println!(
+            "{}do_remove_nodes_from_subnet finished: {:?}",
+            LOG_PREFIX, payload
+        );
     }
 }
 
 /// The payload of a proposal to remove a Node from a Subnet
-#[derive(CandidType, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct RemoveNodesFromSubnetPayload {
     /// The list of Node IDs that will be removed from their subnet
     pub node_ids: Vec<NodeId>,

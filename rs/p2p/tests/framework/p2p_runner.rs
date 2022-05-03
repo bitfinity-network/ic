@@ -1,14 +1,16 @@
 use crate::framework::file_tree_artifact_mgr::ArtifactChunkingTestImpl;
-use ic_config::execution_environment::Config as HypervisorConfig;
 use ic_config::subnet_config::SubnetConfigs;
 use ic_cycles_account_manager::CyclesAccountManager;
 use ic_execution_environment::IngressHistoryReaderImpl;
-use ic_interfaces::{registry::RegistryClient, transport::Transport};
+use ic_interfaces::registry::RegistryClient;
+use ic_interfaces_transport::Transport;
 use ic_logger::{debug, info, ReplicaLogger};
 use ic_metrics::MetricsRegistry;
 use ic_registry_client::client::RegistryClientImpl;
 use ic_registry_subnet_type::SubnetType;
-use ic_replica_setup_ic_network::{create_networking_stack, P2PStateSyncClient};
+use ic_replica_setup_ic_network::{
+    create_networking_stack, init_artifact_pools, P2PStateSyncClient,
+};
 use ic_test_utilities::{
     consensus::make_catch_up_package_with_empty_transcript,
     crypto::fake_tls_handshake::FakeTlsHandshake,
@@ -53,8 +55,10 @@ fn execute_test(
     test_synchronizer: P2PTestSynchronizer,
     log: ReplicaLogger,
     test: Box<impl FnOnce(&mut P2PTestContext) + Send + Sync + 'static>,
+    rt_handle: tokio::runtime::Handle,
 ) {
     ic_test_utilities::artifact_pool_config::with_test_pool_config(|artifact_pool_config| {
+        let _rt_guard = rt_handle.enter();
         let metrics_registry = MetricsRegistry::new();
         let state_manager = Arc::new(FakeStateManager::new());
         let node_id = replica_config.node_id;
@@ -77,18 +81,28 @@ fn execute_test(
         let subnet_config = SubnetConfigs::default().own_subnet_config(SubnetType::System);
         let cycles_account_manager = Arc::new(CyclesAccountManager::new(
             subnet_config.scheduler_config.max_instructions_per_message,
-            HypervisorConfig::default().max_cycles_per_canister,
             SubnetType::System,
             subnet_id,
             subnet_config.cycles_account_manager_config,
         ));
 
-        let (_, p2p_runner, _) = create_networking_stack(
+        let artifact_pools = init_artifact_pools(
+            subnet_id,
+            artifact_pool_config,
             metrics_registry.clone(),
             log.clone(),
-            tokio::runtime::Handle::current(),
+            CUPWithOriginalProtobuf::from_cup(make_catch_up_package_with_empty_transcript(
+                registry.clone(),
+                subnet_id,
+            )),
+            None,
+        );
+
+        let (_, p2p_runner) = create_networking_stack(
+            metrics_registry.clone(),
+            log.clone(),
+            rt_handle,
             transport_config,
-            artifact_pool_config,
             Default::default(),
             Default::default(),
             node_id,
@@ -106,14 +120,11 @@ fn execute_test(
             Arc::clone(&fake_crypto) as Arc<_>,
             registry.clone(),
             ingress_hist_reader,
-            CUPWithOriginalProtobuf::from_cup(make_catch_up_package_with_empty_transcript(
-                registry, subnet_id,
-            )),
+            &artifact_pools,
             cycles_account_manager,
             None,
             0,
-        )
-        .expect("Failed to initialize P2P");
+        );
 
         let mut p2p_test_context = P2PTestContext::new(
             node_num,
@@ -128,7 +139,6 @@ fn execute_test(
         // Call the test
         test_synchronizer.wait_on_barrier(P2P_TEST_START_BARRIER.to_string());
         test(&mut p2p_test_context);
-        std::mem::drop(p2p_test_context.p2p);
         test_synchronizer.wait_on_barrier(P2P_TEST_END_BARRIER.to_string());
     })
 }
@@ -201,8 +211,10 @@ fn execute_test_chunking_pool(
     test_synchronizer: P2PTestSynchronizer,
     log: ReplicaLogger,
     test: impl FnOnce(&mut P2PTestContext) + Send + Sync + 'static,
+    rt_handle: tokio::runtime::Handle,
 ) {
     ic_test_utilities::artifact_pool_config::with_test_pool_config(|artifact_pool_config| {
+        let _rt_guard = rt_handle.enter();
         let metrics_registry = MetricsRegistry::new();
         let state_manager = Arc::new(FakeStateManager::new());
         let node_id = replica_config.node_id;
@@ -230,18 +242,28 @@ fn execute_test_chunking_pool(
         let subnet_config = SubnetConfigs::default().own_subnet_config(SubnetType::System);
         let cycles_account_manager = Arc::new(CyclesAccountManager::new(
             subnet_config.scheduler_config.max_instructions_per_message,
-            HypervisorConfig::default().max_cycles_per_canister,
             SubnetType::System,
             subnet_id,
             subnet_config.cycles_account_manager_config,
         ));
 
-        let (_a, p2p_runner, _) = create_networking_stack(
+        let artifact_pools = init_artifact_pools(
+            subnet_id,
+            artifact_pool_config,
             metrics_registry.clone(),
             log.clone(),
-            tokio::runtime::Handle::current(),
+            CUPWithOriginalProtobuf::from_cup(make_catch_up_package_with_empty_transcript(
+                registry.clone(),
+                subnet_id,
+            )),
+            None,
+        );
+
+        let (_a, p2p_runner) = create_networking_stack(
+            metrics_registry.clone(),
+            log.clone(),
+            rt_handle,
             transport_config,
-            artifact_pool_config,
             Default::default(),
             Default::default(),
             node_id,
@@ -259,15 +281,11 @@ fn execute_test_chunking_pool(
             Arc::clone(&fake_crypto) as Arc<_>,
             registry.clone(),
             ingress_hist_reader,
-            CUPWithOriginalProtobuf::from_cup(make_catch_up_package_with_empty_transcript(
-                registry, subnet_id,
-            )),
+            &artifact_pools,
             cycles_account_manager,
             None,
             0,
-        )
-        .expect("Failed to initialize P2P");
-
+        );
         let mut p2p_test_context = P2PTestContext::new(
             node_num,
             subnet_id,
@@ -281,7 +299,6 @@ fn execute_test_chunking_pool(
         // Call the test
         test_synchronizer.wait_on_barrier(P2P_TEST_START_BARRIER.to_string());
         test(&mut p2p_test_context);
-        std::mem::drop(p2p_test_context.p2p);
         test_synchronizer.wait_on_barrier(P2P_TEST_END_BARRIER.to_string());
     })
 }
@@ -298,6 +315,8 @@ pub fn spawn_replicas_as_threads(
     test: impl FnOnce(&mut P2PTestContext) + Copy + Send + Sync + 'static,
 ) {
     // Create a directory inside of `std::env::temp_dir()`
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _rt_guard = rt.enter();
     let temp_dir = Builder::new()
         .prefix("p2p_tests")
         .tempdir()
@@ -338,6 +357,7 @@ pub fn spawn_replicas_as_threads(
             node_test_id(instance_id as u64),
             hub_access.clone(),
             log.clone(),
+            rt.handle().clone(),
         );
         hub_access
             .lock()
@@ -362,11 +382,10 @@ pub fn spawn_replicas_as_threads(
         };
         let mut replica_test_synchronizer = test_synchronizer.clone();
         replica_test_synchronizer.node_id = node_test_id(i as u64);
+        let rt_handle = rt.handle().clone();
         let jh = std::thread::Builder::new()
             .name(format!("Thread Node {}", i))
             .spawn(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                let _rt_guard = rt.enter();
                 // Spawn System
                 if real_artifact_pool {
                     execute_test(
@@ -377,6 +396,7 @@ pub fn spawn_replicas_as_threads(
                         replica_test_synchronizer,
                         replica_log.clone(),
                         test,
+                        rt_handle,
                     );
                 } else {
                     execute_test_chunking_pool(
@@ -387,6 +407,7 @@ pub fn spawn_replicas_as_threads(
                         replica_test_synchronizer,
                         replica_log,
                         test,
+                        rt_handle,
                     );
                 }
             })
@@ -395,7 +416,6 @@ pub fn spawn_replicas_as_threads(
     }
 
     for join_handle in join_handles {
-        #[warn(unused_must_use)]
         assert!(join_handle.join().is_ok())
     }
 

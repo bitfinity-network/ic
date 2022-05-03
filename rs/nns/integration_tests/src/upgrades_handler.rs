@@ -1,8 +1,10 @@
 use dfn_candid::candid;
 
 use ic_canister_client::Sender;
+use ic_nervous_system_common_test_keys::{
+    TEST_NEURON_1_OWNER_KEYPAIR, TEST_NEURON_2_OWNER_KEYPAIR,
+};
 use ic_nns_common::types::{NeuronId, ProposalId};
-use ic_nns_constants::ids::{TEST_NEURON_1_OWNER_KEYPAIR, TEST_NEURON_2_OWNER_KEYPAIR};
 use ic_nns_governance::pb::v1::{ManageNeuronResponse, NnsFunction, ProposalStatus, Vote};
 use ic_nns_test_utils::ids::TEST_NEURON_2_ID;
 use ic_nns_test_utils::{
@@ -23,8 +25,8 @@ fn test_submit_and_accept_bless_replica_version_proposal() {
 
         let proposal_payload = BlessReplicaVersionPayload {
             replica_version_id: "test_replica_version".to_string(),
-            binary_url: "http://test.test".to_string(),
-            sha256_hex: "f0e4c2f76c58916ec258f246851bea091d14d4247a2fc3e18694461b1816e13b".into(),
+            binary_url: "".into(),
+            sha256_hex: "".into(),
             node_manager_binary_url: "".into(),
             node_manager_sha256_hex: "".into(),
             release_package_url: "".into(),

@@ -10,22 +10,22 @@ use ic_crypto::crypto_hash;
 use ic_interfaces::{
     consensus::*,
     consensus_pool::{ChangeAction, ChangeSet, ConsensusPool, ConsensusPoolCache},
-    ingress_pool::IngressPoolSelect,
     registry::RegistryClient,
     validation::*,
 };
-use ic_registry_client::helper::subnet::SubnetRegistry;
+use ic_registry_client_helpers::subnet::SubnetRegistry;
 use ic_types::{
     artifact::*,
     batch::ValidationContext,
     consensus::{
         catchup::CUPWithOriginalProtobuf, dkg, Block, CatchUpContent, CatchUpPackage, HasHeight,
-        HashedBlock, HashedRandomBeacon, Payload, RandomBeaconContent, Rank, ThresholdSignature,
+        HashedBlock, HashedRandomBeacon, Payload, RandomBeaconContent, Rank,
     },
     crypto::{
         threshold_sig::ni_dkg::NiDkgTag, CombinedThresholdSig, CombinedThresholdSigOf, CryptoHash,
         Signed,
     },
+    signature::ThresholdSignature,
     time::UNIX_EPOCH,
     Height, SubnetId, Time,
 };
@@ -78,7 +78,6 @@ mock! {
         fn on_state_change<'a>(
             &'a self,
             consensus_pool: &'a (dyn ConsensusPool + 'a),
-            ingress_pool: &'a (dyn IngressPoolSelect + 'a),
         ) -> ChangeSet;
     }
 }
@@ -98,7 +97,7 @@ mock! {
 
         fn cup_with_protobuf(&self) -> CUPWithOriginalProtobuf;
 
-        fn get_subnet_membership_version(&self) -> RegistryVersion;
+        fn get_oldest_registry_version_in_use(&self) -> RegistryVersion;
     }
 }
 
@@ -202,7 +201,7 @@ pub fn make_genesis(summary: dkg::Summary) -> CatchUpPackage {
     let high_dkg_id = summary.current_transcript(&NiDkgTag::HighThreshold).dkg_id;
     let block = Block::new(
         Id::from(CryptoHash(Vec::new())),
-        Payload::new(crypto_hash, summary.into()),
+        Payload::new(crypto_hash, (summary, None).into()),
         height,
         Rank(0),
         ValidationContext {

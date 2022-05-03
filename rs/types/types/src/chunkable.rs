@@ -18,7 +18,8 @@
 use crate::{
     artifact::{Artifact, StateSyncMessage},
     consensus::{
-        certification::CertificationMessage, dkg::Message as DkgMessage, ConsensusMessage,
+        certification::CertificationMessage, dkg::Message as DkgMessage, ecdsa::EcdsaMessage,
+        ConsensusMessage,
     },
     crypto::CryptoHash,
     messages::SignedIngress,
@@ -42,6 +43,7 @@ const CHUNKID_UNIT_CHUNK: u32 = 0;
 
 /// The data contained in an artifact chunk.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[allow(clippy::large_enum_variant)]
 pub enum ArtifactChunkData {
     UnitChunkData(Artifact), // Unit chunk data has 1:1 mapping with real artifacts
     SemiStructuredChunkData(Vec<u8>),
@@ -86,6 +88,7 @@ impl ArtifactChunk {
 
 /// Artifact types composed of a single chunk.
 pub enum SingleChunked {
+    CanisterHttp,
     Consensus,
     Ingress,
     Certification,
@@ -128,6 +131,9 @@ chunkable_artifact_impl! {CertificationMessage, |self|
 }
 chunkable_artifact_impl! {DkgMessage, |self|
     ArtifactChunkData::UnitChunkData(Artifact::DkgMessage(*self))
+}
+chunkable_artifact_impl! {EcdsaMessage, |self|
+    ArtifactChunkData::UnitChunkData(Artifact::EcdsaMessage(*self))
 }
 
 impl ChunkableArtifact for StateSyncMessage {

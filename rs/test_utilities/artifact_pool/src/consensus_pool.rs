@@ -3,23 +3,25 @@ use ic_artifact_pool::dkg_pool::DkgPoolImpl;
 use ic_config::artifact_pool::ArtifactPoolConfig;
 use ic_consensus::consensus::pool_reader::PoolReader;
 use ic_consensus_message::ConsensusMessageHashable;
-use ic_interfaces::state_manager::StateManager;
 use ic_interfaces::{
     consensus_pool::{
-        ChangeAction, ChangeSet, ConsensusPool, ConsensusPoolCache, MutableConsensusPool,
-        PoolSection, UnvalidatedConsensusArtifact, ValidatedConsensusArtifact,
+        ChangeAction, ChangeSet, ConsensusBlockCache, ConsensusPool, ConsensusPoolCache,
+        MutableConsensusPool, PoolSection, UnvalidatedConsensusArtifact,
+        ValidatedConsensusArtifact,
     },
     crypto::{MultiSigner, ThresholdSigner},
     dkg::DkgPool,
     registry::RegistryClient,
     time_source::TimeSource,
 };
+use ic_interfaces_state_manager::StateManager;
 use ic_logger::replica_logger::no_op_logger;
 use ic_replicated_state::ReplicatedState;
 use ic_test_utilities::types::ids::{node_test_id, subnet_test_id};
 use ic_test_utilities::{consensus::fake::*, crypto::CryptoReturningOk, mock_time};
 use ic_types::batch::ValidationContext;
 use ic_types::crypto::threshold_sig::ni_dkg::DkgId;
+use ic_types::signature::*;
 use ic_types::{consensus::*, crypto::*, *};
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -662,6 +664,10 @@ impl TestConsensusPool {
     pub fn get_cache(&self) -> Arc<dyn ConsensusPoolCache> {
         self.pool.get_cache()
     }
+
+    pub fn get_block_cache(&self) -> Arc<dyn ConsensusBlockCache> {
+        self.pool.get_block_cache()
+    }
 }
 
 impl ConsensusPool for TestConsensusPool {
@@ -675,6 +681,10 @@ impl ConsensusPool for TestConsensusPool {
 
     fn as_cache(&self) -> &dyn ConsensusPoolCache {
         self.pool.as_cache()
+    }
+
+    fn as_block_cache(&self) -> &dyn ConsensusBlockCache {
+        self.pool.as_block_cache()
     }
 }
 

@@ -1,10 +1,12 @@
 mod framework;
 
 use crate::framework::ConsensusDriver;
-use ic_artifact_pool::{consensus_pool, dkg_pool};
+use ic_artifact_pool::{canister_http_pool, consensus_pool, dkg_pool, ecdsa_pool};
 use ic_consensus::consensus::dkg_key_manager::DkgKeyManager;
+use ic_consensus::consensus::pool_reader::PoolReader;
 use ic_consensus::{certification::CertifierImpl, consensus::ConsensusImpl, dkg};
-use ic_interfaces::{state_manager::Labeled, time_source::TimeSource};
+use ic_interfaces::time_source::TimeSource;
+use ic_interfaces_state_manager::Labeled;
 use ic_logger::replica_logger::no_op_logger;
 use ic_metrics::MetricsRegistry;
 use ic_test_utilities::{
@@ -12,7 +14,6 @@ use ic_test_utilities::{
     crypto::CryptoReturningOk,
     ingress_selector::FakeIngressSelector,
     message_routing::FakeMessageRouting,
-    registry::{setup_registry, SubnetRecordBuilder},
     self_validating_payload_builder::FakeSelfValidatingPayloadBuilder,
     state::get_initial_state,
     state_manager::MockStateManager,
@@ -21,6 +22,7 @@ use ic_test_utilities::{
     xnet_payload_builder::FakeXNetPayloadBuilder,
     FastForwardTimeSource,
 };
+use ic_test_utilities_registry::{setup_registry, SubnetRecordBuilder};
 use ic_types::{
     crypto::CryptoHash, malicious_flags::MaliciousFlags, replica_config::ReplicaConfig,
     CryptoHashOfState, Height,
@@ -83,6 +85,14 @@ fn consensus_produces_expected_batches() {
         let dkg_pool = Arc::new(RwLock::new(dkg_pool::DkgPoolImpl::new(
             metrics_registry.clone(),
         )));
+        let ecdsa_pool = Arc::new(RwLock::new(ecdsa_pool::EcdsaPoolImpl::new(
+            pool_config.clone(),
+            no_op_logger(),
+            metrics_registry.clone(),
+        )));
+        let canister_http_pool = Arc::new(RwLock::new(
+            canister_http_pool::CanisterHttpPoolImpl::new(metrics_registry.clone()),
+        ));
 
         let registry_client = setup_registry(
             replica_config.subnet_id,
@@ -113,6 +123,7 @@ fn consensus_produces_expected_batches() {
             metrics_registry.clone(),
             Arc::clone(&fake_crypto) as Arc<_>,
             no_op_logger(),
+            &PoolReader::new(&*consensus_pool.read().unwrap()),
         )));
 
         let consensus = ConsensusImpl::new(
@@ -125,6 +136,8 @@ fn consensus_produces_expected_batches() {
             Arc::clone(&xnet_payload_builder) as Arc<_>,
             Arc::clone(&self_validating_payload_builder) as Arc<_>,
             Arc::clone(&dkg_pool) as Arc<_>,
+            Arc::clone(&ecdsa_pool) as Arc<_>,
+            Arc::clone(&canister_http_pool) as Arc<_>,
             dkg_key_manager.clone(),
             Arc::clone(&router) as Arc<_>,
             Arc::clone(&state_manager) as Arc<_>,

@@ -1,12 +1,11 @@
 pub mod host_memory;
 mod signal_stack;
 mod system_api;
-pub mod system_api_charges;
+pub mod system_api_complexity;
 
-use std::convert::TryInto;
-use std::{collections::HashMap, convert::TryFrom};
 use std::{
-    path::PathBuf,
+    collections::HashMap,
+    convert::TryFrom,
     sync::{Arc, Mutex},
 };
 
@@ -15,14 +14,12 @@ use wasmtime::{unix::StoreExt, Memory, Mutability, Store, Val, ValType};
 
 use host_memory::MmapMemoryCreator;
 pub use host_memory::WasmtimeMemoryCreator;
-use ic_config::embedders::{Config as EmbeddersConfig, PersistenceType};
+use ic_config::embedders::Config as EmbeddersConfig;
 use ic_interfaces::execution_environment::{
     HypervisorError, HypervisorResult, InstanceStats, SystemApi, TrapCode,
 };
 use ic_logger::{debug, error, fatal, ReplicaLogger};
-use ic_replicated_state::{
-    EmbedderCache, ExecutionState, ExportedFunctions, Global, NumWasmPages, PageIndex, PageMap,
-};
+use ic_replicated_state::{EmbedderCache, Global, NumWasmPages, PageIndex, PageMap};
 use ic_sys::PAGE_SIZE;
 use ic_types::{
     methods::{FuncRef, WasmMethod},
@@ -32,12 +29,7 @@ use ic_wasm_types::{BinaryEncodedWasm, WasmEngineError};
 use memory_tracker::{DirtyPageTracking, SigsegvMemoryTracker};
 use signal_stack::WasmtimeSignalStack;
 
-use crate::wasm_utils::{
-    instrumentation::{instrument, InstructionCostTable},
-    validation::{ensure_determinism, validate_wasm_binary},
-};
-
-use crate::cow_memory_creator::{CowMemoryCreator, CowMemoryCreatorProxy};
+use crate::wasm_utils::validation::ensure_determinism;
 
 use super::InstanceRunResult;
 
@@ -48,40 +40,73 @@ mod wasmtime_embedder_tests;
 
 const NUM_INSTRUCTION_GLOBAL_NAME: &str = "canister counter_instructions";
 
-fn trap_to_error(err: anyhow::Error) -> HypervisorError {
-    let message = {
-        // We cannot use `format!` here because displaying `err` may fail.
-        let mut output = String::new();
-        match std::fmt::write(&mut output, format_args!("{}", err)) {
-            Ok(()) => output,
-            Err(_) => "Conversion of Wasmtime error to string failed.".to_string(),
+const BAD_SIGNATURE_MESSAGE: &str = "function invocation does not match its signature";
+
+fn wasmtime_error_to_hypervisor_error(err: anyhow::Error) -> HypervisorError {
+    match err.downcast::<wasmtime::Trap>() {
+        Ok(trap) => match trap.trap_code() {
+            Some(trap_code) => trap_code_to_hypervisor_error(trap_code),
+            None => HypervisorError::Trapped(TrapCode::Other),
+        },
+        Err(err) => {
+            // The error could be either a compile error or some other error.
+            // We have to inspect the error message to distingiush these cases.
+            let message = {
+                // We cannot use `format!` here because displaying `err` may fail.
+                let mut output = String::new();
+                match std::fmt::write(&mut output, format_args!("{}", err)) {
+                    Ok(()) => output,
+                    Err(_) => "Conversion of Wasmtime error to string failed.".to_string(),
+                }
+            };
+            // Check if the message contains one of:
+            // - "expected ... arguments, got ..."
+            // - "expected ... results, got ..."
+            let arguments_or_results_mismatch = message
+                .find("expected ")
+                .and_then(|i| {
+                    message
+                        .get(i..)
+                        .map(|s| s.contains(" arguments, got ") || s.contains(" results, got "))
+                })
+                .unwrap_or(false);
+            if message.contains("argument type mismatch") || arguments_or_results_mismatch {
+                return HypervisorError::ContractViolation(BAD_SIGNATURE_MESSAGE.to_string());
+            }
+            HypervisorError::Trapped(TrapCode::Other)
         }
-    };
-    let re_signature_mismatch =
-        regex::Regex::new("expected \\d+ arguments, got \\d+").expect("signature mismatch regex");
-    if message.contains("wasm trap: call stack exhausted") {
-        HypervisorError::Trapped(TrapCode::StackOverflow)
-    } else if message.contains("wasm trap: out of bounds memory access") {
-        HypervisorError::Trapped(TrapCode::HeapOutOfBounds)
-    } else if message.contains("wasm trap: integer divide by zero") {
-        HypervisorError::Trapped(TrapCode::IntegerDivByZero)
-    } else if message.contains("wasm trap: unreachable") {
-        HypervisorError::Trapped(TrapCode::Unreachable)
-    } else if message.contains("wasm trap: undefined element: out of bounds") {
-        HypervisorError::Trapped(TrapCode::TableOutOfBounds)
-    } else if message.contains("argument type mismatch") || re_signature_mismatch.is_match(&message)
-    {
-        HypervisorError::ContractViolation(
-            "function invocation does not match its signature".to_string(),
-        )
-    } else {
-        HypervisorError::Trapped(TrapCode::Other)
+    }
+}
+
+fn trap_code_to_hypervisor_error(trap_code: wasmtime::TrapCode) -> HypervisorError {
+    match trap_code {
+        wasmtime::TrapCode::StackOverflow => HypervisorError::Trapped(TrapCode::StackOverflow),
+        wasmtime::TrapCode::MemoryOutOfBounds => {
+            HypervisorError::Trapped(TrapCode::HeapOutOfBounds)
+        }
+        wasmtime::TrapCode::TableOutOfBounds => {
+            HypervisorError::Trapped(TrapCode::TableOutOfBounds)
+        }
+        wasmtime::TrapCode::BadSignature => {
+            HypervisorError::ContractViolation(BAD_SIGNATURE_MESSAGE.to_string())
+        }
+        wasmtime::TrapCode::IntegerDivisionByZero => {
+            HypervisorError::Trapped(TrapCode::IntegerDivByZero)
+        }
+        wasmtime::TrapCode::UnreachableCodeReached => {
+            HypervisorError::Trapped(TrapCode::Unreachable)
+        }
+        _ => {
+            // The `wasmtime::TrapCode` enum is marked as #[non_exhaustive]
+            // so we have to use the wildcard matching here.
+            HypervisorError::Trapped(TrapCode::Other)
+        }
     }
 }
 
 pub struct WasmtimeEmbedder {
     log: ReplicaLogger,
-    max_wasm_stack_size: usize,
+    config: EmbeddersConfig,
     // Each time a new memory is created it is added to this map.  Each time a
     // `SigsegvMemoryTracker` is created it will look up the corresponding memory in the map
     // and remove it. So memories will only be in this map for the time between module
@@ -91,83 +116,32 @@ pub struct WasmtimeEmbedder {
 
 impl WasmtimeEmbedder {
     pub fn new(config: EmbeddersConfig, log: ReplicaLogger) -> Self {
-        let EmbeddersConfig {
-            max_wasm_stack_size,
-            ..
-        } = config;
-
         WasmtimeEmbedder {
             log,
-            max_wasm_stack_size,
+            config,
             created_memories: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    pub fn compile(
-        &self,
-        persistence_type: PersistenceType,
-        wasm_binary: &BinaryEncodedWasm,
-    ) -> HypervisorResult<EmbedderCache> {
+    pub fn compile(&self, wasm_binary: &BinaryEncodedWasm) -> HypervisorResult<EmbedderCache> {
         let mut config = wasmtime::Config::default();
         ensure_determinism(&mut config);
-        let cached_mem_creator = match persistence_type {
-            PersistenceType::Sigsegv => {
-                let raw_creator = MmapMemoryCreator {};
-                let mem_creator = Arc::new(WasmtimeMemoryCreator::new(raw_creator, Arc::clone(&self.created_memories)));
-                config.with_host_memory(mem_creator);
-                None
-            }
-            _ /*Pagemap*/ => {
-                let raw_creator = CowMemoryCreatorProxy::new(Arc::new(CowMemoryCreator::new_uninitialized()));
-                let mem_creator = Arc::new(WasmtimeMemoryCreator::new(raw_creator.clone(), Arc::clone(&self.created_memories)));
-                config.with_host_memory(mem_creator);
-                Some(raw_creator)
-            }
-        };
+        let raw_creator = MmapMemoryCreator {};
+        let mem_creator = Arc::new(WasmtimeMemoryCreator::new(
+            raw_creator,
+            Arc::clone(&self.created_memories),
+        ));
+        config.with_host_memory(mem_creator);
 
         config
             // maximum size in bytes where a linear memory is considered
             // static. setting this to maximum Wasm memory size will guarantee
             // the memory is always static.
             .static_memory_maximum_size(
-                wasmtime_environ::WASM_PAGE_SIZE as u64 * wasmtime_environ::WASM_MAX_PAGES as u64,
-            );
-
-        // Wasmtime requires that the async stack is larger than the Wasm stack.
-        // Since both `config.async_stack_size()` and `config.max_wasm_stack()` check
-        // for that condition and we cannot query the default values, we have to
-        // try calling the setters in two different orders and expect that one of them
-        // succeeds.
-        //
-        // Since by default the async stack size is 2x of the wasm stack size,
-        // we set the new value for the async stack size correspondingly.
-        let async_stack_size = self.max_wasm_stack_size * 2;
-        match config.async_stack_size(async_stack_size) {
-            Ok(_) => {
-                // The new `async_stack_size` is larger than the default `max_wasm_stack`,
-                // the following should succeed.
-                config
-                    .max_wasm_stack(self.max_wasm_stack_size)
-                    .map_err(|_| {
-                        HypervisorError::WasmEngineError(WasmEngineError::FailedToSetWasmStack)
-                    })?
-            }
-            Err(_) => {
-                // The new `async_stack_size` is smaller than `max_wasm_stack`, which in turn
-                // is smaller than the default `async_stack_size`. This means that the new
-                // `max_wasm_stack` is smaller than the default `async_stack_size`, so the
-                // following should succeed.
-                config
-                    .max_wasm_stack(self.max_wasm_stack_size)
-                    .map_err(|_| {
-                        HypervisorError::WasmEngineError(WasmEngineError::FailedToSetWasmStack)
-                    })?
-                    .async_stack_size(async_stack_size)
-                    .map_err(|_| {
-                        HypervisorError::WasmEngineError(WasmEngineError::FailedToSetAsyncStack)
-                    })?
-            }
-        };
+                wasmtime_environ::WASM_PAGE_SIZE as u64 * wasmtime_environ::WASM32_MAX_PAGES as u64,
+            )
+            .max_wasm_stack(self.config.max_wasm_stack_size)
+            .map_err(|_| HypervisorError::WasmEngineError(WasmEngineError::FailedToSetWasmStack))?;
 
         let engine = wasmtime::Engine::new(&config).map_err(|_| {
             HypervisorError::WasmEngineError(WasmEngineError::FailedToInitializeEngine)
@@ -179,30 +153,7 @@ impl WasmtimeEmbedder {
         // a bit of reference counting, i.e. it is a "shallow copy"). This is
         // important because EmbedderCache is cloned frequently, and that must
         // not be an expensive operation.
-        Ok(EmbedderCache::new((module, cached_mem_creator)))
-    }
-
-    /// Initializes a new execution state for a canister.
-    ///
-    /// The wasm_binary is validated and instrumented to detect instrumentation
-    /// errors however just the validated binary is stored.  The expectation is
-    /// that the binary will be instrumented before compiling.  This is done
-    /// to support IC upgrades where the instrumentation changes.
-    pub fn create_execution_state(
-        &self,
-        wasm_binary: Vec<u8>,
-        canister_root: PathBuf,
-        config: &EmbeddersConfig,
-    ) -> HypervisorResult<ExecutionState> {
-        let wasm_binary = BinaryEncodedWasm::new(wasm_binary);
-        validate_wasm_binary(&wasm_binary, config)?;
-        let instrumentation_output = instrument(&wasm_binary, &InstructionCostTable::new())?;
-        ExecutionState::new(
-            wasm_binary,
-            canister_root,
-            ExportedFunctions::new(instrumentation_output.exported_functions),
-            &instrumentation_output.data.as_pages(),
-        )
+        Ok(EmbedderCache::new(module))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -212,13 +163,12 @@ impl WasmtimeEmbedder {
         cache: &EmbedderCache,
         exported_globals: &[Global],
         heap_size: NumWasmPages,
-        memory_creator: Option<Arc<CowMemoryCreator>>,
-        page_map: Option<PageMap>,
+        page_map: PageMap,
         modification_tracking: ModificationTracking,
         system_api: S,
     ) -> Result<WasmtimeInstance<S>, (HypervisorError, S)> {
-        let (module, memory_creator_proxy) = cache
-            .downcast::<(wasmtime::Module, Option<CowMemoryCreatorProxy>)>()
+        let module = cache
+            .downcast::<wasmtime::Module>()
             .expect("incompatible embedder cache, expected BinaryEncodedWasm");
 
         let mut store = Store::new(
@@ -229,63 +179,24 @@ impl WasmtimeEmbedder {
             },
         );
 
-        let linker = system_api::syscalls(self.log.clone(), canister_id, &store);
+        let linker = system_api::syscalls(
+            self.log.clone(),
+            canister_id,
+            &store,
+            self.config.feature_flags.rate_limiting_of_debug_prints,
+        );
 
-        let (instance, persistence_type) = match (memory_creator, memory_creator_proxy) {
-            (Some(memory_creator), Some(cow_mem_creator_proxy)) => {
-                // If we have the CowMemoryCreator we want to ensure it is used
-                // atomically
-                let _lock = cow_mem_creator_proxy.memory_creator_lock.lock().unwrap();
-
-                cow_mem_creator_proxy.replace(memory_creator);
-
-                let instance = match linker.instantiate(&mut store, module) {
-                    Ok(instance) => instance,
-                    Err(err) => {
-                        error!(
-                            self.log,
-                            "Failed to instantiate module for {}: {}", canister_id, err
-                        );
-                        return Err((
-                            HypervisorError::WasmEngineError(
-                                WasmEngineError::FailedToInstantiateModule,
-                            ),
-                            store.into_data().system_api,
-                        ));
-                    }
-                };
-
-                // After the Wasm module instance and its corresponding memory
-                // are created we want to ensure that this particular
-                // MemoryCreator can't be reused
-                cow_mem_creator_proxy
-                    .replace(std::sync::Arc::new(CowMemoryCreator::new_uninitialized()));
-                (instance, PersistenceType::Pagemap)
-            }
-            (None, None) => {
-                let instance = match linker.instantiate(&mut store, module) {
-                    Ok(instance) => instance,
-                    Err(err) => {
-                        error!(
-                            self.log,
-                            "Failed to instantiate module for {}: {}", canister_id, err
-                        );
-                        return Err((
-                            HypervisorError::WasmEngineError(
-                                WasmEngineError::FailedToInstantiateModule,
-                            ),
-                            store.into_data().system_api,
-                        ));
-                    }
-                };
-                (instance, PersistenceType::Sigsegv)
-            }
-            (None, Some(_)) | (Some(_), None) => {
-                fatal!(
+        let instance = match linker.instantiate(&mut store, module) {
+            Ok(instance) => instance,
+            Err(err) => {
+                error!(
                     self.log,
-                    "We are caching mem creator if and only if mem_creator argument is not None,
-                            and both happen if persistence type is Pagemap"
+                    "Failed to instantiate module for {}: {}", canister_id, err
                 );
+                return Err((
+                    HypervisorError::WasmEngineError(WasmEngineError::FailedToInstantiateModule),
+                    store.into_data().system_api,
+                ));
             }
         };
 
@@ -351,11 +262,7 @@ impl WasmtimeEmbedder {
             .get_memory(&mut store, "memory")
             .map(|instance_memory| {
                 let current_heap_size = instance_memory.size(&store);
-                // TODO(EXC-650): Remove panic on wasmtime upgrade.
-                let requested_size: u32 = heap_size
-                    .get()
-                    .try_into()
-                    .expect("Couldn't convert requested heap size to u32");
+                let requested_size = heap_size.get() as u64;
 
                 if current_heap_size < requested_size {
                     let delta = requested_size - current_heap_size;
@@ -380,10 +287,6 @@ impl WasmtimeEmbedder {
         let memory_tracker = match instance_memory {
             None => None,
             Some(instance_memory) => {
-                let page_map = match persistence_type {
-                    PersistenceType::Sigsegv => page_map,
-                    PersistenceType::Pagemap => None,
-                };
                 let start = MemoryStart(instance_memory.data_ptr(&store) as usize);
                 match self
                     .created_memories
@@ -404,7 +307,6 @@ impl WasmtimeEmbedder {
                         ));
                     }
                     Some(current_memory_size_in_pages) => Some(sigsegv_memory_tracker(
-                        persistence_type,
                         &instance_memory,
                         current_memory_size_in_pages,
                         &mut store,
@@ -442,11 +344,10 @@ unsafe impl Sync for StoreRef {}
 unsafe impl Send for StoreRef {}
 
 fn sigsegv_memory_tracker<S>(
-    persistence_type: PersistenceType,
     instance_memory: &wasmtime::Memory,
     current_memory_size_in_pages: MemoryPageSize,
     store: &mut wasmtime::Store<S>,
-    page_map: Option<PageMap>,
+    page_map: PageMap,
     log: ReplicaLogger,
     dirty_page_tracking: DirtyPageTracking,
 ) -> Arc<Mutex<SigsegvMemoryTracker>> {
@@ -468,15 +369,8 @@ fn sigsegv_memory_tracker<S>(
         }
 
         Arc::new(Mutex::new(
-            SigsegvMemoryTracker::new(
-                persistence_type,
-                base,
-                size,
-                log,
-                dirty_page_tracking,
-                page_map,
-            )
-            .expect("failed to instantiate SIGSEGV memory tracker"),
+            SigsegvMemoryTracker::new(base, size, log, dirty_page_tracking, page_map)
+                .expect("failed to instantiate SIGSEGV memory tracker"),
         ))
     };
 
@@ -516,9 +410,8 @@ impl<S: SystemApi> WasmtimeInstance<S> {
         self.store.data_mut()
     }
 
-    fn invoke_export(&mut self, export: &str, args: &[Val]) -> HypervisorResult<Vec<Val>> {
-        Ok(self
-            .instance
+    fn invoke_export(&mut self, export: &str, args: &[Val]) -> HypervisorResult<()> {
+        self.instance
             .get_export(&mut self.store, export)
             .ok_or_else(|| {
                 HypervisorError::MethodNotFound(WasmMethod::try_from(export.to_string()).unwrap())
@@ -527,9 +420,8 @@ impl<S: SystemApi> WasmtimeInstance<S> {
             .ok_or_else(|| {
                 HypervisorError::ContractViolation("export is not a function".to_string())
             })?
-            .call(&mut self.store, args)
-            .map_err(trap_to_error)?
-            .to_vec())
+            .call(&mut self.store, args, &mut [])
+            .map_err(wasmtime_error_to_hypervisor_error)
     }
 
     fn dirty_pages(&self) -> Vec<PageIndex> {
@@ -588,9 +480,8 @@ impl<S: SystemApi> WasmtimeInstance<S> {
                         "unexpected null function reference".to_string(),
                     )
                 })?
-                .call(&mut self.store, &[Val::I32(closure.env as i32)])
-                .map_err(trap_to_error)
-                .map(|boxed_slice| boxed_slice.to_vec()),
+                .call(&mut self.store, &[Val::I32(closure.env as i32)], &mut [])
+                .map_err(wasmtime_error_to_hypervisor_error),
         }
         .map_err(|e| {
             self.store

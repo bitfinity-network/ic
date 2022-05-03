@@ -17,17 +17,19 @@
 //! The data plane module implements data plane functionality for
 //! [`TransportImpl`](../types/struct.TransportImpl.html).
 
-use crate::metrics::DataPlaneMetrics;
-use crate::types::{
-    Connected, ConnectionRole, ConnectionState, SendQueueReader, TransportHeader, TransportImpl,
-    TRANSPORT_FLAGS_IS_HEARTBEAT, TRANSPORT_FLAGS_SENDER_ERROR, TRANSPORT_HEADER_SIZE,
+use crate::{
+    metrics::DataPlaneMetrics,
+    types::{
+        Connected, ConnectionRole, ConnectionState, SendQueueReader, TransportHeader,
+        TransportImpl, TRANSPORT_FLAGS_IS_HEARTBEAT, TRANSPORT_FLAGS_SENDER_ERROR,
+        TRANSPORT_HEADER_SIZE,
+    },
 };
 use ic_crypto_tls_interfaces::{TlsReadHalf, TlsWriteHalf};
-use ic_interfaces::transport::AsyncTransportEventHandler;
-use ic_logger::warn;
-use ic_types::transport::{
-    FlowId, TransportErrorCode, TransportFlowInfo, TransportPayload, TransportStateChange,
+use ic_interfaces_transport::{
+    AsyncTransportEventHandler, FlowId, TransportErrorCode, TransportPayload, TransportStateChange,
 };
+use ic_logger::warn;
 
 use futures::future::{AbortHandle, Abortable, Aborted};
 use std::convert::TryInto;
@@ -185,6 +187,16 @@ impl TransportImpl {
                 state.on_disconnect(flow_id).await;
                 return;
             }
+            // Flush the write
+            if let Err(e) = writer.flush().await {
+                warn!(
+                    state.log,
+                    "DataPlane::flow_write_task(): failed to flush: flow: {:?}, {:?}", flow_id, e,
+                );
+                state.on_disconnect(flow_id).await;
+                return;
+            }
+
             state
                 .data_plane_metrics
                 .socket_write_time_msec
@@ -352,14 +364,14 @@ impl TransportImpl {
         }
         let event_handler = {
             let mut cl_map = self.client_map.write().unwrap();
-            let client_state = match cl_map.get_mut(&flow_id.client_type) {
+            let client_state = match cl_map.as_mut() {
                 Some(client_state) => client_state,
                 _ => return,
             };
             client_state.event_handler.clone()
         };
         event_handler
-            .state_changed(TransportStateChange::PeerFlowDown(TransportFlowInfo {
+            .state_changed(TransportStateChange::PeerFlowDown(FlowId {
                 peer_id: flow_id.peer_id,
                 flow_tag: flow_id.flow_tag,
             }))
@@ -376,7 +388,7 @@ impl TransportImpl {
         writer: Box<TlsWriteHalf>,
     ) -> Result<Arc<dyn AsyncTransportEventHandler>, TransportErrorCode> {
         let mut client_map = self.client_map.write().unwrap();
-        let client_state = match client_map.get_mut(&flow_id.client_type) {
+        let client_state = match client_map.as_mut() {
             Some(client_state) => client_state,
             None => return Err(TransportErrorCode::TransportClientNotFound),
         };
@@ -477,7 +489,7 @@ impl TransportImpl {
     ) -> Result<(), TransportErrorCode> {
         self.on_connect_setup(flow_id, role, peer_addr, reader, writer)?
             // Notify the client that peer flow is up.
-            .state_changed(TransportStateChange::PeerFlowUp(TransportFlowInfo {
+            .state_changed(TransportStateChange::PeerFlowUp(FlowId {
                 peer_id: flow_id.peer_id,
                 flow_tag: flow_id.flow_tag,
             }))

@@ -86,12 +86,6 @@
         "url_template": "https://github.com/<owner>/<repo>/archive/<rev>.tar.gz",
         "version": "0.1.2"
     },
-    "common": {
-        "branch": "master",
-        "repo": "ssh://git@github.com/dfinity-lab/common",
-        "rev": "d865c0cfd64d765a8daf6a31c76dca21a5d4d203",
-        "type": "git"
-    },
     "dfx-x86_64-darwin": {
         "builtin": false,
         "name": "dfx",
@@ -109,12 +103,6 @@
         "url": "https://download.dfinity.systems/sdk/dfx/0.7.0-beta.3/x86_64-linux/dfx-0.7.0-beta.3.tar.gz",
         "url_template": "https://download.dfinity.systems/sdk/dfx/<version>/x86_64-linux/<name>-<version>.tar.gz",
         "version": "0.7.0-beta.3"
-    },
-    "fondue": {
-        "branch": "master",
-        "repo": "ssh://git@github.com/dfinity/fondue",
-        "rev": "4da2684cc89b6ac413ed9da13e790a480bc25b88",
-        "type": "git"
     },
     "haskell-candid": {
         "branch": "master",
@@ -137,22 +125,10 @@
         "url_template": "https://static.crates.io/crates/ic-cdk-optimizer/ic-cdk-optimizer-<version>.crate",
         "version": "0.1.0"
     },
-    "ic-ref-0_16": {
-        "branch": "release-0.16",
-        "repo": "ssh://git@github.com/dfinity-lab/ic-ref",
-        "rev": "23c214042fab3e91aa45e5e91650495fdc554acd",
-        "type": "git"
-    },
-    "ic-ref-0_17": {
-        "branch": "release-0.17",
-        "repo": "ssh://git@github.com/dfinity-lab/ic-ref",
-        "rev": "a858395300d67685545e945dd4afd4b6af26c1a6",
-        "type": "git"
-    },
-    "ic-ref-0_18": {
-        "branch": "release-0.18",
-        "repo": "ssh://git@github.com/dfinity-lab/ic-ref",
-        "rev": "35b920af8100153db9b81e26c217238d6bd3d46f",
+    "ic-ref": {
+        "branch": "release-0.18.4",
+        "repo": "ssh://git@github.com/dfinity/ic-hs",
+        "rev": "563fb997bc87c9894ae2ca343d66b5d25e178303",
         "type": "git"
     },
     "idl2json": {
@@ -193,6 +169,45 @@
         "rev": "43f3547ccbf7d48e5d25e1bf5222f11df8df2940",
         "tag": "0.5.10",
         "type": "git"
+    },
+    "naersk": {
+        "branch": "master",
+        "builtin": false,
+        "description": "Fast, flexible and eco-friendly Nix shipping of cargo crates since 2019",
+        "homepage": null,
+        "owner": "nmattia",
+        "repo": "naersk",
+        "rev": "df71f5e4babda41cd919a8684b72218e2e809fa9",
+        "sha256": "0k1pk2ixnxl6njjrgy750gm6m1nkkdsah383n3wp4ybrzacnav5h",
+        "type": "tarball",
+        "url": "https://github.com/nmattia/naersk/archive/df71f5e4babda41cd919a8684b72218e2e809fa9.tar.gz",
+        "url_template": "https://github.com/<owner>/<repo>/archive/<rev>.tar.gz"
+    },
+    "niv": {
+        "branch": "master",
+        "builtin": false,
+        "description": "Easy dependency management for Nix projects",
+        "homepage": "https://github.com/nmattia/niv",
+        "owner": "nmattia",
+        "repo": "niv",
+        "rev": "ba57d5a29b4e0f2085917010380ef3ddc3cf380f",
+        "sha256": "1kpsvc53x821cmjg1khvp1nz7906gczq8mp83664cr15h94sh8i4",
+        "type": "tarball",
+        "url": "https://github.com/nmattia/niv/archive/ba57d5a29b4e0f2085917010380ef3ddc3cf380f.tar.gz",
+        "url_template": "https://github.com/<owner>/<repo>/archive/<rev>.tar.gz"
+    },
+    "nixpkgs": {
+        "branch": "big-sur-backport",
+        "builtin": true,
+        "description": "Nixpkgs/NixOS branches that track the Nixpkgs/NixOS channels",
+        "homepage": null,
+        "owner": "dfinity-lab",
+        "repo": "nixpkgs",
+        "rev": "fff5699f89ee1bc7523855a55c8ea125885932f4",
+        "sha256": "0dj0yvl3az6j5z0ikwj9rqc5riwch4bfja4im0vz8inyjjb5a7y1",
+        "type": "tarball",
+        "url": "https://github.com/dfinity-lab/nixpkgs/archive/fff5699f89ee1bc7523855a55c8ea125885932f4.tar.gz",
+        "url_template": "https://github.com/<owner>/<repo>/archive/<rev>.tar.gz"
     },
     "rosetta-cli-x86_64-darwin": {
         "builtin": false,

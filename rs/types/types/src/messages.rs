@@ -9,15 +9,14 @@ mod read_state;
 mod webauthn;
 
 pub use self::http::{
-    Authentication, Certificate, CertificateDelegation, Delegation, HasCanisterId,
+    Authentication, Certificate, CertificateDelegation, Delegation, HasCanisterId, HttpCallContent,
     HttpCanisterUpdate, HttpQueryContent, HttpQueryResponse, HttpQueryResponseReply, HttpReadState,
     HttpReadStateContent, HttpReadStateResponse, HttpReply, HttpRequest, HttpRequestContent,
-    HttpRequestEnvelope, HttpRequestError, HttpResponseStatus, HttpStatusResponse,
-    HttpSubmitContent, HttpUserQuery, RawHttpRequestVal, ReplicaHealthStatus, SignedDelegation,
+    HttpRequestEnvelope, HttpRequestError, HttpResponseStatus, HttpStatusResponse, HttpUserQuery,
+    RawHttpRequestVal, ReplicaHealthStatus, SignedDelegation,
 };
 use crate::{user_id_into_protobuf, user_id_try_from_protobuf, Cycles, Funds, NumBytes, UserId};
 pub use blob::Blob;
-pub use ic_base_types::CanisterInstallMode;
 use ic_base_types::{CanisterId, PrincipalId};
 use ic_protobuf::proxy::{try_from_option_field, ProxyDecodeError};
 use ic_protobuf::state::canister_state_bits::v1 as pb;
@@ -27,17 +26,21 @@ pub use inter_canister::{
     CallContextId, CallbackId, Payload, RejectContext, Request, RequestOrResponse, Response,
 };
 pub use message_id::{MessageId, MessageIdError, EXPECTED_MESSAGE_ID_LENGTH};
-pub use query::UserQuery;
+pub use query::{InternalQuery, InternalQueryResponse, InternalQueryResponseReply, UserQuery};
 pub use read_state::ReadState;
 use serde::{Deserialize, Serialize};
 use std::convert::TryFrom;
 use std::mem::size_of;
 pub use webauthn::{WebAuthnEnvelope, WebAuthnSignature};
 
-const MAX_INTER_CANISTER_PAYLOAD_IN_BYTES_U64: u64 = 2 * 1024 * 1024; // 2 MiB
+/// Same as [MAX_INTER_CANISTER_PAYLOAD_IN_BYTES], but of a primitive type
+/// that can be used for computation in const context.
+pub const MAX_INTER_CANISTER_PAYLOAD_IN_BYTES_U64: u64 = 2 * 1024 * 1024; // 2 MiB
 
-/// This sets the upper bound on how big a single inter-canister request or
-/// response can be.  We know that allowing messages larger than around 2MB has
+/// This sets the upper bound on how large a single inter-canister request or
+/// response (as returned by `RequestOrResponse::payload_size_bytes()`) can be.
+///
+/// We know that allowing messages larger than around 2MB has
 /// various security and performance impacts on the network.  More specifically,
 /// large messages can allow dishonest block makers to always manage to get
 /// their blocks notarized; and when the consensus protocol is configured for
@@ -339,7 +342,7 @@ mod tests {
         // the hell out of it to make sure no enum constructors are added which are
         // not handled by the conversion.
         fn request_id_conversion_does_not_panic(
-            submit: HttpRequestEnvelope::<HttpSubmitContent>)
+            submit: HttpRequestEnvelope::<HttpCallContent>)
         {
             let _ = HttpRequest::try_from(submit).unwrap();
         }
@@ -349,8 +352,8 @@ mod tests {
     fn decoding_submit_call() {
         let (_, expiry_time) = current_time_and_expiry_time();
         assert_cbor_de_equal(
-            &HttpRequestEnvelope::<HttpSubmitContent> {
-                content: HttpSubmitContent::Call {
+            &HttpRequestEnvelope::<HttpCallContent> {
+                content: HttpCallContent::Call {
                     update: HttpCanisterUpdate {
                         canister_id: Blob(vec![42; 8]),
                         method_name: "some_method".to_string(),
@@ -383,8 +386,8 @@ mod tests {
     fn decoding_submit_call_arg() {
         let (_, expiry_time) = current_time_and_expiry_time();
         assert_cbor_de_equal(
-            &HttpRequestEnvelope::<HttpSubmitContent> {
-                content: HttpSubmitContent::Call {
+            &HttpRequestEnvelope::<HttpCallContent> {
+                content: HttpCallContent::Call {
                     update: HttpCanisterUpdate {
                         canister_id: Blob(vec![42; 8]),
                         method_name: "some_method".to_string(),
@@ -417,8 +420,8 @@ mod tests {
     fn decoding_submit_call_with_nonce() {
         let (_, expiry_time) = current_time_and_expiry_time();
         assert_cbor_de_equal(
-            &HttpRequestEnvelope::<HttpSubmitContent> {
-                content: HttpSubmitContent::Call {
+            &HttpRequestEnvelope::<HttpCallContent> {
+                content: HttpCallContent::Call {
                     update: HttpCanisterUpdate {
                         canister_id: Blob(vec![42; 8]),
                         method_name: "some_method".to_string(),
@@ -451,8 +454,8 @@ mod tests {
     #[test]
     fn serialize_via_bincode() {
         let expiry_time = current_time_and_expiry_time().1;
-        let update = HttpRequestEnvelope::<HttpSubmitContent> {
-            content: HttpSubmitContent::Call {
+        let update = HttpRequestEnvelope::<HttpCallContent> {
+            content: HttpCallContent::Call {
                 update: HttpCanisterUpdate {
                     canister_id: Blob(vec![42; 8]),
                     method_name: "some_method".to_string(),
@@ -475,8 +478,8 @@ mod tests {
     #[test]
     fn serialize_via_bincode_without_signature() {
         let expiry_time = current_time_and_expiry_time().1;
-        let update = HttpRequestEnvelope::<HttpSubmitContent> {
-            content: HttpSubmitContent::Call {
+        let update = HttpRequestEnvelope::<HttpCallContent> {
+            content: HttpCallContent::Call {
                 update: HttpCanisterUpdate {
                     canister_id: Blob(vec![42; 8]),
                     method_name: "some_method".to_string(),

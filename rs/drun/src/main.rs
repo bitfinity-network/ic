@@ -1,4 +1,8 @@
 use clap::{App, Arg, ArgMatches};
+use ic_canister_sandbox_backend_lib::{
+    canister_sandbox_main, RUN_AS_CANISTER_SANDBOX_FLAG, RUN_AS_SANDBOX_LAUNCHER_FLAG,
+};
+use ic_canister_sandbox_launcher::sandbox_launcher_main;
 use ic_config::{Config, ConfigSource};
 use ic_drun::{run_drun, DrunOptions};
 use std::path::PathBuf;
@@ -10,8 +14,24 @@ const ARG_LOG_FILE: &str = "log-file";
 const ARG_MESSAGES: &str = "messages";
 const ARG_EXTRA_BATCHES: &str = "extra-batches";
 
+fn main() -> Result<(), String> {
+    // Check if `drun` is running in the canister sandbox mode where it waits
+    // for commands from the parent process. This check has to be performed
+    // before the arguments are parsed because the parent process does not pass
+    // all the normally required arguments of `drun`.
+    if std::env::args().any(|arg| arg == RUN_AS_CANISTER_SANDBOX_FLAG) {
+        canister_sandbox_main();
+        Ok(())
+    } else if std::env::args().any(|arg| arg == RUN_AS_SANDBOX_LAUNCHER_FLAG) {
+        sandbox_launcher_main();
+        Ok(())
+    } else {
+        drun_main()
+    }
+}
+
 #[tokio::main]
-async fn main() -> Result<(), String> {
+async fn drun_main() -> Result<(), String> {
     let matches = get_arg_matches();
     Config::run_with_temp_config(|default_config| {
         let source = matches

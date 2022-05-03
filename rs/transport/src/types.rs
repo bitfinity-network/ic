@@ -1,13 +1,11 @@
 //! Shared types internal to transport crate
 
 use crate::metrics::{ControlPlaneMetrics, DataPlaneMetrics, SendQueueMetrics};
+use ic_base_types::{NodeId, RegistryVersion};
+use ic_config::transport::TransportConfig;
 use ic_crypto_tls_interfaces::TlsHandshake;
-use ic_interfaces::transport::AsyncTransportEventHandler;
+use ic_interfaces_transport::{AsyncTransportEventHandler, FlowId, FlowTag, TransportPayload};
 use ic_logger::ReplicaLogger;
-use ic_types::transport::{
-    FlowId, FlowTag, TransportClientType, TransportConfig, TransportPayload,
-};
-use ic_types::{NodeId, RegistryVersion};
 use phantom_newtype::{AmountOf, Id};
 
 use async_trait::async_trait;
@@ -87,7 +85,7 @@ pub(crate) struct TransportImpl {
     /// Configuration
     pub config: TransportConfig,
     /// Map of clients to their corresponding state
-    pub client_map: RwLock<HashMap<TransportClientType, ClientState>>,
+    pub client_map: RwLock<Option<ClientState>>,
 
     // Crypto and data required for TLS handshakes
     /// Clients that are allowed to connect to this node

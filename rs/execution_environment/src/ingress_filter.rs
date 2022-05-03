@@ -1,16 +1,16 @@
-use crate::{
-    common::{PendingFutureResult, PendingFutureResultInternal},
-    ExecutionEnvironmentImpl,
-};
-use ic_interfaces::{execution_environment::IngressFilterService, state_manager::StateReader};
+use crate::ExecutionEnvironmentImpl;
+use ic_error_types::UserError;
+use ic_interfaces::execution_environment::{ExecutionMode, IngressFilterService};
+use ic_interfaces_state_manager::StateReader;
 use ic_registry_provisional_whitelist::ProvisionalWhitelist;
 use ic_replicated_state::ReplicatedState;
-use ic_types::{canonical_error::CanonicalError, messages::SignedIngressContent};
+use ic_types::messages::SignedIngressContent;
 use std::convert::Infallible;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use tokio::sync::oneshot;
 use tower::{util::BoxService, Service, ServiceBuilder};
 
 pub(crate) struct IngressFilter {
@@ -43,23 +43,8 @@ impl IngressFilter {
     }
 }
 
-type FutureIngressFilterResult =
-    PendingFutureResult<Result<Result<(), CanonicalError>, Infallible>>;
-
-impl Default for FutureIngressFilterResult {
-    fn default() -> Self {
-        let inner = PendingFutureResultInternal {
-            result: None,
-            waker: None,
-        };
-        Self {
-            inner: Arc::new(Mutex::new(inner)),
-        }
-    }
-}
-
 impl Service<(ProvisionalWhitelist, SignedIngressContent)> for IngressFilter {
-    type Response = Result<(), CanonicalError>;
+    type Response = Result<(), UserError>;
     type Error = Infallible;
     #[allow(clippy::type_complexity)]
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
@@ -74,17 +59,23 @@ impl Service<(ProvisionalWhitelist, SignedIngressContent)> for IngressFilter {
     ) -> Self::Future {
         let exec_env = Arc::clone(&self.exec_env);
         let state_reader = Arc::clone(&self.state_reader);
-        let future = FutureIngressFilterResult::default();
-        let weak_future = future.weak();
+        let (tx, rx) = oneshot::channel();
         let threadpool = self.threadpool.lock().unwrap().clone();
         threadpool.execute(move || {
-            if let Some(future) = FutureIngressFilterResult::from_weak(weak_future) {
+            if !tx.is_closed() {
                 let state = state_reader.get_latest_state().take();
-                let v =
-                    exec_env.should_accept_ingress_message(state, &provisional_whitelist, &ingress);
-                future.resolve(Ok(v));
+                let v = exec_env.should_accept_ingress_message(
+                    state,
+                    &provisional_whitelist,
+                    &ingress,
+                    ExecutionMode::NonReplicated,
+                );
+                let _ = tx.send(Ok(v));
             }
         });
-        Box::pin(future)
+        Box::pin(async move {
+            rx.await
+                .expect("The sender was dropped before sending the message.")
+        })
     }
 }

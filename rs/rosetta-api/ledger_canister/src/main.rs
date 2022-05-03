@@ -1,32 +1,17 @@
 use candid::candid_method;
 use dfn_candid::{candid, candid_one, CandidOne};
 use dfn_core::{
-    api::{
-        call_bytes_with_cleanup, call_with_cleanup, caller, data_certificate, set_certified_data,
-        trap_with, Funds,
-    },
-    endpoint::over_async_may_reject_explicit,
+    api::{caller, data_certificate, print, set_certified_data, trap_with},
     over, over_async, over_init, printer, setup, stable, BytesS,
 };
-use dfn_protobuf::{protobuf, ProtoBuf};
-use ic_types::CanisterId;
+use dfn_protobuf::protobuf;
+use ic_base_types::CanisterId;
 use ledger_canister::*;
-use on_wire::IntoWire;
 use std::time::Duration;
-
-use archive::FailedToArchiveBlocks;
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, RwLock},
 };
-
-// Helper to print messages in magenta
-fn print<S: std::convert::AsRef<str>>(s: S)
-where
-    yansi::Paint<S>: std::string::ToString,
-{
-    dfn_core::api::print(yansi::Paint::magenta(s).to_string());
-}
 
 /// Initialize the ledger canister
 ///
@@ -43,6 +28,10 @@ where
 /// * `archive_options` - The options of the canister that manages the store of
 ///   old blocks.
 /// * `send_whitelist` - The [Ledger] canister whitelist.
+/// * `transfer_fee` - The fee to pay to perform a transaction.
+/// * `token_symbol` - Token symbol.
+/// * `token_name` - Token name.
+#[allow(clippy::too_many_arguments)]
 fn init(
     minting_account: AccountIdentifier,
     initial_values: HashMap<AccountIdentifier, Tokens>,
@@ -50,6 +39,9 @@ fn init(
     transaction_window: Option<Duration>,
     archive_options: Option<archive::ArchiveOptions>,
     send_whitelist: HashSet<CanisterId>,
+    transfer_fee: Option<Tokens>,
+    token_symbol: Option<String>,
+    token_name: Option<String>,
 ) {
     print(format!(
         "[ledger] init(): minting account is {}",
@@ -61,6 +53,9 @@ fn init(
         dfn_core::api::now().into(),
         transaction_window,
         send_whitelist,
+        transfer_fee,
+        token_symbol,
+        token_name,
     );
     match max_message_size_bytes {
         None => {
@@ -93,6 +88,7 @@ fn init(
     }
 }
 
+#[cfg(feature = "notify-method")]
 fn add_payment(
     memo: Memo,
     operation: Operation,
@@ -115,8 +111,7 @@ fn add_payment(
 ///   withdrawn is equal to the amount + the fee.
 /// * `fee` - The maximum fee that the sender is willing to pay. If the required
 ///   fee is greater than this the transaction will be rejected otherwise the
-///   required fee will be paid. TODO(ROSETTA1-45): automatically pay a lower
-///   fee if possible.
+///   required fee will be paid.
 /// * `from_subaccount` - The subaccount you want to draw funds from.
 /// * `to` - The account you want to send the funds to.
 /// * `created_at_time`: When the transaction has been created. If not set then
@@ -151,14 +146,16 @@ async fn send(
         Operation::Mint { to, amount }
     } else if to == minting_acc {
         assert_eq!(fee, Tokens::ZERO, "Fee for burning should be zero");
-        if amount < MIN_BURN_AMOUNT {
-            panic!("Burns lower than {} are not allowed", MIN_BURN_AMOUNT);
+        let min_burn_amount = LEDGER.read().unwrap().transfer_fee;
+        if amount < min_burn_amount {
+            panic!("Burns lower than {} are not allowed", min_burn_amount);
         }
         Operation::Burn { from, amount }
     } else {
-        if fee != TRANSACTION_FEE {
+        let transfer_fee = LEDGER.read().unwrap().transfer_fee;
+        if fee != transfer_fee {
             return Err(TransferError::BadFee {
-                expected_fee: TRANSACTION_FEE,
+                expected_fee: transfer_fee,
             });
         }
         Operation::Transfer {
@@ -168,10 +165,15 @@ async fn send(
             fee,
         }
     };
-    let (height, hash) = LEDGER
+    let (height, hash) = match LEDGER
         .write()
         .unwrap()
-        .add_payment(memo, transfer, created_at_time)?;
+        .add_payment(memo, transfer, created_at_time)
+    {
+        Ok((height, hash)) => (height, hash),
+        Err(PaymentError::TransferError(transfer_error)) => return Err(transfer_error),
+        Err(PaymentError::Reject(msg)) => panic!("{}", msg),
+    };
     set_certified_data(&hash.into_bytes());
 
     // Don't put anything that could ever trap after this call or people using this
@@ -197,6 +199,7 @@ async fn send(
 /// * `to_subaccount` - The subaccount that received the payment.
 /// * `notify_using_protobuf` - Whether the notification should be encoded using
 ///   protobuf or candid.
+#[cfg(feature = "notify-method")]
 pub async fn notify(
     block_height: BlockHeight,
     max_fee: Tokens,
@@ -205,6 +208,10 @@ pub async fn notify(
     to_subaccount: Option<Subaccount>,
     notify_using_protobuf: bool,
 ) -> Result<BytesS, String> {
+    use dfn_core::api::{call_bytes_with_cleanup, call_with_cleanup, Funds};
+    use dfn_protobuf::ProtoBuf;
+    use on_wire::IntoWire;
+
     let caller_principal_id = caller();
 
     if !LEDGER.read().unwrap().can_send(&caller_principal_id) {
@@ -222,8 +229,10 @@ pub async fn notify(
 
     let expected_to = AccountIdentifier::new(to_canister.get(), to_subaccount);
 
-    if max_fee != TRANSACTION_FEE {
-        panic!("Transaction fee should be {}", TRANSACTION_FEE);
+    let transfer_fee = LEDGER.read().unwrap().transfer_fee;
+
+    if max_fee != transfer_fee {
+        panic!("Transfer fee should be {}", transfer_fee);
     }
 
     let raw_block: EncodedBlock =
@@ -390,9 +399,35 @@ fn account_balance(account: AccountIdentifier) -> Tokens {
     LEDGER.read().unwrap().balances.account_balance(&account)
 }
 
+#[candid_method(query, rename = "transfer_fee")]
+fn transfer_fee(_: TransferFeeArgs) -> TransferFee {
+    LEDGER.read().unwrap().transfer_fee()
+}
+
 /// The total number of Tokens not inside the minting canister
 fn total_supply() -> Tokens {
     LEDGER.read().unwrap().balances.total_supply()
+}
+
+#[candid_method(query, rename = "symbol")]
+fn token_symbol() -> Symbol {
+    Symbol {
+        symbol: LEDGER.read().unwrap().token_symbol.clone(),
+    }
+}
+
+#[candid_method(query, rename = "name")]
+fn token_name() -> Name {
+    Name {
+        name: LEDGER.read().unwrap().token_name.clone(),
+    }
+}
+
+#[candid_method(query, rename = "decimals")]
+fn token_decimals() -> Decimals {
+    Decimals {
+        decimals: DECIMAL_PLACES,
+    }
 }
 
 #[candid_method(init)]
@@ -404,6 +439,9 @@ fn canister_init(arg: LedgerCanisterInitPayload) {
         arg.transaction_window,
         arg.archive_options,
         arg.send_whitelist,
+        arg.transfer_fee,
+        arg.token_symbol,
+        arg.token_name,
     )
 }
 
@@ -416,8 +454,10 @@ fn main() {
 fn post_upgrade() {
     over_init(|_: BytesS| {
         let mut ledger = LEDGER.write().unwrap();
-        *ledger = serde_cbor::from_reader(&mut stable::StableReader::new())
+        *ledger = ciborium::de::from_reader(stable::StableReader::new())
             .expect("Decoding stable memory failed");
+
+        ledger.maximum_number_of_accounts = 28_000_000;
 
         set_certified_data(
             &ledger
@@ -431,8 +471,6 @@ fn post_upgrade() {
 
 #[export_name = "canister_pre_upgrade"]
 fn pre_upgrade() {
-    use std::io::Write;
-
     setup::START.call_once(|| {
         printer::hook();
     });
@@ -441,11 +479,8 @@ fn pre_upgrade() {
         .read()
         // This should never happen, but it's better to be safe than sorry
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut writer = stable::StableWriter::new();
-    serde_cbor::to_writer(&mut writer, &*ledger).unwrap();
-    writer
-        .flush()
-        .expect("failed to flush stable memory writer");
+    ciborium::ser::into_writer(&*ledger, stable::StableWriter::new())
+        .expect("failed to write ledger state to stable memory");
 }
 
 /// Upon reaching a `trigger_threshold` we will archive `num_blocks`.
@@ -454,37 +489,47 @@ fn pre_upgrade() {
 /// split this method up into the parts that require async (this function) and
 /// the parts that require a lock (Ledger::get_blocks_for_archiving).
 async fn archive_blocks() {
-    let ledger_guard = LEDGER.try_read().expect("Failed to get ledger read lock");
-    let archive_arc = ledger_guard.blockchain.archive.clone();
-    let mut archive_guard = match archive_arc.try_write() {
-        Ok(g) => g,
-        Err(_) => {
+    use ledger_canister::archive::{
+        send_blocks_to_archive, ArchivingGuard, ArchivingGuardError, FailedToArchiveBlocks,
+    };
+
+    let archive_arc = {
+        let ledger_guard = LEDGER.try_read().expect("Failed to get ledger read lock");
+        ledger_guard.blockchain.archive.clone()
+    };
+
+    // NOTE: this guard will prevent another logical thread to start the archiving process.
+    let _archiving_guard = match ArchivingGuard::new(Arc::clone(&archive_arc)) {
+        Ok(guard) => guard,
+        Err(ArchivingGuardError::NoArchive) => {
+            return; // Archiving not enabled
+        }
+        Err(ArchivingGuardError::AlreadyArchiving) => {
             print("Ledger is currently archiving. Skipping archive_blocks()");
             return;
         }
     };
-    if archive_guard.is_none() {
-        return; // Archiving not enabled
-    }
-    let archive = archive_guard.as_mut().unwrap();
 
-    let blocks_to_archive = ledger_guard
-        .get_blocks_for_archiving(archive.trigger_threshold, archive.num_blocks_to_archive);
+    let blocks_to_archive = {
+        let ledger_guard = LEDGER.try_read().expect("Failed to get ledger read lock");
+        let archive_guard = ledger_guard.blockchain.archive.read().unwrap();
+        let archive = archive_guard.as_ref().unwrap();
+
+        ledger_guard
+            .get_blocks_for_archiving(archive.trigger_threshold, archive.num_blocks_to_archive)
+    };
+
     if blocks_to_archive.is_empty() {
         return;
     }
-
-    drop(ledger_guard); // Drop the lock on the ledger
 
     let num_blocks = blocks_to_archive.len();
     print(format!("[ledger] archiving {} blocks", num_blocks,));
 
     let max_msg_size = *MAX_MESSAGE_SIZE_BYTES.read().unwrap();
-    let res = archive
-        .send_blocks_to_archive(blocks_to_archive, max_msg_size)
-        .await;
+    let res = send_blocks_to_archive(archive_arc, blocks_to_archive, max_msg_size).await;
 
-    let mut ledger = LEDGER.try_write().expect("Failed to get ledger write lock");
+    let mut ledger = LEDGER.write().expect("Failed to get ledger write lock");
     match res {
         Ok(num_sent_blocks) => ledger.remove_archived_blocks(num_sent_blocks),
         Err((num_sent_blocks, FailedToArchiveBlocks(err))) => {
@@ -535,8 +580,12 @@ fn send_dfx_() {
     over_async(candid_one, send_dfx);
 }
 
+#[cfg(feature = "notify-method")]
 #[export_name = "canister_update notify_pb"]
 fn notify_() {
+    use dfn_core::endpoint::over_async_may_reject_explicit;
+    use dfn_protobuf::ProtoBuf;
+
     // we use over_init because it doesn't reply automatically so we can do explicit
     // replies in the callback
     over_async_may_reject_explicit(
@@ -583,8 +632,11 @@ fn transfer() {
 }
 
 /// See caveats of use on send_dfx
+#[cfg(feature = "notify-method")]
 #[export_name = "canister_update notify_dfx"]
 fn notify_dfx_() {
+    use dfn_core::endpoint::over_async_may_reject_explicit;
+
     // we use over_init because it doesn't reply automatically so we can do explicit
     // replies in the callback
     over_async_may_reject_explicit(
@@ -677,6 +729,31 @@ fn account_balance_dfx() {
     over(candid_one, account_balance_dfx_);
 }
 
+#[export_name = "canister_query transfer_fee"]
+fn transfer_fee_candid() {
+    over(candid_one, transfer_fee)
+}
+
+#[export_name = "canister_query transfer_fee_pb"]
+fn transfer_fee_() {
+    over(protobuf, transfer_fee)
+}
+
+#[export_name = "canister_query symbol"]
+fn token_symbol_candid() {
+    over(candid_one, |()| token_symbol())
+}
+
+#[export_name = "canister_query name"]
+fn token_name_candid() {
+    over(candid_one, |()| token_name())
+}
+
+#[export_name = "canister_query decimals"]
+fn token_decimals_candid() {
+    over(candid_one, |()| token_decimals())
+}
+
 #[export_name = "canister_query total_supply_pb"]
 fn total_supply_() {
     over(protobuf, |_: TotalSupplyArgs| total_supply())
@@ -706,23 +783,101 @@ fn get_blocks_() {
     });
 }
 
+#[candid_method(query, rename = "query_blocks")]
+fn query_blocks(GetBlocksArgs { start, length }: GetBlocksArgs) -> QueryBlocksResponse {
+    use ledger_canister::range_utils;
+
+    let requested_range = range_utils::make_range(start, length);
+
+    let ledger = &LEDGER.read().unwrap();
+    let local_range = ledger.blockchain.local_block_range();
+    let effective_local_range = range_utils::head(
+        &range_utils::intersect(&requested_range, &local_range),
+        MAX_BLOCKS_PER_REQUEST,
+    );
+
+    let local_start = (effective_local_range.start - local_range.start) as usize;
+    let local_end = local_start + range_utils::range_len(&effective_local_range) as usize;
+
+    let local_blocks: Vec<CandidBlock> = ledger.blockchain.blocks[local_start..local_end]
+        .iter()
+        .map(|enc_block| -> CandidBlock {
+            enc_block
+                .decode()
+                .expect("bug: failed to decode encoded block")
+                .into()
+        })
+        .collect();
+
+    let archived_blocks_range = requested_range.start..effective_local_range.start;
+    let archive = ledger.blockchain.archive.read().unwrap();
+
+    let archived_blocks = archive
+        .iter()
+        .flat_map(|archive| archive.index().into_iter())
+        .filter_map(|((from, to), canister_id)| {
+            let slice = range_utils::intersect(&(from..to + 1), &archived_blocks_range);
+            (!slice.is_empty()).then(|| ArchivedBlocksRange {
+                start: slice.start,
+                length: range_utils::range_len(&slice) as u64,
+                callback: QueryArchiveFn {
+                    canister_id,
+                    method: "get_blocks".to_string(),
+                },
+            })
+        })
+        .collect();
+
+    let chain_length = ledger.blockchain.chain_length() as u64;
+
+    QueryBlocksResponse {
+        chain_length,
+        certificate: dfn_core::api::data_certificate().map(serde_bytes::ByteBuf::from),
+        blocks: local_blocks,
+        first_block_index: effective_local_range.start as BlockHeight,
+        archived_blocks,
+    }
+}
+
+#[export_name = "canister_query query_blocks"]
+fn query_blocks_() {
+    over(candid_one, query_blocks)
+}
+
+#[candid_method(query, rename = "archives")]
+fn archives() -> Archives {
+    let ledger_guard = LEDGER.try_read().expect("Failed to get ledger read lock");
+    let archive_guard = ledger_guard.blockchain.archive.read().unwrap();
+    let archives = archive_guard
+        .as_ref()
+        .iter()
+        .flat_map(|archive| {
+            archive
+                .nodes()
+                .iter()
+                .map(|cid| ArchiveInfo { canister_id: *cid })
+        })
+        .collect();
+    Archives { archives }
+}
+
 #[export_name = "canister_query get_nodes"]
 fn get_nodes_() {
-    over(candid, |()| -> Vec<CanisterId> {
-        LEDGER
-            .read()
-            .unwrap()
-            .blockchain
-            .archive
-            .try_read()
-            .expect("Failed to get lock on archive")
-            .as_ref()
-            .map(|archive| archive.nodes().to_vec())
-            .unwrap_or_default()
+    over(candid, |()| {
+        archives()
+            .archives
+            .iter()
+            .map(|archive| archive.canister_id)
+            .collect::<Vec<CanisterId>>()
     });
 }
 
-fn encode_metrics(w: &mut metrics_encoder::MetricsEncoder<Vec<u8>>) -> std::io::Result<()> {
+#[export_name = "canister_query archives"]
+fn archives_candid() {
+    over(candid_one, |()| archives());
+}
+
+fn encode_metrics(w: &mut ic_metrics_encoder::MetricsEncoder<Vec<u8>>) -> std::io::Result<()> {
     let ledger = LEDGER.try_read().map_err(|err| {
         std::io::Error::new(
             std::io::ErrorKind::Other,
@@ -787,37 +942,94 @@ fn encode_metrics(w: &mut metrics_encoder::MetricsEncoder<Vec<u8>>) -> std::io::
 
 #[export_name = "canister_query http_request"]
 fn http_request() {
-    ledger_canister::http_request::serve_metrics(encode_metrics);
+    dfn_http_metrics::serve_metrics(encode_metrics);
 }
 
-#[test]
-fn check_candid_interface_compatibility() {
-    use candid::types::subtype::{subtype, Gamma};
-    use candid::types::Type;
-    use std::io::Write;
+#[export_name = "canister_query __get_candid_interface_tmp_hack"]
+fn get_canidid_interface() {
+    over(candid_one, |()| -> &'static str {
+        include_str!("../ledger.did")
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candid::utils::{service_compatible, CandidSource};
     use std::path::PathBuf;
+    use std::process::Command;
 
-    candid::export_service!();
+    fn source_to_str(source: &CandidSource) -> String {
+        match source {
+            CandidSource::File(f) => std::fs::read_to_string(f).unwrap_or_else(|_| "".to_string()),
+            CandidSource::Text(t) => t.to_string(),
+        }
+    }
 
-    let actual_interface = __export_service();
-    println!("Generated DID:\n {}", actual_interface);
-    let mut tmp = tempfile::NamedTempFile::new().expect("failed to create a temporary file");
-    write!(tmp, "{}", actual_interface).expect("failed to write interface to a temporary file");
-    let (mut env1, t1) =
-        candid::pretty_check_file(tmp.path()).expect("failed to check generated candid file");
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("ledger.did");
-    let (env2, t2) =
-        candid::pretty_check_file(path.as_path()).expect("failed to open ledger.did file");
+    fn check_service_compatible(
+        new_name: &str,
+        new: CandidSource,
+        old_name: &str,
+        old: CandidSource,
+    ) {
+        let new_str = source_to_str(&new);
+        let old_str = source_to_str(&old);
+        match service_compatible(new, old) {
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!(
+                    "{} is not compatible with {}!\n\n\
+                {}:\n\
+                {}\n\n\
+                {}:\n\
+                {}\n",
+                    new_name, old_name, new_name, new_str, old_name, old_str
+                );
+                panic!("{:?}", e);
+            }
+        }
+    }
 
-    let (t1_ref, t2) = match (t1.as_ref().unwrap(), t2.unwrap()) {
-        (Type::Class(_, s1), Type::Class(_, s2)) => (s1.as_ref(), *s2),
-        (Type::Class(_, s1), s2 @ Type::Service(_)) => (s1.as_ref(), s2),
-        (s1 @ Type::Service(_), Type::Class(_, s2)) => (s1, *s2),
-        (t1, t2) => (t1, t2),
-    };
+    #[test]
+    fn check_candid_interface_compatibility() {
+        candid::export_service!();
 
-    let mut gamma = Gamma::new();
-    let t2 = env1.merge_type(env2, t2);
-    subtype(&mut gamma, &env1, t1_ref, &t2)
-        .expect("ledger canister interface is not compatible with the ledger.did file");
+        let new_interface = __export_service();
+
+        // check the public interface against the actual one
+        let old_interface =
+            PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("ledger.did");
+
+        check_service_compatible(
+            "actual ledger candid interface",
+            CandidSource::Text(&new_interface),
+            "declared candid interface in ledger.did file",
+            CandidSource::File(old_interface.as_path()),
+        );
+
+        // check the public interface against the master version if we are in a
+        // repository
+        let commit = Command::new("git")
+            .args(["merge-base", "HEAD", "origin/master"])
+            .output()
+            .expect("Failed to execute git merge-base HEAD origin/master")
+            .stdout;
+        let commit = String::from_utf8(commit).unwrap();
+        let commit = commit.trim();
+        let commit_file = format!("{}:rs/rosetta-api/ledger_canister/ledger.did", commit);
+
+        let master_interface = Command::new("git")
+            .args(["show", &commit_file])
+            .output()
+            .unwrap_or_else(|e| panic!("Failed to execute git show {}: {}", commit_file, e))
+            .stdout;
+        let master_interface = String::from_utf8(master_interface).unwrap();
+
+        check_service_compatible(
+            "current branch ledger.did",
+            CandidSource::File(old_interface.as_path()),
+            &format!("merge-base master (commit: {}) ledger.did", commit),
+            CandidSource::Text(&master_interface),
+        );
+    }
 }

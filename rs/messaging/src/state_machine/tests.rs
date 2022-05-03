@@ -3,8 +3,10 @@ use crate::{
     routing::demux::MockDemux, routing::stream_builder::MockStreamBuilder,
     state_machine::StateMachineImpl,
 };
-use ic_interfaces::{execution_environment::Scheduler, state_manager::StateManager};
+use ic_interfaces::execution_environment::Scheduler;
+use ic_interfaces_state_manager::StateManager;
 use ic_metrics::MetricsRegistry;
+use ic_registry_subnet_features::SubnetFeatures;
 use ic_registry_subnet_type::SubnetType;
 use ic_replicated_state::{ReplicatedState, SubnetTopology};
 use ic_test_utilities::{
@@ -14,6 +16,7 @@ use ic_test_utilities::{
     types::messages::SignedIngressBuilder,
     with_test_replica_logger,
 };
+use ic_types::crypto::canister_threshold_sig::MasterEcdsaPublicKey;
 use ic_types::messages::SignedIngress;
 use ic_types::{Height, PrincipalId, SubnetId};
 use mockall::{mock, predicate::*, Sequence};
@@ -29,6 +32,7 @@ mock! {
             &self,
             state: ic_replicated_state::ReplicatedState,
             randomness: ic_types::Randomness,
+            ecdsa_subnet_public_key: Option<MasterEcdsaPublicKey>,
             current_round: ExecutionRound,
             provisional_whitelist: ProvisionalWhitelist,
             max_number_of_canisters: u64,
@@ -78,11 +82,12 @@ fn test_fixture(provided_batch: &Batch) -> StateMachineTestFixture {
         .with(
             always(),
             eq(provided_batch.randomness),
+            eq(provided_batch.ecdsa_subnet_public_key.clone()),
             eq(round),
             eq(provisional_whitelist),
             eq(max_number_of_canisters),
         )
-        .returning(|state, _, _, _, _| state);
+        .returning(|state, _, _, _, _, _| state);
 
     let mut stream_builder = Box::new(MockStreamBuilder::new());
     stream_builder
@@ -99,6 +104,8 @@ fn test_fixture(provided_batch: &Batch) -> StateMachineTestFixture {
             public_key: vec![0, 1, 2, 3],
             nodes: BTreeMap::new(),
             subnet_type: SubnetType::Application,
+            subnet_features: SubnetFeatures::default(),
+            ecdsa_keys_held: BTreeSet::new(),
         },
     );
 
@@ -106,6 +113,8 @@ fn test_fixture(provided_batch: &Batch) -> StateMachineTestFixture {
         subnets,
         routing_table: Default::default(),
         nns_subnet_id: SubnetId::from(PrincipalId::new_subnet_test_id(0)),
+        canister_migrations: Default::default(),
+        ecdsa_keys: Default::default(),
     };
 
     StateMachineTestFixture {

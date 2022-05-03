@@ -1,17 +1,17 @@
 use assert_matches::assert_matches;
 use ic_base_types::NumSeconds;
 use ic_config::state_manager::Config;
+use ic_interfaces::certified_stream_store::CertifiedStreamStore;
 use ic_interfaces::{
     certification::{CertificationPermanentError, Verifier, VerifierError},
     certified_stream_store::DecodeStreamError,
     validation::ValidationResult,
 };
-use ic_interfaces::{certified_stream_store::CertifiedStreamStore, state_manager::*};
+use ic_interfaces_state_manager::*;
 use ic_metrics::MetricsRegistry;
 use ic_registry_subnet_type::SubnetType;
 use ic_replicated_state::canister_state::execution_state::WasmBinary;
 use ic_replicated_state::{testing::ReplicatedStateTesting, ReplicatedState, Stream};
-use ic_state_layout::{CheckpointLayout, RwPolicy};
 use ic_state_manager::{stream_encoding, StateManagerImpl};
 use ic_test_utilities::{
     consensus::fake::{Fake, FakeVerifier},
@@ -25,20 +25,18 @@ use ic_types::{
         ArtifactErrorCode::{ChunkVerificationFailed, ChunksMoreNeeded},
         ChunkId, Chunkable, ChunkableArtifact,
     },
-    consensus::{
-        certification::{Certification, CertificationContent},
-        ThresholdSignature,
-    },
+    consensus::certification::{Certification, CertificationContent},
     crypto::Signed,
+    signature::ThresholdSignature,
     xnet::{CertifiedStreamSlice, StreamIndex, StreamSlice},
     CanisterId, CryptoHashOfState, Cycles, Height, RegistryVersion, SubnetId,
 };
-use ic_wasm_types::BinaryEncodedWasm;
+use ic_wasm_types::CanisterModule;
 use std::{collections::HashSet, sync::Arc};
 use tempfile::Builder;
 
-pub fn empty_wasm() -> BinaryEncodedWasm {
-    BinaryEncodedWasm::new(vec![
+pub fn empty_wasm() -> CanisterModule {
+    CanisterModule::new(vec![
         0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x00, 0x08, 0x04, 0x6e, 0x61, 0x6d, 0x65,
         0x02, 0x01, 0x00,
     ])
@@ -317,10 +315,6 @@ pub fn wait_for_checkpoint(state_manager: &impl StateManager, h: Height) -> Cryp
 }
 
 pub fn insert_dummy_canister(state: &mut ReplicatedState, canister_id: CanisterId) {
-    let can_layout = CheckpointLayout::<RwPolicy>::new(state.path().into(), Height::from(0))
-        .and_then(|layout| layout.canister(&canister_id))
-        .expect("failed to obtain canister layout");
-
     let wasm = empty_wasm();
     let mut canister_state = new_canister_state(
         canister_id,
@@ -328,7 +322,7 @@ pub fn insert_dummy_canister(state: &mut ReplicatedState, canister_id: CanisterI
         INITIAL_CYCLES,
         NumSeconds::from(100_000),
     );
-    let mut execution_state = initial_execution_state(Some(can_layout.raw_path()));
+    let mut execution_state = initial_execution_state();
     execution_state.wasm_binary = WasmBinary::new(wasm);
     canister_state.execution_state = Some(execution_state);
     state.put_canister_state(canister_state);
@@ -438,6 +432,7 @@ pub fn state_manager_test_with_verifier_result<F: FnOnce(&MetricsRegistry, State
                 log,
                 &metrics_registry,
                 &config,
+                None,
                 ic_types::malicious_flags::MaliciousFlags::default(),
             ),
         );
@@ -448,9 +443,13 @@ pub fn state_manager_test<F: FnOnce(&MetricsRegistry, StateManagerImpl)>(f: F) {
     state_manager_test_with_verifier_result(true, f)
 }
 
-pub fn state_manager_restart_test<Test>(test: Test)
+pub fn state_manager_restart_test_with_metrics<Test>(test: Test)
 where
-    Test: FnOnce(StateManagerImpl, Box<dyn Fn(StateManagerImpl) -> StateManagerImpl>),
+    Test: FnOnce(
+        &MetricsRegistry,
+        StateManagerImpl,
+        Box<dyn Fn(StateManagerImpl, Option<Height>) -> (MetricsRegistry, StateManagerImpl)>,
+    ),
 {
     let tmp = Builder::new().prefix("test").tempdir().unwrap();
     let config = Config::new(tmp.path().into());
@@ -458,27 +457,43 @@ where
     let verifier: Arc<dyn Verifier> = Arc::new(FakeVerifier::new());
 
     with_test_replica_logger(|log| {
-        let make_state_manager = move || {
+        let make_state_manager = move |starting_height| {
             let metrics_registry = MetricsRegistry::new();
 
-            StateManagerImpl::new(
+            let state_manager = StateManagerImpl::new(
                 Arc::clone(&verifier),
                 own_subnet,
                 SubnetType::Application,
                 log.clone(),
                 &metrics_registry,
                 &config,
+                starting_height,
                 ic_types::malicious_flags::MaliciousFlags::default(),
-            )
+            );
+
+            (metrics_registry, state_manager)
         };
 
-        let state_manager = make_state_manager();
+        let (metrics_registry, state_manager) = make_state_manager(None);
 
-        let restart_fn = Box::new(move |state_manager| {
+        let restart_fn = Box::new(move |state_manager, starting_height| {
             drop(state_manager);
-            make_state_manager()
+            make_state_manager(starting_height)
         });
 
-        test(state_manager, restart_fn);
+        test(&metrics_registry, state_manager, restart_fn);
+    });
+}
+
+pub fn state_manager_restart_test<Test>(test: Test)
+where
+    Test:
+        FnOnce(StateManagerImpl, Box<dyn Fn(StateManagerImpl, Option<Height>) -> StateManagerImpl>),
+{
+    state_manager_restart_test_with_metrics(|_metrics, state_manager, restart_fn| {
+        let restart_fn_without_metrics = Box::new(move |state_manager, starting_height| {
+            restart_fn(state_manager, starting_height).1
+        });
+        test(state_manager, restart_fn_without_metrics);
     });
 }

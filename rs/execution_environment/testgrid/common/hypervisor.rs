@@ -1,31 +1,31 @@
 use crate::config;
-use ic_config::embedders::Config as EmbeddersConfig;
-use ic_embedders::{wasm_executor::WasmExecutor, WasmtimeEmbedder};
-use ic_execution_environment::{
-    execute as hypervisor_execute, Hypervisor, HypervisorMetrics, QueryExecutionType,
-};
+use candid::{Decode, Encode};
+use ic_error_types::RejectCode;
+use ic_execution_environment::{Hypervisor, QueryExecutionType};
+use ic_ic00_types::CanisterHttpResponsePayload;
 use ic_interfaces::execution_environment::{
-    ExecutionParameters, HypervisorError, HypervisorError::ContractViolation, HypervisorResult,
-    SubnetAvailableMemory, TrapCode,
+    AvailableMemory, ExecutionParameters, HypervisorError, HypervisorError::ContractViolation,
+    HypervisorResult, TrapCode,
 };
+use ic_interfaces::execution_environment::{ExecutionMode, SubnetAvailableMemory};
 use ic_interfaces::messages::RequestOrIngress;
-use ic_logger::replica_logger::no_op_logger;
 use ic_metrics::MetricsRegistry;
+use ic_nns_constants::CYCLES_MINTING_CANISTER_ID;
 use ic_registry_routing_table::{CanisterIdRange, RoutingTable};
 use ic_registry_subnet_type::SubnetType;
+use ic_replicated_state::canister_state::execution_state::CustomSectionType;
 use ic_replicated_state::page_map::MemoryRegion;
 use ic_replicated_state::{
     testing::CanisterQueuesTesting, CallContextAction, CallOrigin, CanisterState, Global,
     NumWasmPages, SystemState,
 };
-use ic_replicated_state::{PageIndex, PageMap};
+use ic_replicated_state::{ExportedFunctions, NetworkTopology, PageIndex, SubnetTopology};
 use ic_sys::PAGE_SIZE;
 use ic_system_api::ApiType;
 use ic_test_utilities::types::messages::{IngressBuilder, RequestBuilder};
 use ic_test_utilities::{
     assert_utils::assert_balance_equals,
     cycles_account_manager::CyclesAccountManagerBuilder,
-    execution_state::ExecutionStateBuilder,
     metrics::{fetch_histogram_stats, HistogramStats},
     mock_time,
     state::{
@@ -38,16 +38,16 @@ use ic_types::{
     ingress::WasmResult,
     messages::{CallbackId, Payload, RejectContext, MAX_INTER_CANISTER_PAYLOAD_IN_BYTES},
     methods::{Callback, FuncRef, SystemMethod, WasmClosure, WasmMethod},
-    user_error::RejectCode,
     CanisterId, ComputeAllocation, Cycles, MemoryAllocation, NumBytes, NumInstructions,
     PrincipalId, SubnetId, Time, UserId,
 };
-use ic_utils::ic_features::cow_state_feature;
 use lazy_static::lazy_static;
 use maplit::btreemap;
 use proptest::prelude::*;
+use proptest::test_runner::{TestRng, TestRunner};
+use std::collections::BTreeSet;
 use std::path::PathBuf;
-use std::{collections::BTreeMap, convert::TryFrom, sync::Arc, time::Duration};
+use std::{convert::TryFrom, sync::Arc, time::Duration};
 
 const MAX_NUM_INSTRUCTIONS: NumInstructions = NumInstructions::new(1_000_000_000);
 const EMPTY_PAYLOAD: Vec<u8> = Vec::new();
@@ -57,20 +57,34 @@ const INITIAL_CYCLES: Cycles = Cycles::new(5_000_000_000_000);
 
 lazy_static! {
     static ref MAX_SUBNET_AVAILABLE_MEMORY: SubnetAvailableMemory =
-        SubnetAvailableMemory::new(i64::MAX / 2);
+        AvailableMemory::new(i64::MAX / 2, i64::MAX / 2).into();
+}
+
+fn execution_parameters_with_unique_subnet_available_memory(
+    canister: &CanisterState,
+    instruction_limit: NumInstructions,
+    subnet_available_memory: SubnetAvailableMemory,
+) -> ExecutionParameters {
+    ExecutionParameters {
+        total_instruction_limit: instruction_limit,
+        slice_instruction_limit: instruction_limit,
+        canister_memory_limit: canister.memory_limit(NumBytes::new(u64::MAX / 2)),
+        subnet_available_memory,
+        compute_allocation: canister.scheduler_state.compute_allocation,
+        subnet_type: SubnetType::Application,
+        execution_mode: ExecutionMode::Replicated,
+    }
 }
 
 fn execution_parameters(
     canister: &CanisterState,
     instruction_limit: NumInstructions,
 ) -> ExecutionParameters {
-    ExecutionParameters {
+    execution_parameters_with_unique_subnet_available_memory(
+        canister,
         instruction_limit,
-        canister_memory_limit: canister.memory_limit(NumBytes::new(u64::MAX / 2)),
-        subnet_available_memory: MAX_SUBNET_AVAILABLE_MEMORY.clone(),
-        compute_allocation: canister.scheduler_state.compute_allocation,
-        subnet_type: SubnetType::Application,
-    }
+        MAX_SUBNET_AVAILABLE_MEMORY.clone(),
+    )
 }
 
 fn test_func_ref() -> FuncRef {
@@ -81,34 +95,37 @@ fn test_caller() -> PrincipalId {
     user_test_id(1).get()
 }
 
-fn setup() -> (
-    SubnetId,
-    SubnetType,
-    SubnetId,
-    Arc<RoutingTable>,
-    Arc<BTreeMap<SubnetId, SubnetType>>,
-) {
+fn setup() -> (SubnetId, SubnetType, Arc<NetworkTopology>) {
     let subnet_id = subnet_test_id(1);
+    let subnet_id_2 = subnet_test_id(2);
     let subnet_type = SubnetType::Application;
-    let nns_subnet_id = subnet_test_id(0x101);
-    let routing_table = Arc::new(RoutingTable::new(btreemap! {
-        CanisterIdRange{ start: CanisterId::from(0), end: CanisterId::from(0xff) } => subnet_id,
-    }));
-    let subnet_records = Arc::new(btreemap! {
-        subnet_id => subnet_type,
-    });
-    (
-        subnet_id,
-        subnet_type,
-        nns_subnet_id,
+    let routing_table = Arc::new(
+        RoutingTable::try_from(btreemap! {
+            CanisterIdRange{ start: CanisterId::from(0), end: CanisterId::from(0xfe) } => subnet_id,
+            CanisterIdRange{ start: CanisterId::from(0xff), end: CanisterId::from(0xff) } => subnet_id_2,
+        })
+        .unwrap(),
+    );
+    let network_topology = Arc::new(NetworkTopology {
         routing_table,
-        subnet_records,
-    )
+        subnets: btreemap! {
+            subnet_id => SubnetTopology {
+                subnet_type,
+                ..SubnetTopology::default()
+            },
+            subnet_id_2 => SubnetTopology {
+                subnet_type: SubnetType::VerifiedApplication,
+                ..SubnetTopology::default()
+            }
+        },
+        ..NetworkTopology::default()
+    });
+    (subnet_id, subnet_type, network_topology)
 }
 
 fn test_api_type_for_update(caller: Option<PrincipalId>, payload: Vec<u8>) -> ApiType {
     let caller = caller.unwrap_or_else(|| user_test_id(24).get());
-    let (subnet_id, subnet_type, nns_subnet_id, routing_table, subnet_records) = setup();
+    let (subnet_id, subnet_type, network_topology) = setup();
     ApiType::update(
         mock_time(),
         payload,
@@ -117,14 +134,12 @@ fn test_api_type_for_update(caller: Option<PrincipalId>, payload: Vec<u8>) -> Ap
         call_context_test_id(13),
         subnet_id,
         subnet_type,
-        nns_subnet_id,
-        routing_table,
-        subnet_records,
+        network_topology,
     )
 }
 
 fn test_api_type_for_reject(reject_context: RejectContext) -> ApiType {
-    let (subnet_id, subnet_type, nns_subnet_id, routing_table, subnet_records) = setup();
+    let (subnet_id, subnet_type, network_topology) = setup();
     ApiType::reject_callback(
         mock_time(),
         reject_context,
@@ -133,15 +148,13 @@ fn test_api_type_for_reject(reject_context: RejectContext) -> ApiType {
         false,
         subnet_id,
         subnet_type,
-        nns_subnet_id,
-        routing_table,
-        subnet_records,
+        network_topology,
     )
 }
 
-pub fn with_hypervisor<F>(f: F)
+pub fn with_hypervisor<F, R>(f: F) -> R
 where
-    F: FnOnce(Hypervisor, std::path::PathBuf),
+    F: FnOnce(Hypervisor, std::path::PathBuf) -> R,
 {
     with_test_replica_logger(|log| {
         let tmpdir = tempfile::Builder::new().prefix("test").tempdir().unwrap();
@@ -149,38 +162,14 @@ where
         let cycles_account_manager = Arc::new(CyclesAccountManagerBuilder::new().build());
         let hypervisor = Hypervisor::new(
             config(),
-            1,
             &metrics_registry,
             subnet_test_id(1),
             SubnetType::Application,
             log,
             cycles_account_manager,
         );
-        f(hypervisor, tmpdir.path().into());
-    });
-}
-
-fn execute_update_on_nns(
-    hypervisor: &Hypervisor,
-    wast: &str,
-    method: &str,
-    payload: Vec<u8>,
-    caller: Option<PrincipalId>,
-    canister_root: std::path::PathBuf,
-    nns_subnet_id: SubnetId,
-) -> (CanisterState, NumInstructions, CallContextAction, NumBytes) {
-    execute_update_with_cycles_memory_time(
-        hypervisor,
-        wast,
-        method,
-        payload,
-        caller,
-        MAX_NUM_INSTRUCTIONS,
-        NumBytes::from(0),
-        mock_time(),
-        canister_root,
-        nns_subnet_id,
-    )
+        f(hypervisor, tmpdir.path().into())
+    })
 }
 
 fn execute_update(
@@ -188,18 +177,77 @@ fn execute_update(
     wast: &str,
     method: &str,
     payload: Vec<u8>,
-    caller: Option<PrincipalId>,
     canister_root: std::path::PathBuf,
 ) -> (CanisterState, NumInstructions, CallContextAction, NumBytes) {
-    execute_update_on_nns(
+    execute_update_on(hypervisor, wast, method, payload, None, None, canister_root)
+}
+
+fn execute_update_on(
+    hypervisor: &Hypervisor,
+    wast: &str,
+    method: &str,
+    payload: Vec<u8>,
+    source: Option<UserId>,
+    receiver: Option<CanisterId>,
+    canister_root: std::path::PathBuf,
+) -> (CanisterState, NumInstructions, CallContextAction, NumBytes) {
+    execute_update_with_cycles_memory_time(
         hypervisor,
         wast,
         method,
         payload,
-        caller,
+        source,
+        receiver,
+        MAX_NUM_INSTRUCTIONS,
+        NumBytes::from(0),
+        mock_time(),
         canister_root,
-        subnet_test_id(0x101), // NNS subnet != canister subnet
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_update_with_cycles_memory_time_subnet_memory(
+    hypervisor: &Hypervisor,
+    wast: &str,
+    method: &str,
+    payload: Vec<u8>,
+    instructions_limit: NumInstructions,
+    bytes: NumBytes,
+    time: Time,
+    canister_root: std::path::PathBuf,
+    subnet_available_memory: SubnetAvailableMemory,
+) -> (CanisterState, NumInstructions, CallContextAction, NumBytes) {
+    let source = user_test_id(24);
+    let receiver = canister_test_id(42);
+
+    let wasm_binary = wabt::wat2wasm(wast).unwrap();
+    let execution_state = hypervisor
+        .create_execution_state(wasm_binary, canister_root, receiver)
+        .unwrap();
+    let mut canister = canister_from_exec_state(execution_state, receiver);
+    canister.system_state.memory_allocation = MemoryAllocation::try_from(bytes).unwrap();
+
+    let req = IngressBuilder::new()
+        .method_name(method.to_string())
+        .method_payload(payload)
+        .source(source)
+        .build();
+
+    let (_, _, network_topology) = setup();
+    let execution_parameters = execution_parameters_with_unique_subnet_available_memory(
+        &canister,
+        instructions_limit,
+        subnet_available_memory,
+    );
+    let (canister, num_instructions_left, action, heap_delta) = hypervisor.execute_update(
+        canister,
+        RequestOrIngress::Ingress(req),
+        time,
+        network_topology,
+        execution_parameters,
+    );
+
+    (canister, num_instructions_left, action, heap_delta)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -208,36 +256,39 @@ fn execute_update_with_cycles_memory_time(
     wast: &str,
     method: &str,
     payload: Vec<u8>,
-    caller: Option<PrincipalId>,
+    source: Option<UserId>,
+    receiver: Option<CanisterId>,
     instructions_limit: NumInstructions,
     bytes: NumBytes,
     time: Time,
     canister_root: std::path::PathBuf,
-    nns_subnet_id: SubnetId,
 ) -> (CanisterState, NumInstructions, CallContextAction, NumBytes) {
-    let caller = caller.unwrap_or_else(|| user_test_id(24).get());
+    let source = source.unwrap_or_else(|| user_test_id(24));
+    let receiver = receiver.unwrap_or_else(|| canister_test_id(42));
 
-    let execution_state =
-        ExecutionStateBuilder::new(wabt::wat2wasm(wast).unwrap(), canister_root).build();
-    let mut canister = canister_from_exec_state(execution_state);
+    let wasm_binary = wabt::wat2wasm(wast).unwrap();
+    let execution_state = hypervisor
+        .create_execution_state(wasm_binary, canister_root, receiver)
+        .unwrap();
+    let mut canister = canister_from_exec_state(execution_state, receiver);
     canister.system_state.memory_allocation = MemoryAllocation::try_from(bytes).unwrap();
+    canister.system_state.canister_id = receiver;
 
     let req = IngressBuilder::new()
         .method_name(method.to_string())
         .method_payload(payload)
-        .source(UserId::from(caller))
+        .source(source)
+        .receiver(receiver)
         .build();
 
-    let (_, _, _, routing_table, subnet_records) = setup();
+    let (_, _, network_topology) = setup();
     let execution_parameters = execution_parameters(&canister, instructions_limit);
     let (canister, num_instructions_left, action, heap_delta) = hypervisor.execute_update(
         canister,
         RequestOrIngress::Ingress(req),
         time,
-        routing_table,
-        subnet_records,
+        network_topology,
         execution_parameters,
-        nns_subnet_id,
     );
 
     (canister, num_instructions_left, action, heap_delta)
@@ -257,16 +308,13 @@ fn execute_update_for_request(
 ) -> (CanisterState, NumInstructions, CallContextAction) {
     let caller = CanisterId::new(caller.unwrap_or_else(|| canister_test_id(24).get())).unwrap();
 
-    let embedders_config = EmbeddersConfig::default();
-    let wasm_embedder = WasmtimeEmbedder::new(embedders_config.clone(), no_op_logger());
-    let execution_state = wasm_embedder
-        .create_execution_state(
-            wabt::wat2wasm(wast).unwrap(),
-            canister_root,
-            &embedders_config,
-        )
-        .expect("Failed to create execution state.");
-    let canister = canister_from_exec_state(execution_state);
+    let wasm_binary = wabt::wat2wasm(wast).unwrap();
+    let canister_id = canister_test_id(42);
+    let execution_state = hypervisor
+        .create_execution_state(wasm_binary, canister_root, canister_id)
+        .unwrap();
+
+    let canister = canister_from_exec_state(execution_state, canister_id);
 
     let req = RequestBuilder::new()
         .method_name(method.to_string())
@@ -276,16 +324,14 @@ fn execute_update_for_request(
         .payment(payment)
         .build();
 
-    let (_, _, _, routing_table, subnet_records) = setup();
+    let (_, _, network_topology) = setup();
     let execution_parameters = execution_parameters(&canister, instructions_limit);
     let (canister, num_instructions_left, action, _) = hypervisor.execute_update(
         canister,
         RequestOrIngress::Request(req),
         time,
-        routing_table,
-        subnet_records,
+        network_topology,
         execution_parameters,
-        subnet_test_id(0x101), // NNS subnet
     );
 
     (canister, num_instructions_left, action)
@@ -297,57 +343,35 @@ fn execute(
     wast: &str,
     func_ref: FuncRef,
 ) -> Result<Option<WasmResult>, HypervisorError> {
-    let canister_root = tempfile::Builder::new()
-        .prefix("test")
-        .tempdir()
-        .unwrap()
-        .path()
-        .into();
-
-    let metrics_registry = MetricsRegistry::new();
-    let metrics = Arc::new(HypervisorMetrics::new(&metrics_registry));
-    let config = config();
-
-    let mut embedder_config = ic_config::embedders::Config::new();
-    embedder_config.persistence_type = config.persistence_type;
-
-    let wasm_embedder = WasmtimeEmbedder::new(embedder_config.clone(), no_op_logger());
-    let execution_state = wasm_embedder
-        .create_execution_state(
-            wabt::wat2wasm(wast).unwrap(),
-            canister_root,
-            &EmbeddersConfig::default(),
-        )
-        .unwrap();
-
-    let wasm_executor = WasmExecutor::new(
-        wasm_embedder,
-        &metrics_registry,
-        embedder_config,
-        no_op_logger(),
-    );
-
-    let execution_parameters = ExecutionParameters {
-        instruction_limit: MAX_NUM_INSTRUCTIONS,
-        canister_memory_limit: NumBytes::from(4 << 30),
-        subnet_available_memory: MAX_SUBNET_AVAILABLE_MEMORY.clone(),
-        compute_allocation: ComputeAllocation::default(),
-        subnet_type: SubnetType::Application,
-    };
-
-    hypervisor_execute(
-        api_type,
-        system_state,
-        NumBytes::from(0),
-        execution_parameters,
-        func_ref,
-        execution_state,
-        Arc::new(CyclesAccountManagerBuilder::new().build()),
-        metrics,
-        Arc::new(wasm_executor),
-        None,
-    )
-    .wasm_result
+    let mut result = Ok(None);
+    let result_ref = &mut result;
+    with_hypervisor(move |hypervisor, tmp_path| {
+        let wasm_binary = wabt::wat2wasm(wast).unwrap();
+        let execution_state = hypervisor
+            .create_execution_state(wasm_binary, tmp_path, system_state.canister_id)
+            .unwrap();
+        let execution_parameters = ExecutionParameters {
+            total_instruction_limit: MAX_NUM_INSTRUCTIONS,
+            slice_instruction_limit: MAX_NUM_INSTRUCTIONS,
+            canister_memory_limit: NumBytes::from(4 << 30),
+            subnet_available_memory: MAX_SUBNET_AVAILABLE_MEMORY.clone(),
+            compute_allocation: ComputeAllocation::default(),
+            subnet_type: SubnetType::Application,
+            execution_mode: ExecutionMode::Replicated,
+        };
+        *result_ref = hypervisor
+            .execute(
+                api_type,
+                system_state,
+                NumBytes::from(0),
+                execution_parameters,
+                func_ref,
+                execution_state,
+            )
+            .0
+            .wasm_result;
+    });
+    result
 }
 
 #[test]
@@ -355,15 +379,7 @@ fn execute(
 fn test_method_not_found_error() {
     with_hypervisor(|hypervisor, tmp_path| {
         assert_eq!(
-            execute_update(
-                &hypervisor,
-                "(module)",
-                "test",
-                EMPTY_PAYLOAD,
-                None,
-                tmp_path,
-            )
-            .2,
+            execute_update(&hypervisor, "(module)", "test", EMPTY_PAYLOAD, tmp_path,).2,
             CallContextAction::Fail {
                 error: HypervisorError::MethodNotFound(WasmMethod::Update("test".to_string())),
                 refund: Cycles::from(0),
@@ -433,8 +449,11 @@ fn start_noop() {
                           (start 0))"#,
         )
         .unwrap();
-        let execution_state = ExecutionStateBuilder::new(binary, tmp_path).build();
-        let canister = canister_from_exec_state(execution_state);
+        let canister_id = canister_test_id(42);
+        let execution_state = hypervisor
+            .create_execution_state(binary, tmp_path, canister_id)
+            .unwrap();
+        let canister = canister_from_exec_state(execution_state, canister_id);
         let execution_parameters = execution_parameters(&canister, MAX_NUM_INSTRUCTIONS);
 
         hypervisor
@@ -487,7 +506,6 @@ fn sys_api_call_canister_status() {
              )"#,
                 "hi",
                 vec![],
-                None,
                 tmp_path,
             )
             .2,
@@ -519,7 +537,6 @@ fn sys_api_call_arg_data_size() {
                   (export "canister_update test" (func 1)))"#,
                 "test",
                 vec![0, 1, 2, 3],
-                None,
                 tmp_path,
             )
             .2,
@@ -565,7 +582,6 @@ fn sys_api_call_stable_grow() {
                     (export "canister_update test" (func $test)))"#,
                 "test",
                 EMPTY_PAYLOAD,
-                None,
                 tmp_path,
             )
             .2,
@@ -619,7 +635,6 @@ fn exercise_stable_memory_delta() {
             wasm_module,
             "grow",
             EMPTY_PAYLOAD,
-            None,
             tmp_path.clone(),
         );
         assert_eq!(
@@ -631,14 +646,8 @@ fn exercise_stable_memory_delta() {
         );
         assert_eq!(delta, NumBytes::from(0));
 
-        let (_, _, action, delta) = execute_update(
-            &hypervisor,
-            wasm_module,
-            "write",
-            EMPTY_PAYLOAD,
-            None,
-            tmp_path,
-        );
+        let (_, _, action, delta) =
+            execute_update(&hypervisor, wasm_module, "write", EMPTY_PAYLOAD, tmp_path);
         assert_eq!(
             action,
             CallContextAction::Reply {
@@ -694,7 +703,6 @@ fn exercise_stable_memory_delta_2() {
             wasm_module,
             "grow",
             EMPTY_PAYLOAD,
-            None,
             tmp_path.clone(),
         );
         assert_eq!(
@@ -706,14 +714,8 @@ fn exercise_stable_memory_delta_2() {
         );
         assert_eq!(delta, NumBytes::from(0));
 
-        let (_, _, action, delta) = execute_update(
-            &hypervisor,
-            wasm_module,
-            "write",
-            EMPTY_PAYLOAD,
-            None,
-            tmp_path,
-        );
+        let (_, _, action, delta) =
+            execute_update(&hypervisor, wasm_module, "write", EMPTY_PAYLOAD, tmp_path);
         assert_eq!(
             action,
             CallContextAction::Reply {
@@ -768,7 +770,6 @@ fn exercise_stable_memory_delta64() {
             wasm_module,
             "grow",
             EMPTY_PAYLOAD,
-            None,
             tmp_path.clone(),
         );
         assert_eq!(
@@ -780,14 +781,8 @@ fn exercise_stable_memory_delta64() {
         );
         assert_eq!(delta, NumBytes::from(0));
 
-        let (_, _, action, delta) = execute_update(
-            &hypervisor,
-            wasm_module,
-            "write",
-            EMPTY_PAYLOAD,
-            None,
-            tmp_path,
-        );
+        let (_, _, action, delta) =
+            execute_update(&hypervisor, wasm_module, "write", EMPTY_PAYLOAD, tmp_path);
         assert_eq!(
             action,
             CallContextAction::Reply {
@@ -843,7 +838,6 @@ fn exercise_stable_memory_delta64_exact_page() {
             wasm_module,
             "grow",
             EMPTY_PAYLOAD,
-            None,
             tmp_path.clone(),
         );
         assert_eq!(
@@ -855,14 +849,8 @@ fn exercise_stable_memory_delta64_exact_page() {
         );
         assert_eq!(delta, NumBytes::from(0));
 
-        let (_, _, action, delta) = execute_update(
-            &hypervisor,
-            wasm_module,
-            "write",
-            EMPTY_PAYLOAD,
-            None,
-            tmp_path,
-        );
+        let (_, _, action, delta) =
+            execute_update(&hypervisor, wasm_module, "write", EMPTY_PAYLOAD, tmp_path);
         assert_eq!(
             action,
             CallContextAction::Reply {
@@ -902,7 +890,6 @@ fn sys_api_call_stable_grow_too_many_pages() {
                     (export "canister_update test" (func $test)))"#,
                 "test",
                 EMPTY_PAYLOAD,
-                None,
                 tmp_path,
             )
             .2,
@@ -955,11 +942,11 @@ fn sys_api_call_stable64_grow() {
                 "test",
                 EMPTY_PAYLOAD,
                 None,
+                None,
                 MAX_NUM_INSTRUCTIONS,
                 NumBytes::from(8 * 1024 * 1024 * 1024),
                 mock_time(),
                 tmp_path,
-                subnet_test_id(0x101), // NNS subnet != canister subnet
             )
             .2,
             CallContextAction::Reply {
@@ -1006,11 +993,11 @@ fn sys_api_call_stable_grow_by_0_traps_if_memory_exceeds_4gb() {
                 "test",
                 EMPTY_PAYLOAD,
                 None,
+                None,
                 MAX_NUM_INSTRUCTIONS,
                 NumBytes::from(8 * 1024 * 1024 * 1024),
                 mock_time(),
                 tmp_path,
-                subnet_test_id(0x101), // NNS subnet != canister subnet
             )
             .2,
             CallContextAction::Fail {
@@ -1057,11 +1044,11 @@ fn sys_api_call_stable_grow_by_traps_if_memory_exceeds_4gb() {
                 "test",
                 EMPTY_PAYLOAD,
                 None,
+                None,
                 MAX_NUM_INSTRUCTIONS,
                 NumBytes::from(8 * 1024 * 1024 * 1024),
                 mock_time(),
                 tmp_path,
-                subnet_test_id(0x101), // NNS subnet != canister subnet
             )
             .2,
             CallContextAction::Fail {
@@ -1120,7 +1107,6 @@ fn sys_api_call_stable_read_write() {
                     (export "canister_update test" (func $test)))"#,
                 "test",
                 EMPTY_PAYLOAD,
-                None,
                 tmp_path,
             )
             .2,
@@ -1156,7 +1142,6 @@ fn sys_api_call_stable_read_traps_when_out_of_bounds() {
                     (export "canister_update test" (func $test)))"#,
                 "test",
                 EMPTY_PAYLOAD,
-                None,
                 tmp_path,
             )
             .2,
@@ -1191,11 +1176,11 @@ fn sys_api_call_stable_read_can_handle_overflows() {
                 "test",
                 EMPTY_PAYLOAD,
                 None,
+                None,
                 MAX_NUM_INSTRUCTIONS * 10,
                 NumBytes::from(0),
                 mock_time(),
                 tmp_path,
-                subnet_test_id(0x101), // NNS subnet != canister subnet
             )
             .2,
             CallContextAction::Fail {
@@ -1227,7 +1212,6 @@ fn sys_api_call_stable_write_traps_when_out_of_bounds() {
                     (export "canister_update test" (func $test)))"#,
                 "test",
                 EMPTY_PAYLOAD,
-                None,
                 tmp_path,
             )
             .2,
@@ -1262,11 +1246,11 @@ fn sys_api_call_stable_write_can_handle_overflows() {
                 "test",
                 EMPTY_PAYLOAD,
                 None,
+                None,
                 MAX_NUM_INSTRUCTIONS * 10,
                 NumBytes::from(0),
                 mock_time(),
                 tmp_path,
-                subnet_test_id(0x101), // NNS subnet != canister subnet
             )
             .2,
             CallContextAction::Fail {
@@ -1305,7 +1289,6 @@ fn sys_api_call_stable_read_traps_when_heap_out_of_bounds() {
                     (export "canister_update test" (func $test)))"#,
                 "test",
                 EMPTY_PAYLOAD,
-                None,
                 tmp_path,
             )
             .2,
@@ -1343,7 +1326,6 @@ fn sys_api_call_stable_write_traps_when_heap_out_of_bounds() {
                     (export "canister_update test" (func $test)))"#,
                 "test",
                 EMPTY_PAYLOAD,
-                None,
                 tmp_path,
             )
             .2,
@@ -1382,7 +1364,6 @@ fn sys_api_call_stable_write_at_max_size_handled_gracefully() {
                     (export "canister_update test" (func $test)))"#,
                 "test",
                 EMPTY_PAYLOAD,
-                None,
                 tmp_path,
             )
             .2,
@@ -1421,7 +1402,6 @@ fn sys_api_call_stable_read_does_not_trap_at_end_of_page() {
                     (export "canister_update test" (func $test)))"#,
                 "test",
                 EMPTY_PAYLOAD,
-                None,
                 tmp_path,
             )
             .2,
@@ -1458,7 +1438,6 @@ fn sys_api_call_stable_read_traps_beyond_end_of_page() {
                     (export "canister_update test" (func $test)))"#,
                 "test",
                 EMPTY_PAYLOAD,
-                None,
                 tmp_path,
             )
             .2,
@@ -1497,7 +1476,6 @@ fn sys_api_call_stable_read_at_max_size_handled_gracefully() {
                     (export "canister_update test" (func $test)))"#,
                 "test",
                 EMPTY_PAYLOAD,
-                None,
                 tmp_path,
             )
             .2,
@@ -1535,7 +1513,6 @@ fn sys_api_call_stable64_read_traps_when_out_of_bounds() {
                     (export "canister_update test" (func $test)))"#,
                 "test",
                 EMPTY_PAYLOAD,
-                None,
                 tmp_path,
             )
             .2,
@@ -1572,7 +1549,6 @@ fn sys_api_call_stable64_read_can_handle_overflows() {
                     (export "canister_update test" (func $test)))"#,
                 "test",
                 EMPTY_PAYLOAD,
-                None,
                 tmp_path,
             )
             .2,
@@ -1605,7 +1581,6 @@ fn sys_api_call_stable64_write_traps_when_out_of_bounds() {
                     (export "canister_update test" (func $test)))"#,
                 "test",
                 EMPTY_PAYLOAD,
-                None,
                 tmp_path,
             )
             .2,
@@ -1643,7 +1618,6 @@ fn sys_api_call_stable64_write_can_handle_overflows() {
                     (export "canister_update test" (func $test)))"#,
                 "test",
                 EMPTY_PAYLOAD,
-                None,
                 tmp_path,
             )
             .2,
@@ -1683,7 +1657,6 @@ fn sys_api_call_stable64_read_traps_when_heap_out_of_bounds() {
                     (export "canister_update test" (func $test)))"#,
                 "test",
                 EMPTY_PAYLOAD,
-                None,
                 tmp_path,
             )
             .2,
@@ -1721,7 +1694,6 @@ fn sys_api_call_stable64_write_traps_when_heap_out_of_bounds() {
                     (export "canister_update test" (func $test)))"#,
                 "test",
                 EMPTY_PAYLOAD,
-                None,
                 tmp_path,
             )
             .2,
@@ -1760,7 +1732,6 @@ fn sys_api_call_stable64_read_does_not_trap_at_end_of_page() {
                     (export "canister_update test" (func $test)))"#,
                 "test",
                 EMPTY_PAYLOAD,
-                None,
                 tmp_path,
             )
             .2,
@@ -1797,7 +1768,6 @@ fn sys_api_call_stable64_read_traps_beyond_end_of_page() {
                     (export "canister_update test" (func $test)))"#,
                 "test",
                 EMPTY_PAYLOAD,
-                None,
                 tmp_path,
             )
             .2,
@@ -1835,12 +1805,12 @@ fn sys_api_call_time_with_5_nanoseconds() {
                 "test",
                 EMPTY_PAYLOAD,
                 None,
+                None,
                 MAX_NUM_INSTRUCTIONS,
                 MEMORY_ALLOCATION,
                 // Five nanoseconds
                 mock_time() + Duration::new(0, 5),
                 tmp_path,
-                subnet_test_id(0x101), // NNS subnet != canister subnet
             )
             .2,
             CallContextAction::Reply {
@@ -1874,12 +1844,12 @@ fn sys_api_call_time_with_5_seconds() {
                 "test",
                 EMPTY_PAYLOAD,
                 None,
+                None,
                 MAX_NUM_INSTRUCTIONS,
                 MEMORY_ALLOCATION,
                 // Five seconds
                 mock_time() + Duration::new(5, 0),
                 tmp_path,
-                subnet_test_id(0x101), // NNS subnet != canister subnet
             )
             .2,
             CallContextAction::Reply {
@@ -1937,7 +1907,6 @@ fn sys_api_call_reply() {
                   (export "canister_update test" (func $test)))"#,
                 "test",
                 EMPTY_PAYLOAD,
-                None,
                 tmp_path,
             )
             .2,
@@ -1968,7 +1937,6 @@ fn sys_api_call_reply_without_finishing() {
                   (export "canister_update test" (func $test)))"#,
                 "test",
                 EMPTY_PAYLOAD,
-                None,
                 tmp_path,
             )
             .2,
@@ -2018,12 +1986,13 @@ fn test_execute_update_msg_caller() {
     with_hypervisor(|hypervisor, tmp_path| {
         let id = user_test_id(12);
         assert_eq!(
-            execute_update(
+            execute_update_on(
                 &hypervisor,
                 MSG_CALLER_WAT,
                 "update_test",
                 EMPTY_PAYLOAD,
-                Some(id.get()),
+                Some(id),
+                None,
                 tmp_path.clone(),
             )
             .2,
@@ -2033,14 +2002,15 @@ fn test_execute_update_msg_caller() {
             },
         );
 
-        let id = canister_test_id(32);
+        let id = user_test_id(32);
         assert_eq!(
-            execute_update(
+            execute_update_on(
                 &hypervisor,
                 MSG_CALLER_WAT,
                 "update_test",
                 EMPTY_PAYLOAD,
-                Some(id.get()),
+                Some(id),
+                None,
                 tmp_path,
             )
             .2,
@@ -2057,9 +2027,12 @@ fn test_execute_update_msg_caller() {
 fn test_execute_query_msg_caller() {
     with_hypervisor(|hypervisor, tmp_path| {
         let wasm_binary = wabt::wat2wasm(MSG_CALLER_WAT).unwrap();
-        let execution_state = ExecutionStateBuilder::new(wasm_binary, tmp_path).build();
+        let canister_id = canister_test_id(42);
+        let execution_state = hypervisor
+            .create_execution_state(wasm_binary, tmp_path, canister_id)
+            .unwrap();
         let _system_state = SystemStateBuilder::default().build();
-        let canister = canister_from_exec_state(execution_state);
+        let canister = canister_from_exec_state(execution_state, canister_id);
         let id = user_test_id(12);
         let execution_parameters = execution_parameters(&canister, MAX_NUM_INSTRUCTIONS);
         let (canister, _, result) = hypervisor.execute_query(
@@ -2146,7 +2119,6 @@ fn sys_api_call_arg_data_copy() {
                   (export "canister_update test" (func $test)))"#,
                 "test",
                 vec![121, 121, 121, 121],
-                None,
                 tmp_path,
             )
             .2,
@@ -2180,7 +2152,6 @@ fn sys_api_call_reject() {
                   (export "canister_update test" (func 1)))"#,
                 "test",
                 EMPTY_PAYLOAD,
-                None,
                 tmp_path,
             )
             .2,
@@ -2395,7 +2366,6 @@ fn sys_api_call_reject_msg_size_outside_reject_callback() {
               (export "canister_update test" (func 1)))"#,
                 "test",
                 EMPTY_PAYLOAD,
-                None,
                 tmp_path,
             )
             .2,
@@ -2457,7 +2427,6 @@ fn sys_api_call_reject_msg_copy_called_outside_reject_callback() {
                 REJECT_MSG_COPY_WAT,
                 "test",
                 EMPTY_PAYLOAD,
-                None,
                 tmp_path,
             )
             .2,
@@ -2514,7 +2483,6 @@ fn sys_api_call_canister_self_size() {
                   (export "canister_update test" (func $test)))"#,
                 "test",
                 EMPTY_PAYLOAD,
-                None,
                 tmp_path,
             )
             .2,
@@ -2530,9 +2498,8 @@ fn sys_api_call_canister_self_size() {
 fn sys_api_call_canister_self_copy() {
     with_hypervisor(|hypervisor, tmp_path| {
         let canister_id = canister_test_id(42);
-        let source = user_test_id(24);
         assert_eq!(
-            execute_update(
+            execute_update_on(
                 &hypervisor,
                 r#"(module
                   (import "ic0" "canister_self_copy"
@@ -2553,7 +2520,8 @@ fn sys_api_call_canister_self_copy() {
                   (export "canister_update test" (func $test)))"#,
                 "test",
                 EMPTY_PAYLOAD,
-                Some(source.get()),
+                None,
+                Some(canister_id),
                 tmp_path,
             )
             .2,
@@ -2601,7 +2569,6 @@ fn test_call_simple_does_not_enqueue_request_if_err() {
                 )"#,
             "test",
             EMPTY_PAYLOAD,
-            None,
             tmp_path,
         );
 
@@ -2656,7 +2623,6 @@ fn test_call_with_builder_does_not_enqueue_request_if_err() {
                 )"#,
             "test",
             EMPTY_PAYLOAD,
-            None,
             tmp_path,
         );
 
@@ -2672,9 +2638,64 @@ fn test_call_with_builder_does_not_enqueue_request_if_err() {
 }
 
 #[test]
+fn send_cycles_from_application_to_verified_subnet_fails() {
+    with_hypervisor(|hypervisor, tmp_path| {
+        let (canister, _instructions_left, action, _) = execute_update(
+            &hypervisor,
+            r#"(module
+                  (import "ic0" "call_new"
+                    (func $ic0_call_new
+                        (param i32 i32)
+                        (param $method_name_src i32)    (param $method_name_len i32)
+                        (param $reply_fun i32)          (param $reply_env i32)
+                        (param $reject_fun i32)         (param $reject_env i32)
+                    ))
+                  (import "ic0" "call_cycles_add" (func $ic0_call_cycles_add (param $amount i64)))
+                  (import "ic0" "call_perform" (func $ic0_call_perform (result i32)))
+                  (func $test
+                    (call $ic0_call_new
+                        (i32.const 100) (i32.const 10)  ;; callee canister id = 777
+                        (i32.const 0) (i32.const 18)    ;; refers to "some_remote_method" on the heap
+                        (i32.const 11) (i32.const 22)   ;; fictive on_reply closure
+                        (i32.const 33) (i32.const 44)   ;; fictive on_reject closure
+                    )
+                    (call $ic0_call_cycles_add
+                        (i64.const 10000000000)         ;; amount of cycles used to be transferred
+                    )
+                    (call $ic0_call_perform)
+                    drop)
+
+                  (export "canister_update test" (func $test))
+                  (memory $memory 1)
+                  (export "memory" (memory $memory))
+                  (data (i32.const 0) "some_remote_method XYZ")
+                  (data (i32.const 100) "\00\00\00\00\00\00\00\ff\01\01")
+                )"#,
+            "test",
+            EMPTY_PAYLOAD,
+            tmp_path,
+        );
+
+        assert_eq!(action, CallContextAction::Fail {
+            error: ContractViolation(
+                "Canisters on Application subnets cannot send cycles to canisters on VerifiedApplication subnets".to_string()
+            ),
+            refund: Cycles::from(0)
+        });
+        assert_eq!(canister.system_state.queues().output_queues_len(), 0);
+
+        assert_balance_equals(
+            INITIAL_CYCLES,
+            canister.system_state.balance(),
+            BALANCE_EPSILON,
+        );
+    });
+}
+
+#[test]
 fn test_call_add_cycles_deducts_cycles() {
     with_hypervisor(|hypervisor, tmp_path| {
-        let (canister, instructions_left, action, _) = execute_update(
+        let (canister, _instructions_left, action, _) = execute_update(
             &hypervisor,
             r#"(module
                   (import "ic0" "call_new"
@@ -2707,7 +2728,6 @@ fn test_call_add_cycles_deducts_cycles() {
                 )"#,
             "test",
             EMPTY_PAYLOAD,
-            None,
             tmp_path,
         );
 
@@ -2715,7 +2735,6 @@ fn test_call_add_cycles_deducts_cycles() {
         assert_eq!(canister.system_state.queues().output_queues_len(), 1);
 
         let cycles_account_manager = Arc::new(CyclesAccountManagerBuilder::new().build());
-        let instructions_executed = MAX_NUM_INSTRUCTIONS - instructions_left;
         let messaging_fee = cycles_account_manager.xnet_call_performed_fee()
             + cycles_account_manager
                 .xnet_call_bytes_transmitted_fee(MAX_INTER_CANISTER_PAYLOAD_IN_BYTES)
@@ -2724,11 +2743,8 @@ fn test_call_add_cycles_deducts_cycles() {
         // Amount of cycles used to be transferred.
         let amount_cycles = Cycles::new(10_000_000_000);
         assert_balance_equals(
-            INITIAL_CYCLES
-                - amount_cycles
-                - cycles_account_manager.execution_cost(instructions_executed)
-                - messaging_fee,
-            canister.system_state.cycles_balance,
+            INITIAL_CYCLES - amount_cycles - messaging_fee,
+            canister.system_state.balance(),
             BALANCE_EPSILON,
         );
     });
@@ -2767,7 +2783,6 @@ fn test_call_add_cycles_no_effect_when_perform_not_called() {
                 )"#,
             "test",
             EMPTY_PAYLOAD,
-            None,
             tmp_path,
         );
 
@@ -2777,7 +2792,7 @@ fn test_call_add_cycles_no_effect_when_perform_not_called() {
         //Call `ic0.call_perform` never called.
         assert_balance_equals(
             INITIAL_CYCLES,
-            canister.system_state.cycles_balance,
+            canister.system_state.balance(),
             BALANCE_EPSILON,
         );
     });
@@ -2809,22 +2824,16 @@ const MINT_CYCLES: &str = r#"(module
 #[test]
 fn test_mint_cycles_non_nns_canister() {
     with_hypervisor(|hypervisor, tmp_path| {
-        let (canister, _, action, _) = execute_update(
-            &hypervisor,
-            MINT_CYCLES,
-            "test",
-            EMPTY_PAYLOAD,
-            None,
-            tmp_path,
-        );
+        let (canister, _, action, _) =
+            execute_update(&hypervisor, MINT_CYCLES, "test", EMPTY_PAYLOAD, tmp_path);
 
         assert_eq!(
             action,
             CallContextAction::Fail {
-                error: ContractViolation(
-                    format!("ic0.mint_cycles cannot be executed. Should only be called by a canister on the NNS subnet: {} != {}",
-                    subnet_test_id(0),
-                    subnet_test_id(0x101),
+                error: ContractViolation(format!(
+                    "ic0.mint_cycles cannot be executed on non Cycles Minting Canister: {} != {}",
+                    canister.canister_id(),
+                    CYCLES_MINTING_CANISTER_ID,
                 )),
                 refund: Cycles::from(0)
             }
@@ -2835,46 +2844,44 @@ fn test_mint_cycles_non_nns_canister() {
         //Not on NNS subnet -> balance remains unchanged
         assert_balance_equals(
             INITIAL_CYCLES,
-            canister.system_state.cycles_balance,
+            canister.system_state.balance(),
             BALANCE_EPSILON,
         );
     });
 }
 
 #[test]
-fn test_mint_cycles_nns_canister() {
+fn test_mint_cycles_cmc_canister() {
     with_test_replica_logger(|log| {
         let tmpdir = tempfile::Builder::new().prefix("test").tempdir().unwrap();
         let metrics_registry = MetricsRegistry::new();
         let cycles_account_manager = Arc::new(
             CyclesAccountManagerBuilder::new()
                 .with_subnet_type(SubnetType::System)
-                .with_subnet_id(subnet_test_id(1))
                 .build(),
         );
         let hypervisor = Hypervisor::new(
             config(),
-            1,
             &metrics_registry,
             cycles_account_manager.get_subnet_id(),
-            SubnetType::Application,
+            SubnetType::System,
             log,
             cycles_account_manager,
         );
-        let (canister, _, _, _) = execute_update_on_nns(
+        let (canister, _, _, _) = execute_update_on(
             &hypervisor,
             MINT_CYCLES,
             "test",
             EMPTY_PAYLOAD,
             None,
+            Some(CYCLES_MINTING_CANISTER_ID),
             tmpdir.path().into(),
-            subnet_test_id(1), // NNS subnet == canister subnet
         );
 
         assert_eq!(canister.system_state.queues().output_queues_len(), 0);
         assert_balance_equals(
             INITIAL_CYCLES + Cycles::new(10_000_000_000),
-            canister.system_state.cycles_balance,
+            canister.system_state.balance(),
             BALANCE_EPSILON,
         );
     });
@@ -2893,21 +2900,18 @@ fn test_mint_cycles_fail_on_system_canister() {
         );
         let hypervisor = Hypervisor::new(
             config(),
-            1,
             &metrics_registry,
             cycles_account_manager.get_subnet_id(),
             SubnetType::System,
             log,
             cycles_account_manager,
         );
-        let (canister, _, _, _) = execute_update_on_nns(
+        let (canister, _, _, _) = execute_update(
             &hypervisor,
             MINT_CYCLES,
             "test",
             EMPTY_PAYLOAD,
-            None,
             tmpdir.path().into(),
-            subnet_test_id(0x101), // NNS subnet != canister subnet
         );
 
         assert_eq!(canister.system_state.queues().output_queues_len(), 0);
@@ -2915,7 +2919,7 @@ fn test_mint_cycles_fail_on_system_canister() {
         //Not on NNS subnet -> balance remains unchanged
         assert_balance_equals(
             INITIAL_CYCLES,
-            canister.system_state.cycles_balance,
+            canister.system_state.balance(),
             BALANCE_EPSILON,
         );
     });
@@ -2957,7 +2961,6 @@ fn test_call_simple_enqueues_request() {
                 )"#,
             "test",
             EMPTY_PAYLOAD,
-            None,
             tmp_path,
         );
 
@@ -3012,7 +3015,6 @@ fn test_call_with_builder_enqueues_request() {
                 )"#,
             "test",
             EMPTY_PAYLOAD,
-            None,
             tmp_path,
         );
 
@@ -3046,7 +3048,6 @@ fn sys_api_call_ic_trap() {
             )"#,
                 "test",
                 EMPTY_PAYLOAD,
-                None,
                 tmp_path,
             )
             .2,
@@ -3081,7 +3082,6 @@ fn globals_are_updated_in_execution_state_after_message_execution() {
             "#,
             "write",
             EMPTY_PAYLOAD,
-            None,
             tmp_path,
         );
         assert_eq!(
@@ -3117,7 +3117,6 @@ fn comparison_of_non_canonical_nans() {
             "#,
             "test",
             EMPTY_PAYLOAD,
-            None,
             tmp_path,
         );
         assert_eq!(
@@ -3153,12 +3152,12 @@ fn sys_api_call_out_of_cycles() {
                 "test",
                 EMPTY_PAYLOAD,
                 None,
+                None,
                 // this is not enough for 4 instructions
                 NumInstructions::from(3),
                 MEMORY_ALLOCATION,
                 mock_time(),
                 tmp_path,
-                subnet_test_id(0x101), // NNS subnet != canister subnet
             )
             .2,
             CallContextAction::Fail {
@@ -3190,12 +3189,12 @@ fn sys_api_call_update_available_memory_1() {
                 "test",
                 EMPTY_PAYLOAD,
                 None,
+                None,
                 MAX_NUM_INSTRUCTIONS,
                 // Only 9 pages available
                 ic_replicated_state::num_bytes_try_from(NumWasmPages::from(9)).unwrap(),
                 mock_time(),
                 tmp_path,
-                subnet_test_id(0x101), // NNS subnet != canister subnet
             )
             .2,
             CallContextAction::Fail {
@@ -3225,7 +3224,6 @@ fn sys_api_call_update_available_memory_2() {
                   (export "canister_update test" (func 0)))"#,
                 "test",
                 EMPTY_PAYLOAD,
-                None,
                 tmp_path,
             )
             .2,
@@ -3233,6 +3231,85 @@ fn sys_api_call_update_available_memory_2() {
                 refund: Cycles::from(0),
             },
         );
+    });
+}
+
+#[test]
+// Verifies that subnet available memory decreases when execution succeeds.
+fn available_memory_is_updated() {
+    let available_memory = ic_replicated_state::num_bytes_try_from(NumWasmPages::from(9)).unwrap();
+    with_hypervisor(|hypervisor, tmp_path| {
+        let subnet_available_memory: SubnetAvailableMemory =
+            AvailableMemory::new(1_000_000_000, 1 << 30).into();
+        let initial_subnet_available_memory = subnet_available_memory.get();
+        let _ = execute_update_with_cycles_memory_time_subnet_memory(
+            &hypervisor,
+            r#"
+                (module
+                  (func (;0;)
+                    i32.const 1
+                    memory.grow ;; Try to grow by 1 wasm page
+                    drop
+                  )
+                  (memory (;0;) 1 20)
+                  (export "memory" (memory 0))
+                  (export "canister_update test" (func 0)))"#,
+            "test",
+            EMPTY_PAYLOAD,
+            MAX_NUM_INSTRUCTIONS,
+            available_memory,
+            mock_time(),
+            tmp_path,
+            subnet_available_memory.clone(),
+        );
+        assert_eq!(
+            initial_subnet_available_memory.get_total_memory() - WASM_PAGE_SIZE as i64,
+            subnet_available_memory.get_total_memory()
+        );
+        assert_eq!(
+            initial_subnet_available_memory.get_message_memory(),
+            subnet_available_memory.get_message_memory()
+        )
+    });
+}
+
+#[test]
+// Verifies that subnet available memory doesn't decrease when execution fails.
+fn available_memory_isnt_updated_from_failed_message() {
+    let available_memory = ic_replicated_state::num_bytes_try_from(NumWasmPages::from(9)).unwrap();
+    with_hypervisor(|hypervisor, tmp_path| {
+        let subnet_available_memory: SubnetAvailableMemory =
+            AvailableMemory::new(1_000_000_000, 1_000_000_000).into();
+        let initial_subnet_available_memory = subnet_available_memory.get_total_memory();
+        let _ = execute_update_with_cycles_memory_time_subnet_memory(
+            &hypervisor,
+            r#"
+                (module
+                  (func (;0;)
+                    i32.const 1
+                    memory.grow ;; Try to grow by 1 wasm page
+                    drop
+                    unreachable
+                  )
+                  (memory (;0;) 1 20)
+                  (export "memory" (memory 0))
+                  (export "canister_update test" (func 0)))"#,
+            "test",
+            EMPTY_PAYLOAD,
+            MAX_NUM_INSTRUCTIONS,
+            available_memory,
+            mock_time(),
+            tmp_path,
+            subnet_available_memory.clone(),
+        );
+        assert_eq!(
+            initial_subnet_available_memory,
+            subnet_available_memory.get_total_memory()
+        );
+        assert_eq!(
+            initial_subnet_available_memory,
+            subnet_available_memory.get_message_memory()
+        )
     });
 }
 
@@ -3256,7 +3333,6 @@ fn sys_api_call_msg_cycles_available_for_ingress() {
                   (export "canister_update test" (func 1)))"#,
                 "test",
                 vec![0, 1, 2, 3],
-                None,
                 tmp_path,
             )
             .2,
@@ -3309,7 +3385,6 @@ fn canister_metrics_are_recorded() {
         let cycles_account_manager = Arc::new(CyclesAccountManagerBuilder::new().build());
         let hypervisor = Hypervisor::new(
             config(),
-            1,
             &registry,
             subnet_test_id(1),
             SubnetType::Application,
@@ -3340,7 +3415,6 @@ fn canister_metrics_are_recorded() {
                 wast,
                 "write",
                 EMPTY_PAYLOAD,
-                None,
                 tmpdir.path().into(),
             )
             .2,
@@ -3355,16 +3429,12 @@ fn canister_metrics_are_recorded() {
             Some(HistogramStats { sum: 1.0, count: 1 })
         );
 
-        // Cow memory does not support absolute accessed pages
-        // accounting.
-        if !cow_state_feature::is_enabled(cow_state_feature::cow_state) {
-            match fetch_histogram_stats(&registry, "hypervisor_accessed_pages") {
-                Some(HistogramStats { sum, count }) => {
-                    assert_eq!(count, 1);
-                    assert!(sum >= 2.0);
-                }
-                None => unreachable!(),
+        match fetch_histogram_stats(&registry, "hypervisor_accessed_pages") {
+            Some(HistogramStats { sum, count }) => {
+                assert_eq!(count, 1);
+                assert!(sum >= 2.0);
             }
+            None => unreachable!(),
         }
     });
 }
@@ -3376,7 +3446,6 @@ fn executing_non_existing_method_does_not_consume_cycles() {
         let cycles_account_manager = Arc::new(CyclesAccountManagerBuilder::new().build());
         let hypervisor = Hypervisor::new(
             config(),
-            1,
             &registry,
             subnet_test_id(1),
             SubnetType::Application,
@@ -3411,7 +3480,6 @@ fn executing_non_existing_method_does_not_consume_cycles() {
             wast,
             "foo",
             EMPTY_PAYLOAD,
-            None,
             tmpdir.path().into(),
         );
         assert_eq!(
@@ -3458,8 +3526,11 @@ fn grow_memory() {
                         "#,
         )
         .unwrap();
-        let execution_state = ExecutionStateBuilder::new(wasm, tmp_path).build();
-        let canister = canister_from_exec_state(execution_state);
+        let canister_id = canister_test_id(42);
+        let execution_state = hypervisor
+            .create_execution_state(wasm, tmp_path, canister_id)
+            .unwrap();
+        let canister = canister_from_exec_state(execution_state, canister_id);
         let execution_parameters = execution_parameters(&canister, MAX_NUM_INSTRUCTIONS);
 
         hypervisor
@@ -3490,9 +3561,12 @@ fn memory_access_between_min_and_max_canister_start() {
                         "#,
         )
         .unwrap();
+        let canister_id = canister_test_id(42);
+        let execution_state = hypervisor
+            .create_execution_state(wasm, tmp_path, canister_id)
+            .unwrap();
 
-        let execution_state = ExecutionStateBuilder::new(wasm, tmp_path).build();
-        let canister = canister_from_exec_state(execution_state);
+        let canister = canister_from_exec_state(execution_state, canister_id);
         let execution_parameters = execution_parameters(&canister, MAX_NUM_INSTRUCTIONS);
         assert_eq!(
             hypervisor
@@ -3518,7 +3592,6 @@ fn memory_access_between_min_and_max_ingress() {
             "#,
                 "test",
                 EMPTY_PAYLOAD,
-                None,
                 tmp_path,
             )
             .2,
@@ -3557,9 +3630,12 @@ fn test_system_method_is_callable(system_method: SystemMethod) {
                 )"#;
 
         let binary = wabt::wat2wasm(wat).unwrap();
-        let execution_state = ExecutionStateBuilder::new(binary, tmp_path).build();
+        let canister_id = canister_test_id(42);
+        let execution_state = hypervisor
+            .create_execution_state(binary, tmp_path, canister_id)
+            .unwrap();
 
-        let canister = canister_from_exec_state(execution_state);
+        let canister = canister_from_exec_state(execution_state, canister_id);
         let execution_parameters = execution_parameters(&canister, MAX_NUM_INSTRUCTIONS);
         // Run the system method to increment the counter.
         let (canister, instructions, res) = match system_method {
@@ -3641,11 +3717,14 @@ fn test_non_existing_system_method(system_method: SystemMethod) {
     with_hypervisor(|hypervisor, tmp_path| {
         let wat = "(module)";
         let binary = wabt::wat2wasm(wat).unwrap();
-        let execution_state = ExecutionStateBuilder::new(binary, tmp_path).build();
+        let canister_id = canister_test_id(42);
+        let execution_state = hypervisor
+            .create_execution_state(binary, tmp_path, canister_id)
+            .unwrap();
 
-        let canister = canister_from_exec_state(execution_state);
+        let canister = canister_from_exec_state(execution_state, canister_id);
         let execution_parameters = execution_parameters(&canister, MAX_NUM_INSTRUCTIONS);
-        let (_, _, _, routing_table, subnet_records) = setup();
+        let (_, _, network_topology) = setup();
         // Run the non-existing system method.
         let (_, cycles, res) = match system_method {
             SystemMethod::CanisterPostUpgrade => hypervisor.execute_canister_post_upgrade(
@@ -3675,11 +3754,9 @@ fn test_non_existing_system_method(system_method: SystemMethod) {
             SystemMethod::Empty => unimplemented!(),
             SystemMethod::CanisterHeartbeat => hypervisor.execute_canister_heartbeat(
                 canister,
-                routing_table,
-                subnet_records,
+                network_topology,
                 mock_time(),
                 execution_parameters,
-                subnet_test_id(0x101), // NNS subnet
             ),
         };
 
@@ -3738,8 +3815,11 @@ fn canister_init_can_set_mutable_globals() {
         )
         .unwrap();
 
-        let execution_state = ExecutionStateBuilder::new(wasm, tmp_path).build();
-        let canister = canister_from_exec_state(execution_state);
+        let canister_id = canister_test_id(42);
+        let execution_state = hypervisor
+            .create_execution_state(wasm, tmp_path, canister_id)
+            .unwrap();
+        let canister = canister_from_exec_state(execution_state, canister_id);
         let execution_parameters = execution_parameters(&canister, MAX_NUM_INSTRUCTIONS);
         let (canister, _, _) = hypervisor.execute_canister_init(
             canister,
@@ -3776,8 +3856,11 @@ fn grow_memory_beyond_max_size_1() {
         )
         .unwrap();
 
-        let execution_state = ExecutionStateBuilder::new(wasm, tmp_path).build();
-        let canister = canister_from_exec_state(execution_state);
+        let canister_id = canister_test_id(42);
+        let execution_state = hypervisor
+            .create_execution_state(wasm, tmp_path, canister_id)
+            .unwrap();
+        let canister = canister_from_exec_state(execution_state, canister_id);
         let execution_parameters = execution_parameters(&canister, MAX_NUM_INSTRUCTIONS);
         let (_, _, res) = hypervisor.execute_canister_init(
             canister,
@@ -3808,8 +3891,11 @@ fn memory_access_between_min_and_max_canister_init() {
         )
         .unwrap();
 
-        let execution_state = ExecutionStateBuilder::new(wasm, tmp_path).build();
-        let canister = canister_from_exec_state(execution_state);
+        let canister_id = canister_test_id(42);
+        let execution_state = hypervisor
+            .create_execution_state(wasm, tmp_path, canister_id)
+            .unwrap();
+        let canister = canister_from_exec_state(execution_state, canister_id);
         let execution_parameters = execution_parameters(&canister, MAX_NUM_INSTRUCTIONS);
         let (_, _, res) = hypervisor.execute_canister_init(
             canister,
@@ -3845,8 +3931,50 @@ fn grow_memory_beyond_max_size_2() {
         )
         .unwrap();
 
-        let execution_state = ExecutionStateBuilder::new(wasm, tmp_path).build();
-        let canister = canister_from_exec_state(execution_state);
+        let canister_id = canister_test_id(42);
+        let execution_state = hypervisor
+            .create_execution_state(wasm, tmp_path, canister_id)
+            .unwrap();
+        let canister = canister_from_exec_state(execution_state, canister_id);
+        let execution_parameters = execution_parameters(&canister, MAX_NUM_INSTRUCTIONS);
+        let (_, _, res) = hypervisor.execute_canister_init(
+            canister,
+            test_caller(),
+            EMPTY_PAYLOAD.as_slice(),
+            mock_time(),
+            execution_parameters,
+        );
+
+        assert_eq!(
+            res.unwrap_err(),
+            HypervisorError::Trapped(TrapCode::HeapOutOfBounds)
+        );
+    });
+}
+
+#[test]
+fn grow_memory_beyond_32_bit_limit_fails() {
+    with_hypervisor(|hypervisor, tmp_path| {
+        let wasm = wabt::wat2wasm(
+            r#"
+                        (module
+                          (func (export "canister_init")
+                            ;; 65536 is the maximum number of 32-bit wasm memory pages 
+                            (drop (memory.grow (i32.const 65537)))
+                            ;; grow failed so accessing the memory triggers HeapOutOfBounds
+                            (i32.store
+                              (i32.const 1)
+                              (i32.const 1)))
+                          (memory 0))
+                        "#,
+        )
+        .unwrap();
+
+        let canister_id = canister_test_id(42);
+        let execution_state = hypervisor
+            .create_execution_state(wasm, tmp_path, canister_id)
+            .unwrap();
+        let canister = canister_from_exec_state(execution_state, canister_id);
         let execution_parameters = execution_parameters(&canister, MAX_NUM_INSTRUCTIONS);
         let (_, _, res) = hypervisor.execute_canister_init(
             canister,
@@ -3895,10 +4023,13 @@ where
                 (export "canister_init" (func $test))
                 (export "canister_pre_upgrade" (func $test))
                 (export "canister_post_upgrade" (func $test)))"#;
-        let execution_state =
-            ExecutionStateBuilder::new(wabt::wat2wasm(wat).unwrap(), tmp_path).build();
 
-        let canister = canister_from_exec_state(execution_state);
+        let wasm = wabt::wat2wasm(wat).unwrap();
+        let canister_id = canister_test_id(42);
+        let execution_state = hypervisor
+            .create_execution_state(wasm, tmp_path, canister_id)
+            .unwrap();
+        let canister = canister_from_exec_state(execution_state, canister_id);
 
         let (canister, _, res) = execute_method(&hypervisor, canister);
 
@@ -3973,7 +4104,7 @@ fn changes_to_stable_memory_in_canister_post_upgrade_are_rolled_back_on_failure(
 fn cannot_execute_update_on_stopping_canister() {
     with_hypervisor(|hypervisor, _| {
         let canister = get_stopping_canister(canister_test_id(0));
-        let (_, _, _, routing_table, subnet_records) = setup();
+        let (_, _, network_topology) = setup();
         let execution_parameters = execution_parameters(&canister, MAX_NUM_INSTRUCTIONS);
 
         assert_eq!(
@@ -3982,10 +4113,8 @@ fn cannot_execute_update_on_stopping_canister() {
                     canister,
                     RequestOrIngress::Ingress(IngressBuilder::new().build()),
                     mock_time(),
-                    routing_table,
-                    subnet_records,
+                    network_topology,
                     execution_parameters,
-                    subnet_test_id(0x101), // NNS subnet
                 )
                 .2,
             CallContextAction::Fail {
@@ -4000,7 +4129,7 @@ fn cannot_execute_update_on_stopping_canister() {
 fn cannot_execute_update_on_stopped_canister() {
     with_hypervisor(|hypervisor, _| {
         let canister = get_stopped_canister(canister_test_id(0));
-        let (_, _, _, routing_table, subnet_records) = setup();
+        let (_, _, network_topology) = setup();
         let execution_parameters = execution_parameters(&canister, MAX_NUM_INSTRUCTIONS);
 
         assert_eq!(
@@ -4009,10 +4138,8 @@ fn cannot_execute_update_on_stopped_canister() {
                     canister,
                     RequestOrIngress::Ingress(IngressBuilder::new().build()),
                     mock_time(),
-                    routing_table,
-                    subnet_records,
+                    network_topology,
                     execution_parameters,
-                    subnet_test_id(0x101), // NNS subnet
                 )
                 .2,
             CallContextAction::Fail {
@@ -4075,7 +4202,7 @@ fn cannot_execute_query_on_stopped_canister() {
 fn cannot_execute_callback_on_stopped_canister() {
     with_hypervisor(|hypervisor, _| {
         let canister = get_stopped_canister(canister_test_id(0));
-        let (_, _, _, routing_table, subnet_records) = setup();
+        let (_, _, network_topology) = setup();
         let execution_parameters = execution_parameters(&canister, MAX_NUM_INSTRUCTIONS);
 
         assert_eq!(
@@ -4085,6 +4212,8 @@ fn cannot_execute_callback_on_stopped_canister() {
                     &CallOrigin::CanisterUpdate(canister_test_id(0), CallbackId::from(0)),
                     Callback::new(
                         call_context_test_id(0),
+                        None,
+                        None,
                         Cycles::from(0),
                         WasmClosure::new(0, 0),
                         WasmClosure::new(0, 0),
@@ -4093,10 +4222,8 @@ fn cannot_execute_callback_on_stopped_canister() {
                     Payload::Data(EMPTY_PAYLOAD),
                     Cycles::from(0),
                     mock_time(),
-                    routing_table,
-                    subnet_records,
+                    network_topology,
                     execution_parameters,
-                    subnet_test_id(0x101), // NNS subnet
                 )
                 .3,
             Err(HypervisorError::CanisterStopped)
@@ -4123,14 +4250,8 @@ fn sys_api_call_ic_trap_preserves_some_cycles() {
             )"#;
 
         // Check an update method.
-        let (canister, num_instructions_left, action, _) = execute_update(
-            &hypervisor,
-            wat,
-            "update_trap",
-            EMPTY_PAYLOAD,
-            None,
-            tmp_path,
-        );
+        let (canister, num_instructions_left, action, _) =
+            execute_update(&hypervisor, wat, "update_trap", EMPTY_PAYLOAD, tmp_path);
         assert_eq!(
             action,
             CallContextAction::Fail {
@@ -4138,10 +4259,13 @@ fn sys_api_call_ic_trap_preserves_some_cycles() {
                 refund: Cycles::from(0),
             }
         );
-        // Check that ic0.trap call wasn't expensive
+        // Check that ic0.trap call wasn't expensive:
+        // call trap -- 21 instructions
+        // constants -- 2 instructions
+        // trap data -- 12 instructions
         assert_eq!(
             num_instructions_left,
-            MAX_NUM_INSTRUCTIONS - NumInstructions::new(15)
+            MAX_NUM_INSTRUCTIONS - NumInstructions::new(35)
         );
 
         let execution_parameters = execution_parameters(&canister, MAX_NUM_INSTRUCTIONS);
@@ -4161,11 +4285,117 @@ fn sys_api_call_ic_trap_preserves_some_cycles() {
             res,
             Err(HypervisorError::CalledTrap("Trap called!".to_string()))
         );
-        // Check that ic0.trap call wasn't expensive
+        // Check that ic0.trap call wasn't expensive:
+        // call trap -- 21 instructions
+        // constants -- 2 instructions
+        // trap data -- 12 instructions
         assert_eq!(
             num_instructions_left,
-            MAX_NUM_INSTRUCTIONS - NumInstructions::new(15)
+            MAX_NUM_INSTRUCTIONS - NumInstructions::new(35)
         );
+    });
+}
+
+// If method is not exported, `execute_anonymous_query` fails.
+#[test]
+fn canister_anonymous_query_method_not_exported() {
+    with_hypervisor(|hypervisor, tmp_path| {
+        let method = "transform";
+        let wasm = wabt::wat2wasm(
+            r#"(module
+                  (memory $memory 1)
+                  (export "memory" (memory $memory))
+            )"#,
+        )
+        .unwrap();
+
+        let canister_id = canister_test_id(42);
+        let execution_state = hypervisor
+            .create_execution_state(wasm, tmp_path, canister_id)
+            .unwrap();
+        let canister = canister_from_exec_state(execution_state, canister_id);
+        let execution_parameters = execution_parameters(&canister, MAX_NUM_INSTRUCTIONS);
+
+        let (_, _, result) = hypervisor.execute_anonymous_query(
+            mock_time(),
+            method,
+            vec![].as_slice(),
+            canister,
+            None,
+            execution_parameters,
+        );
+        assert_eq!(
+            result,
+            Err(HypervisorError::MethodNotFound(WasmMethod::Query(
+                method.to_string()
+            )))
+        );
+    });
+}
+
+// Using `execute_anonymous_query` to execute transform function on a http response succeeds.
+#[test]
+fn canister_anonymous_query_transform_http_response() {
+    with_hypervisor(|hypervisor, tmp_path| {
+        let wasm = wabt::wat2wasm(
+            r#"(module
+                 (import "ic0" "msg_reply" (func $ic0_msg_reply))
+                 (import "ic0" "msg_arg_data_copy"
+                      (func $ic0_msg_arg_data_copy (param i32 i32 i32)))
+                 (import "ic0" "msg_arg_data_size"
+                      (func $ic0_msg_arg_data_size (result i32)))
+                 (import "ic0" "msg_reply_data_append"
+                      (func $ic0_msg_reply_data_append (param i32) (param i32)))
+                 (func $transform
+                        ;; Replies with the provided http_reponse argument without any modifcations.
+                        (call $ic0_msg_arg_data_copy
+                          (i32.const 0) ;; dst
+                          (i32.const 0) ;; offset
+                          (call $ic0_msg_arg_data_size) ;; size
+                        )
+                        (call $ic0_msg_reply_data_append
+                          (i32.const 0) ;; src
+                          (call $ic0_msg_arg_data_size) ;; size
+                        )
+                        (call $ic0_msg_reply)
+                    )
+
+                  (memory $memory 1)
+                  (export "memory" (memory $memory))
+                  (export "canister_query http_transform" (func $transform))
+            )"#,
+        )
+        .unwrap();
+
+        let method = "http_transform";
+        let canister_http_response = CanisterHttpResponsePayload {
+            status: 200,
+            headers: vec![],
+            body: vec![0, 1, 2],
+        };
+        let payload = Encode!(&canister_http_response).unwrap();
+
+        let canister_id = canister_test_id(42);
+        let execution_state = hypervisor
+            .create_execution_state(wasm, tmp_path, canister_id)
+            .unwrap();
+        let canister = canister_from_exec_state(execution_state, canister_id);
+        let execution_parameters = execution_parameters(&canister, MAX_NUM_INSTRUCTIONS);
+
+        let (_, _, result) = hypervisor.execute_anonymous_query(
+            mock_time(),
+            method,
+            payload.as_slice(),
+            canister,
+            None,
+            execution_parameters,
+        );
+        let transformed_canister_http_response = Decode!(
+            result.unwrap().unwrap().bytes().as_slice(),
+            CanisterHttpResponsePayload
+        )
+        .unwrap();
+        assert_eq!(canister_http_response, transformed_canister_http_response)
     });
 }
 
@@ -4182,20 +4412,21 @@ fn canister_heartbeat() {
         )
         .unwrap();
 
-        let execution_state = ExecutionStateBuilder::new(wasm, tmp_path).build();
-        let canister = canister_from_exec_state(execution_state);
-        let (_, _, _, routing_table, subnet_records) = setup();
+        let canister_id = canister_test_id(42);
+        let execution_state = hypervisor
+            .create_execution_state(wasm, tmp_path, canister_id)
+            .unwrap();
+        let canister = canister_from_exec_state(execution_state, canister_id);
+        let (_, _, network_topology) = setup();
         let execution_parameters = execution_parameters(&canister, MAX_NUM_INSTRUCTIONS);
 
         assert_eq!(
             hypervisor
                 .execute_canister_heartbeat(
                     canister,
-                    routing_table,
-                    subnet_records,
+                    network_topology,
                     mock_time(),
                     execution_parameters,
-                    subnet_test_id(0x101), // NNS subnet
                 )
                 .2,
             Err(HypervisorError::Trapped(TrapCode::Unreachable))
@@ -4217,18 +4448,19 @@ fn execute_canister_heartbeat_produces_heap_delta() {
         )
         .unwrap();
 
-        let execution_state = ExecutionStateBuilder::new(wasm, tmp_path).build();
-        let canister = canister_from_exec_state(execution_state);
-        let (_, _, _, routing_table, subnet_records) = setup();
+        let canister_id = canister_test_id(42);
+        let execution_state = hypervisor
+            .create_execution_state(wasm, tmp_path, canister_id)
+            .unwrap();
+        let canister = canister_from_exec_state(execution_state, canister_id);
+        let (_, _, network_topology) = setup();
         let execution_parameters = execution_parameters(&canister, MAX_NUM_INSTRUCTIONS);
 
         let (_, _, result) = hypervisor.execute_canister_heartbeat(
             canister,
-            routing_table,
-            subnet_records,
+            network_topology,
             mock_time(),
             execution_parameters,
-            subnet_test_id(0x101), // NNS subnet
         );
         let heap_delta = result.unwrap();
         // the wasm module touched one memory location so that should produce one page
@@ -4251,9 +4483,12 @@ fn execute_update_produces_heap_delta() {
         )
         .unwrap();
 
-        let execution_state = ExecutionStateBuilder::new(wasm, tmp_path).build();
-        let canister = canister_from_exec_state(execution_state);
-        let (_, _, _, routing_table, subnet_records) = setup();
+        let canister_id = canister_test_id(42);
+        let execution_state = hypervisor
+            .create_execution_state(wasm, tmp_path, canister_id)
+            .unwrap();
+        let canister = canister_from_exec_state(execution_state, canister_id);
+        let (_, _, network_topology) = setup();
         let execution_parameters = execution_parameters(&canister, MAX_NUM_INSTRUCTIONS);
 
         let message = RequestOrIngress::Ingress(
@@ -4266,10 +4501,8 @@ fn execute_update_produces_heap_delta() {
             canister,
             message,
             mock_time(),
-            routing_table,
-            subnet_records,
+            network_topology,
             execution_parameters,
-            subnet_test_id(0x101), // NNS subnet
         );
         // the wasm module touched one memory location so that should produce one page
         // of delta.
@@ -4292,8 +4525,11 @@ fn execute_canister_start_produces_heap_delta() {
         )
         .unwrap();
 
-        let execution_state = ExecutionStateBuilder::new(wasm, tmp_path).build();
-        let canister = canister_from_exec_state(execution_state);
+        let canister_id = canister_test_id(42);
+        let execution_state = hypervisor
+            .create_execution_state(wasm, tmp_path, canister_id)
+            .unwrap();
+        let canister = canister_from_exec_state(execution_state, canister_id);
         let execution_parameters = execution_parameters(&canister, MAX_NUM_INSTRUCTIONS);
 
         let (_, _, result) = hypervisor.execute_canister_start(canister, execution_parameters);
@@ -4318,8 +4554,11 @@ fn execute_system_produces_heap_delta() {
         )
         .unwrap();
 
-        let execution_state = ExecutionStateBuilder::new(wasm, tmp_path).build();
-        let canister = canister_from_exec_state(execution_state);
+        let canister_id = canister_test_id(42);
+        let execution_state = hypervisor
+            .create_execution_state(wasm, tmp_path, canister_id)
+            .unwrap();
+        let canister = canister_from_exec_state(execution_state, canister_id);
         let execution_parameters = execution_parameters(&canister, MAX_NUM_INSTRUCTIONS);
 
         let (_, _, result) = hypervisor.execute_canister_init(
@@ -4439,26 +4678,26 @@ const WASM_PAGE_SIZE: i32 = 65536;
 struct MemoryAccessor {
     hypervisor: Hypervisor,
     canister: CanisterState,
-    routing_table: Arc<RoutingTable>,
-    subnet_records: Arc<BTreeMap<SubnetId, SubnetType>>,
+    network_topology: Arc<NetworkTopology>,
     execution_parameters: ExecutionParameters,
 }
 
 impl MemoryAccessor {
     fn new(wasm_pages: i32, hypervisor: Hypervisor, tmp_path: PathBuf) -> Self {
         let wat = memory_module_wat(wasm_pages);
-        let mut execution_state =
-            ExecutionStateBuilder::new(wabt::wat2wasm(wat).unwrap(), tmp_path).build();
-        execution_state.wasm_memory.page_map = PageMap::default();
+        let wasm = wabt::wat2wasm(wat).unwrap();
+        let canister_id = canister_test_id(42);
+        let execution_state = hypervisor
+            .create_execution_state(wasm, tmp_path, canister_id)
+            .unwrap();
 
-        let canister = canister_from_exec_state(execution_state);
+        let canister = canister_from_exec_state(execution_state, canister_id);
         let execution_parameters = execution_parameters(&canister, MAX_NUM_INSTRUCTIONS);
-        let (_, _, _, routing_table, subnet_records) = setup();
+        let (_, _, network_topology) = setup();
         Self {
             hypervisor,
             canister,
-            routing_table,
-            subnet_records,
+            network_topology,
             execution_parameters,
         }
     }
@@ -4478,10 +4717,8 @@ impl MemoryAccessor {
             self.canister.clone(),
             RequestOrIngress::Ingress(req),
             mock_time(),
-            Arc::clone(&self.routing_table),
-            Arc::clone(&self.subnet_records),
+            Arc::clone(&self.network_topology),
             self.execution_parameters.clone(),
-            subnet_test_id(0x101), // NNS subnet
         );
         self.canister = result.0;
         result.2
@@ -4502,10 +4739,8 @@ impl MemoryAccessor {
             self.canister.clone(),
             RequestOrIngress::Ingress(req),
             mock_time(),
-            Arc::clone(&self.routing_table),
-            Arc::clone(&self.subnet_records),
+            Arc::clone(&self.network_topology),
             self.execution_parameters.clone(),
-            subnet_test_id(0x101), // NNS subnet
         );
         self.canister = result.0;
         result.2
@@ -4524,10 +4759,8 @@ impl MemoryAccessor {
             self.canister.clone(),
             RequestOrIngress::Ingress(req),
             mock_time(),
-            Arc::clone(&self.routing_table),
-            Arc::clone(&self.subnet_records),
+            Arc::clone(&self.network_topology),
             self.execution_parameters.clone(),
-            subnet_test_id(0x101), // NNS subnet
         );
         self.canister = result.0;
         result.2
@@ -4547,19 +4780,14 @@ impl MemoryAccessor {
             self.canister.clone(),
             RequestOrIngress::Ingress(req),
             mock_time(),
-            Arc::clone(&self.routing_table),
-            Arc::clone(&self.subnet_records),
+            Arc::clone(&self.network_topology),
             self.execution_parameters.clone(),
-            subnet_test_id(0x101), // NNS subnet
         );
         self.canister = result.0;
         result.2
     }
 
     fn verify_dirty_pages(&self, is_dirty_page: &[bool]) {
-        if cow_state_feature::is_enabled(cow_state_feature::cow_state) {
-            return;
-        }
         for (page_index, is_dirty_page) in is_dirty_page.iter().enumerate() {
             match self
                 .canister
@@ -4581,14 +4809,14 @@ impl MemoryAccessor {
     }
 }
 
-fn with_memory_accessor<F>(wasm_pages: i32, test: F)
+fn with_memory_accessor<F, R>(wasm_pages: i32, test: F) -> R
 where
-    F: FnOnce(MemoryAccessor),
+    F: FnOnce(MemoryAccessor) -> R,
 {
     with_hypervisor(|hypervisor, tmp_path| {
         let memory_accessor = MemoryAccessor::new(wasm_pages, hypervisor, tmp_path);
-        test(memory_accessor);
-    });
+        test(memory_accessor)
+    })
 }
 
 #[test]
@@ -4690,91 +4918,104 @@ fn random_operations(
     prop::collection::vec(operation, 1..num_operations)
 }
 
-proptest! {
+#[test]
+fn random_memory_accesses() {
     // Limit the number of cases to keep the running time low.
-    #![proptest_config(ProptestConfig { cases: 20, .. ProptestConfig::default() })]
-    #[test]
-    fn random_memory_accesses(operations in random_operations(10, 100)) {
-        const PAGES_PER_WASM_PAGE: i32 = WASM_PAGE_SIZE / 4096;
-        let mut pages = vec![0_u8; 10 * PAGES_PER_WASM_PAGE as usize];
-        let mut dirty = vec![false; 10 * PAGES_PER_WASM_PAGE as usize];
-        with_memory_accessor(10, |mut memory_accessor| {
-            for op in operations {
-                match op {
-                    Operation::Read (page) => {
-                        assert_eq!(
-                            CallContextAction::Reply {
-                                payload: vec![pages[page as usize]; 4096],
-                                refund: Cycles::new(0)
-                            },
-                            memory_accessor.read(page * 4096, 4096),
-                        );
-                        // Read uses the first page as a scratchpad for arguments.
-                        dirty[0] = true;
-                    }
-                    Operation::Write (page, value) => {
-                        // Pages are already zero initialized, so writing zero
-                        // doesn't necessarily dirty them. Avoid zeros to make
-                        // dirty page tracking in the test precise.
-                        assert!(value > 0);
-                        assert_eq!(
-                            CallContextAction::NoResponse {
-                                refund: Cycles::new(0)
-                            },
-                            memory_accessor.write(page * 4096, &[value; 4096]),
-                        );
+    let config = ProptestConfig {
+        cases: 20,
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    };
+    let algorithm = config.rng_algorithm;
+    let mut runner = TestRunner::new_with_rng(config, TestRng::deterministic_rng(algorithm));
+    runner
+        .run(&random_operations(10, 100), |operations| {
+            const PAGES_PER_WASM_PAGE: i32 = WASM_PAGE_SIZE / 4096;
+            let mut pages = vec![0_u8; 10 * PAGES_PER_WASM_PAGE as usize];
+            let mut dirty = vec![false; 10 * PAGES_PER_WASM_PAGE as usize];
+            with_memory_accessor(10, |mut memory_accessor| {
+                for op in operations {
+                    match op {
+                        Operation::Read(page) => {
+                            prop_assert_eq!(
+                                CallContextAction::Reply {
+                                    payload: vec![pages[page as usize]; 4096],
+                                    refund: Cycles::new(0)
+                                },
+                                memory_accessor.read(page * 4096, 4096)
+                            );
+                            // Read uses the first page as a scratchpad for arguments.
+                            dirty[0] = true;
+                        }
+                        Operation::Write(page, value) => {
+                            // Pages are already zero initialized, so writing zero
+                            // doesn't necessarily dirty them. Avoid zeros to make
+                            // dirty page tracking in the test precise.
+                            prop_assert!(value > 0);
+                            prop_assert_eq!(
+                                CallContextAction::NoResponse {
+                                    refund: Cycles::new(0)
+                                },
+                                memory_accessor.write(page * 4096, &[value; 4096])
+                            );
 
-                        // Confirm that the write was correct by reading the page.
-                        assert_eq!(
-                            CallContextAction::Reply {
-                                payload: vec![value; 4096],
-                                refund: Cycles::new(0)
-                            },
-                            memory_accessor.read(page * 4096, 4096),
-                        );
-                        pages[page as usize] = value;
-                        dirty[page as usize] = true;
-                        // Write uses the first page as a scratchpad for arguments.
-                        dirty[0] = true;
-                    },
-                    Operation::GrowAndRead => {
-                        assert_eq!(
-                            CallContextAction::Reply {
-                                payload: vec![0; 65536],
-                                refund: Cycles::new(0)
-                            },
-                            memory_accessor.grow_and_read(),
-                        );
-                        pages.extend(vec![0_u8; PAGES_PER_WASM_PAGE as usize]);
-                        dirty.extend(vec![false; PAGES_PER_WASM_PAGE as usize]);
-                    },
-                    Operation::GrowAndWrite (value) => {
-                        // Pages are already zero initialized, so writing zero
-                        // doesn't necessarily dirty them. Avoid zeros to make
-                        // dirty page tracking in the test precise.
-                        assert!(value > 0);
-                        assert_eq!(
-                            CallContextAction::NoResponse {
-                                refund: Cycles::new(0)
-                            },
-                            memory_accessor.grow_and_write(&[value; WASM_PAGE_SIZE as usize]),
-                        );
-                        // Confirm that the write was correct by reading the pages.
-                        assert_eq!(
-                            CallContextAction::Reply {
-                                payload: vec![value; WASM_PAGE_SIZE as usize],
-                                refund: Cycles::new(0)
-                            },
-                            memory_accessor.read(pages.len() as i32 * 4096, WASM_PAGE_SIZE),
-                        );
-                        pages.extend(vec![value; PAGES_PER_WASM_PAGE as usize]);
-                        dirty.extend(vec![true; PAGES_PER_WASM_PAGE as usize]);
+                            // Confirm that the write was correct by reading the page.
+                            prop_assert_eq!(
+                                CallContextAction::Reply {
+                                    payload: vec![value; 4096],
+                                    refund: Cycles::new(0)
+                                },
+                                memory_accessor.read(page * 4096, 4096)
+                            );
+                            pages[page as usize] = value;
+                            dirty[page as usize] = true;
+                            // Write uses the first page as a scratchpad for arguments.
+                            dirty[0] = true;
+                        }
+                        Operation::GrowAndRead => {
+                            prop_assert_eq!(
+                                CallContextAction::Reply {
+                                    payload: vec![0; 65536],
+                                    refund: Cycles::new(0)
+                                },
+                                memory_accessor.grow_and_read()
+                            );
+                            pages.extend(vec![0_u8; PAGES_PER_WASM_PAGE as usize]);
+                            dirty.extend(vec![false; PAGES_PER_WASM_PAGE as usize]);
+                            // Read uses the first page as a scratchpad for arguments.
+                            dirty[0] = true;
+                        }
+                        Operation::GrowAndWrite(value) => {
+                            // Pages are already zero initialized, so writing zero
+                            // doesn't necessarily dirty them. Avoid zeros to make
+                            // dirty page tracking in the test precise.
+                            prop_assert!(value > 0);
+                            prop_assert_eq!(
+                                CallContextAction::NoResponse {
+                                    refund: Cycles::new(0)
+                                },
+                                memory_accessor.grow_and_write(&[value; WASM_PAGE_SIZE as usize])
+                            );
+                            // Confirm that the write was correct by reading the pages.
+                            prop_assert_eq!(
+                                CallContextAction::Reply {
+                                    payload: vec![value; WASM_PAGE_SIZE as usize],
+                                    refund: Cycles::new(0)
+                                },
+                                memory_accessor.read(pages.len() as i32 * 4096, WASM_PAGE_SIZE)
+                            );
+                            pages.extend(vec![value; PAGES_PER_WASM_PAGE as usize]);
+                            dirty.extend(vec![true; PAGES_PER_WASM_PAGE as usize]);
+                            // Write uses the first page as a scratchpad for arguments.
+                            dirty[0] = true;
+                        }
                     }
                 }
-            }
-            memory_accessor.verify_dirty_pages(&dirty);
-        });
-    }
+                memory_accessor.verify_dirty_pages(&dirty);
+                Ok(())
+            })
+        })
+        .unwrap();
 }
 
 // Verify that the `memory.fill` instruction has cost linear with it's size
@@ -4796,9 +5037,12 @@ fn account_for_size_of_memory_fill_instruction() {
             features,
         )
         .unwrap();
-        let execution_state = ExecutionStateBuilder::new(binary, tmp_path).build();
+        let canister_id = canister_test_id(42);
+        let execution_state = hypervisor
+            .create_execution_state(binary, tmp_path, canister_id)
+            .unwrap();
 
-        let canister = canister_from_exec_state(execution_state);
+        let canister = canister_from_exec_state(execution_state, canister_id);
         let execution_parameters = execution_parameters(&canister, MAX_NUM_INSTRUCTIONS);
 
         let (_, num_instructions, result) =
@@ -4828,11 +5072,198 @@ fn memory_fill_can_trigger_out_of_instructions() {
             features,
         )
         .unwrap();
-        let execution_state = ExecutionStateBuilder::new(binary, tmp_path).build();
-        let canister = canister_from_exec_state(execution_state);
+        let canister_id = canister_test_id(42);
+        let execution_state = hypervisor
+            .create_execution_state(binary, tmp_path, canister_id)
+            .unwrap();
+        let canister = canister_from_exec_state(execution_state, canister_id);
         let execution_parameters = execution_parameters(&canister, MAX_NUM_INSTRUCTIONS);
 
         let (_, _, result) = hypervisor.execute_canister_start(canister, execution_parameters);
         assert_eq!(result, Err(HypervisorError::InstructionLimitExceeded));
+    });
+}
+
+#[test]
+fn broken_wasm_results_in_compilation_error() {
+    with_hypervisor(|hypervisor, tmp_path| {
+        let binary = vec![0xca, 0xfe, 0xba, 0xbe];
+
+        let result = hypervisor.create_execution_state(binary, tmp_path, canister_test_id(0));
+
+        match result {
+            Err(HypervisorError::InvalidWasm(_)) => (),
+            val => panic!("Expected a compile error, got: {:?}", val),
+        }
+    });
+}
+
+#[test]
+fn can_extract_exported_functions() {
+    with_hypervisor(|hypervisor, tmp_path| {
+        let execution_state = hypervisor
+            .create_execution_state(
+                wabt::wat2wasm(
+                    r#"
+                        (module
+                          (func $write)
+                          (func $read)
+                          (export "canister_update write" (func $write))
+                          (export "canister_query read" (func $read))
+                          (memory (;0;) 2)
+                          (export "memory" (memory 0))
+                        )
+                    "#,
+                )
+                .unwrap(),
+                tmp_path,
+                canister_test_id(0),
+            )
+            .unwrap();
+        let mut expected_exports = BTreeSet::new();
+        expected_exports.insert(WasmMethod::Update("write".to_string()));
+        expected_exports.insert(WasmMethod::Query("read".to_string()));
+        assert_eq!(
+            execution_state.exports,
+            ExportedFunctions::new(expected_exports)
+        );
+    });
+}
+
+#[test]
+fn can_extract_exported_custom_sections() {
+    with_hypervisor(|hypervisor, tmp_path| {
+        // The wasm file below contains the following custom sections
+        // Custom start=0x0002586a end=0x00028d92 (size=0x00003528) "name"
+        // Custom start=0x00028d98 end=0x00028ddc (size=0x00000044) "icp:public candid:service"
+        // Custom start=0x00028de2 end=0x00028dfc (size=0x0000001a) "icp:private candid:args"
+        // Custom start=0x00028e02 end=0x00028e30 (size=0x0000002e) "icp:private motoko:stable-types"
+
+        let wasm = include_bytes!("test-data/custom_sections.wasm").to_vec();
+        let execution_state = hypervisor
+            .create_execution_state(wasm, tmp_path, canister_test_id(0))
+            .unwrap();
+
+        assert_eq!(
+            execution_state
+                .metadata
+                .custom_sections()
+                .get("candid:service")
+                .unwrap()
+                .visibility,
+            CustomSectionType::Public
+        );
+        assert_eq!(
+            execution_state
+                .metadata
+                .custom_sections()
+                .get("candid:args")
+                .unwrap()
+                .visibility,
+            CustomSectionType::Private
+        );
+        assert_eq!(
+            execution_state
+                .metadata
+                .custom_sections()
+                .get("motoko:stable-types")
+                .unwrap()
+                .visibility,
+            CustomSectionType::Private
+        );
+        // Only the valid custom sections names are extracted: icp:public <name> or icp:private <name>.
+        assert_eq!(execution_state.metadata.custom_sections().len(), 3);
+    });
+}
+
+#[test]
+fn execute_with_huge_cycle_balance() {
+    with_hypervisor(|hypervisor, tmp_path| {
+        let wasm = wabt::wat2wasm(
+            r#"
+                        (module
+                          (func (export "canister_init"))
+                          (memory 0))
+                        "#,
+        )
+        .unwrap();
+
+        let canister_id = canister_test_id(42);
+        let execution_state = hypervisor
+            .create_execution_state(wasm, tmp_path, canister_id)
+            .unwrap();
+        let mut canister = canister_from_exec_state(execution_state, canister_id);
+        let execution_parameters = execution_parameters(&canister, MAX_NUM_INSTRUCTIONS);
+        *canister.system_state.balance_mut() = Cycles::new(1u128 << 100);
+        let (_, _, res) = hypervisor.execute_canister_init(
+            canister,
+            test_caller(),
+            EMPTY_PAYLOAD.as_slice(),
+            mock_time(),
+            execution_parameters,
+        );
+        assert!(res.is_ok());
+    });
+}
+
+#[test]
+fn install_gzip_compressed_module() {
+    with_hypervisor(|hypervisor, tmp_path| {
+        let wat = r#"
+                (module
+                    (import "ic0" "msg_reply" (func $msg_reply))
+                    (import "ic0" "msg_reply_data_append"
+                        (func $msg_reply_data_append (param i32 i32)))
+                    (func $inc
+                        (i32.store
+                            (i32.const 0)
+                            (i32.add (i32.load (i32.const 0)) (i32.const 1))))
+                    (func $read
+                        (call $msg_reply_data_append
+                            (i32.const 0) ;; the counter from heap[0]
+                            (i32.const 4)) ;; length
+                        (call $msg_reply))
+                    (memory $memory 1)
+                    (export "canister_query read" (func $read))
+                    (export "canister_update inc" (func $inc))
+                )"#;
+
+        let binary = {
+            let wasm = wabt::wat2wasm(wat).unwrap();
+            let mut encoder = libflate::gzip::Encoder::new(Vec::new()).unwrap();
+            std::io::copy(&mut &wasm[..], &mut encoder).unwrap();
+            encoder.finish().into_result().unwrap()
+        };
+
+        let canister_id = canister_test_id(42);
+        let execution_state = hypervisor
+            .create_execution_state(binary, tmp_path, canister_id)
+            .unwrap();
+
+        let canister = canister_from_exec_state(execution_state, canister_id);
+        let execution_parameters = execution_parameters(&canister, MAX_NUM_INSTRUCTIONS);
+
+        let (_, _, subnet_topology) = setup();
+
+        let (canister, _, _, _) = hypervisor.execute_update(
+            canister,
+            RequestOrIngress::Ingress(IngressBuilder::new().method_name("inc".to_string()).build()),
+            mock_time(),
+            subnet_topology,
+            execution_parameters.clone(),
+        );
+
+        let (_, _, result) = hypervisor.execute_query(
+            QueryExecutionType::Replicated,
+            "read",
+            EMPTY_PAYLOAD.as_slice(),
+            test_caller(),
+            canister,
+            None,
+            mock_time(),
+            execution_parameters,
+        );
+
+        assert_eq!(result, Ok(Some(WasmResult::Reply(vec![1, 0, 0, 0]))));
     });
 }

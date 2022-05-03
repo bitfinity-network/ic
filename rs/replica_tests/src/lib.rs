@@ -1,23 +1,27 @@
 use core::future::Future;
 use ic_base_types::{PrincipalId, SubnetId};
 use ic_canister_client::Sender;
-use ic_config::crypto::CryptoConfig;
 use ic_config::Config;
+use ic_config::{crypto::CryptoConfig, transport::TransportFlowConfig};
+use ic_error_types::{ErrorCode, RejectCode, UserError};
 use ic_execution_environment::IngressHistoryReaderImpl;
-use ic_interfaces::registry::RegistryClient;
-use ic_interfaces::{
-    execution_environment::{IngressHistoryReader, QueryHandler},
-    p2p::IngressIngestionService,
-    state_manager::StateReader,
+use ic_ic00_types::CanisterInstallMode;
+use ic_ic00_types::{
+    CanisterIdRecord, InstallCodeArgs, Method, Payload, ProvisionalCreateCanisterWithCyclesArgs,
+    IC_00,
 };
+use ic_interfaces::execution_environment::{IngressHistoryReader, QueryHandler};
+use ic_interfaces::registry::RegistryClient;
+use ic_interfaces_p2p::IngressIngestionService;
+use ic_interfaces_state_manager::StateReader;
 use ic_metrics::MetricsRegistry;
 use ic_prep_lib::internet_computer::{IcConfig, TopologyConfig};
-use ic_prep_lib::node::{NodeConfiguration, NodeIndex};
+use ic_prep_lib::node::{NodeConfiguration, NodeIndex, NodeSecretKeyStore};
 use ic_prep_lib::subnet_configuration::SubnetConfig;
-use ic_registry_client::fake::FakeRegistryClient;
-use ic_registry_client::helper::subnet::SubnetRegistry;
-use ic_registry_common::proto_registry_data_provider::ProtoRegistryDataProvider;
+use ic_registry_client_fake::FakeRegistryClient;
+use ic_registry_client_helpers::subnet::SubnetRegistry;
 use ic_registry_keys::make_subnet_list_record_key;
+use ic_registry_proto_data_provider::ProtoRegistryDataProvider;
 use ic_registry_provisional_whitelist::ProvisionalWhitelist;
 use ic_registry_subnet_type::SubnetType;
 use ic_replica::setup::setup_crypto_provider;
@@ -26,21 +30,13 @@ use ic_test_utilities::{
     types::ids::user_anonymous_id, types::messages::SignedIngressBuilder,
     universal_canister::UNIVERSAL_CANISTER_WASM, with_test_replica_logger,
 };
-use ic_types::user_error::RejectCode;
 use ic_types::{
-    ic00::{
-        CanisterIdRecord, InstallCodeArgs, Method, Payload,
-        ProvisionalCreateCanisterWithCyclesArgs, IC_00,
-    },
     ingress::{IngressStatus, WasmResult},
-    messages::{CanisterInstallMode, SignedIngress, UserQuery},
+    messages::{SignedIngress, UserQuery},
     replica_config::NODE_INDEX_DEFAULT,
     time::current_time_and_expiry_time,
-    transport::TransportFlowConfig,
-    user_error::UserError,
     CanisterId, Height, NodeId, RegistryVersion, Time,
 };
-use ic_utils::ic_features::*;
 use prost::Message;
 use slog_scope::info;
 use std::collections::BTreeMap;
@@ -52,10 +48,9 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use tower::util::ServiceExt;
-use tower_service::Service;
+use tower::{util::ServiceExt, Service};
 
-const CYCLES_BALANCE: u64 = 1 << 50;
+const CYCLES_BALANCE: u128 = 1 << 120;
 
 /// Executes an ingress message and blocks till execution finishes.
 ///
@@ -99,6 +94,12 @@ fn process_ingress(
             IngressStatus::Failed { error, .. } => {
                 // Don't forget! Signal the runtime to stop.
                 return Err(error);
+            }
+            IngressStatus::Done { .. } => {
+                return Err(UserError::new(
+                    ErrorCode::SubnetOversubscribed,
+                    "The call has completed but the reply/reject data has been pruned.",
+                ));
             }
             IngressStatus::Received { .. }
             | IngressStatus::Processing { .. }
@@ -157,12 +158,14 @@ where
 /// function calls instead of http calls.
 pub struct LocalTestRuntime {
     pub query_handler: Arc<dyn QueryHandler<State = ReplicatedState>>,
-    pub ingress_sender: Mutex<Option<IngressIngestionService>>,
+    pub ingress_sender: Arc<Mutex<Option<IngressIngestionService>>>,
     pub ingress_history_reader: Arc<dyn IngressHistoryReader>,
     pub state_reader: Arc<dyn StateReader<State = ReplicatedState>>,
     pub node_id: NodeId,
     nonce: Mutex<u64>,
     pub ingress_time_limit: Duration,
+    pub registry_data_provider: Arc<ProtoRegistryDataProvider>,
+    pub registry_client: Arc<FakeRegistryClient>,
 }
 
 /// This function is here to maintain compatibility with existing tests
@@ -211,12 +214,14 @@ where
 pub fn get_ic_config() -> IcConfig {
     let subnet_index = 0;
 
-    // Allocate a temporary directory where ic-prep generates the registry and the
-    // crypto state.
-    let prep_dir = tempfile::Builder::new()
-        .prefix("ic_prep")
-        .tempdir()
-        .unwrap();
+    // Choose a temporary directory as the working directory for ic-prep.
+    use rand::Rng;
+    let random_suffix = rand::thread_rng().gen::<usize>();
+    let prep_dir = std::env::temp_dir().join(format!("ic_prep_{}", random_suffix));
+
+    // Create the secret key store in a node a sub-directory of the ic-prep.
+    let node_sks = prep_dir.join("node_sks");
+    let node_sks = NodeSecretKeyStore::new(node_sks).unwrap();
 
     // We use the `ic-prep` crate to generate the secret key store and registry
     // entries. The topology contains a single node.
@@ -224,16 +229,18 @@ pub fn get_ic_config() -> IcConfig {
     subnet_nodes.insert(
         NODE_INDEX_DEFAULT,
         NodeConfiguration {
-            xnet_api: vec!["http://0.0.0.0:0".parse().expect("can't fail")],
-            public_api: vec!["http://0.0.0.0:0".parse().expect("can't fail")],
+            xnet_api: vec!["http://0.0.0.1:0".parse().expect("can't fail")],
+            public_api: vec!["http://128.0.0.1:10000".parse().expect("can't fail")],
             private_api: vec![],
-            p2p_addr: "org.internetcomputer.p2p1://0.0.0.0:0"
+            p2p_addr: "org.internetcomputer.p2p1://128.0.0.1:10000"
                 .parse()
                 .expect("can't fail"),
             prometheus_metrics: vec![],
             p2p_num_flows: 1,
             p2p_start_flow_tag: 0,
             node_operator_principal_id: None,
+            no_idkg_key: false,
+            secret_key_store: Some(node_sks),
         },
     );
 
@@ -269,15 +276,11 @@ pub fn get_ic_config() -> IcConfig {
     // for ic-prep when we handle a specific deployment scenario: deploying
     // without assigning nodes to a particular subnet.
     IcConfig::new(
-        prep_dir.path(),
+        prep_dir,
         topology_config,
         /* replica_version_id= */ None,
-        /* replica_download_url= */ None,
-        /* replica_hash= */ None,
         /* generate_subnet_records= */ true,
         /* nns_subnet_id= */ Some(subnet_index),
-        /* nodemanager_download_url= */ None,
-        /* nodemanager_sha256_hex= */ None,
         /* release_package_url= */ None,
         /* release_package_sha256_hex= */ None,
         /* provisional_whitelist */ Some(provisional_whitelist),
@@ -328,12 +331,6 @@ where
     Fut: Future<Output = Out>,
     F: FnOnce(LocalTestRuntime) -> Fut + 'static,
 {
-    if subnet_config.cow_memory_manager_config.enabled {
-        cow_state_feature::enable(cow_state_feature::cow_state);
-    } else {
-        cow_state_feature::disable(cow_state_feature::cow_state);
-    }
-
     with_test_replica_logger(|logger| {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let _rt_guard = rt.enter();
@@ -345,14 +342,15 @@ where
         let init_subnet = init_ic.initialized_topology.values().next().unwrap();
         let init_node = init_subnet.initialized_nodes.values().next().unwrap();
         let crypto_root = init_node.crypto_path();
-        config.crypto = CryptoConfig { crypto_root };
+        config.crypto = CryptoConfig::new(crypto_root);
 
         // load the registry file written by ic-prep
         let data_provider =
             ProtoRegistryDataProvider::load_from_file(init_ic.registry_path().as_path());
-        let registry = Arc::new(FakeRegistryClient::new(Arc::new(data_provider)));
-        registry.update_to_latest_version();
-        let registry = registry as Arc<dyn RegistryClient + Send + Sync>;
+        let data_provider = Arc::new(data_provider);
+        let fake_registry_client = Arc::new(FakeRegistryClient::new(data_provider.clone()));
+        fake_registry_client.update_to_latest_version();
+        let registry = fake_registry_client.clone() as Arc<dyn RegistryClient + Send + Sync>;
         let crypto = setup_crypto_provider(
             &config.crypto,
             registry.clone(),
@@ -388,28 +386,37 @@ where
             queue_size: 0,
         }];
         let temp_node = node_id;
-        let (_, state_manager, query_handler, _, mut p2p, p2p_event_handler, _, _, _) =
-            ic_replica::setup_p2p::construct_ic_stack(
-                logger,
-                config.clone(),
-                subnet_config,
-                temp_node,
-                subnet_id,
-                subnet_type,
-                registry.clone(),
-                crypto,
-                metrics_registry,
-                None,
-                None,
-            )
-            .expect("Failed to setup p2p");
+        let (
+            _,
+            state_manager,
+            query_handler,
+            _,
+            _,
+            _p2p_thread_joiner,
+            ingress_ingestion_service,
+            _,
+            _,
+            _,
+        ) = ic_replica::setup_p2p::construct_ic_stack(
+            logger,
+            tokio::runtime::Handle::current(),
+            config.clone(),
+            subnet_config,
+            temp_node,
+            subnet_id,
+            subnet_type,
+            registry.clone(),
+            crypto,
+            metrics_registry,
+            None,
+            None,
+        )
+        .expect("Failed to setup p2p");
 
         let ingress_history_reader =
             IngressHistoryReaderImpl::new(Arc::clone(&state_manager) as Arc<_>);
 
-        let ingress_sender = Mutex::new(Some(p2p_event_handler));
-
-        p2p.run();
+        let ingress_sender = Mutex::new(Some(ingress_ingestion_service));
 
         std::thread::sleep(std::time::Duration::from_millis(1000));
         // Before height 1 the replica hasn't figured out what
@@ -430,12 +437,14 @@ where
 
         let runtime = LocalTestRuntime {
             query_handler,
-            ingress_sender,
+            ingress_sender: Arc::new(ingress_sender),
             ingress_history_reader: Arc::new(ingress_history_reader),
             state_reader: state_manager,
             node_id,
             nonce: Mutex::new(0),
             ingress_time_limit: Duration::from_secs(300),
+            registry_data_provider: data_provider,
+            registry_client: fake_registry_client,
         };
         tokio::runtime::Handle::current().block_on(test(runtime))
     })
@@ -480,7 +489,7 @@ impl LocalTestRuntime {
         self.create_canister_with_anonymous(self.get_nonce(), CYCLES_BALANCE)
     }
 
-    pub fn create_canister_with_cycles(&self, num_cycles: u64) -> Result<CanisterId, UserError> {
+    pub fn create_canister_with_cycles(&self, num_cycles: u128) -> Result<CanisterId, UserError> {
         self.create_canister_with_anonymous(self.get_nonce(), num_cycles)
     }
 
@@ -491,7 +500,7 @@ impl LocalTestRuntime {
     pub fn create_canister_with_anonymous(
         &self,
         nonce: u64,
-        num_cycles: u64,
+        num_cycles: u128,
     ) -> Result<CanisterId, UserError> {
         let res = process_ingress(
             &self.ingress_sender,
@@ -566,7 +575,7 @@ impl LocalTestRuntime {
     pub fn create_universal_canister_with_args<P: Into<Vec<u8>>>(
         &self,
         payload: P,
-        num_cycles: u64,
+        num_cycles: u128,
     ) -> CanisterId {
         let (canister_id, res) = self.create_and_install_canister_wasm(
             UNIVERSAL_CANISTER_WASM.to_vec(),
@@ -600,7 +609,7 @@ impl LocalTestRuntime {
         compute_allocation: Option<u64>,
         memory_allocation: Option<u64>,
         query_allocation: Option<u64>,
-        num_cycles: u64,
+        num_cycles: u128,
     ) -> (CanisterId, Result<WasmResult, UserError>) {
         let canister_id = self.create_canister_with_cycles(num_cycles).unwrap();
         (
@@ -614,6 +623,35 @@ impl LocalTestRuntime {
                 query_allocation,
             ),
         )
+    }
+
+    pub async fn install_canister_helper_async(
+        &self,
+        install_code_args: InstallCodeArgs,
+    ) -> Result<WasmResult, UserError> {
+        // Clone data to send to thread
+        let ingress_sender = Arc::clone(&self.ingress_sender);
+        let ingress_history_reader = Arc::clone(&self.ingress_history_reader);
+        let nonce = self.get_nonce();
+        let ingress_time_limit = self.ingress_time_limit;
+        // Wrapping the call to process_ingress to avoid blocking current thread
+        tokio::runtime::Handle::current()
+            .spawn_blocking(move || {
+                process_ingress(
+                    &ingress_sender,
+                    ingress_history_reader.as_ref(),
+                    SignedIngressBuilder::new()
+                        .expiry_time(current_time_and_expiry_time().1)
+                        .canister_id(IC_00)
+                        .method_name(Method::InstallCode)
+                        .method_payload(install_code_args.encode())
+                        .nonce(nonce)
+                        .build(),
+                    ingress_time_limit,
+                )
+            })
+            .await
+            .unwrap()
     }
 
     pub fn install_canister_helper(

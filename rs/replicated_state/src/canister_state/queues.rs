@@ -44,8 +44,8 @@ pub struct CanisterQueues {
     /// Queue of ingress (user) messages.
     ingress_queue: IngressQueue,
 
-    /// Per-sender input (canister-to-canister message) queues.
-    input_queues: BTreeMap<CanisterId, InputQueue>,
+    /// Per remote canister input and output queues.
+    canister_queues: BTreeMap<CanisterId, (InputQueue, OutputQueue)>,
 
     /// FIFO queue of Local Subnet sender canister IDs ensuring round-robin
     /// consumption of input messages. Only senders with non-empty queues
@@ -56,9 +56,6 @@ pub struct CanisterQueues {
     /// consumption of input messages. Only senders with non-empty queues
     /// are scheduled.
     remote_subnet_input_schedule: VecDeque<CanisterId>,
-
-    /// Per-receiver output (canister-to-canister message) queues.
-    output_queues: BTreeMap<CanisterId, OutputQueue>,
 
     /// Running `input_queues` stats.
     input_queues_stats: InputQueuesStats,
@@ -98,12 +95,13 @@ pub struct CanisterOutputQueuesIterator<'a> {
 impl<'a> CanisterOutputQueuesIterator<'a> {
     fn new(
         owner: CanisterId,
-        queues: &'a mut BTreeMap<CanisterId, OutputQueue>,
+        queues: &'a mut BTreeMap<CanisterId, (InputQueue, OutputQueue)>,
         stats: &'a mut MemoryUsageStats,
     ) -> Self {
         let queues: VecDeque<_> = queues
             .iter_mut()
-            .filter(|(_, queue)| queue.num_messages() > 0)
+            .filter(|(_, (_, queue))| queue.num_messages() > 0)
+            .map(|(canister, (_, queue))| (canister, queue))
             .collect();
         let size = Self::compute_size(&queues);
 
@@ -219,7 +217,7 @@ impl CanisterQueues {
     where
         F: FnMut(&CanisterId, Arc<RequestOrResponse>) -> Result<(), ()>,
     {
-        for (canister_id, queue) in self.output_queues.iter_mut() {
+        for (canister_id, (_, queue)) in self.canister_queues.iter_mut() {
             while let Some((_, msg)) = queue.peek() {
                 match f(canister_id, msg) {
                     Err(_) => break,
@@ -243,7 +241,7 @@ impl CanisterQueues {
     pub(crate) fn output_into_iter(&mut self, owner: CanisterId) -> CanisterOutputQueuesIterator {
         CanisterOutputQueuesIterator::new(
             owner,
-            &mut self.output_queues,
+            &mut self.canister_queues,
             &mut self.memory_usage_stats,
         )
     }
@@ -295,12 +293,12 @@ impl CanisterQueues {
                 }
                 input_queue
             }
-            RequestOrResponse::Response(_) => match self.input_queues.get_mut(&sender) {
-                Some(queue) => queue,
+            RequestOrResponse::Response(_) => match self.canister_queues.get_mut(&sender) {
+                Some((queue, _)) => queue,
                 None => return Err((StateError::QueueFull { capacity: 0 }, msg)),
             },
         };
-        let iq_stats_delta = InputQueuesStats::stats_delta(&msg);
+        let iq_stats_delta = InputQueuesStats::stats_delta(QueueOp::Push, &msg);
         let mu_stats_delta = MemoryUsageStats::stats_delta(QueueOp::Push, &msg);
 
         input_queue.push(index, msg)?;
@@ -334,7 +332,7 @@ impl CanisterQueues {
         };
         if let Some(sender) = input_schedule.pop_front() {
             // Get the message queue of this canister.
-            let input_queue = self.input_queues.get_mut(&sender).unwrap();
+            let input_queue = &mut self.canister_queues.get_mut(&sender).unwrap().0;
             let msg = input_queue.pop().unwrap();
             // If the queue still isn't empty, re-add sender canister ID to the end of the
             // input schedule queue.
@@ -342,7 +340,7 @@ impl CanisterQueues {
                 input_schedule.push_back(sender);
             }
 
-            self.input_queues_stats -= InputQueuesStats::stats_delta(&msg);
+            self.input_queues_stats -= InputQueuesStats::stats_delta(QueueOp::Pop, &msg);
             self.memory_usage_stats -= MemoryUsageStats::stats_delta(QueueOp::Pop, &msg);
             debug_assert!(self.stats_ok());
 
@@ -357,17 +355,17 @@ impl CanisterQueues {
     pub fn has_input(&self) -> bool {
         !self.ingress_queue.is_empty()
             || self
-                .input_queues
+                .canister_queues
                 .iter()
-                .any(|(_, queue)| queue.num_messages() > 0)
+                .any(|(_, (queue, _))| queue.num_messages() > 0)
     }
 
     /// Returns `true` if at least one output queue is not empty; false
     /// otherwise.
     pub fn has_output(&self) -> bool {
-        self.output_queues
+        self.canister_queues
             .iter()
-            .any(|(_, queue)| queue.num_messages() > 0)
+            .any(|(_, (_, queue))| queue.num_messages() > 0)
     }
 
     /// Extracts the next ingress, priority, or normal message (round-robin).
@@ -439,10 +437,30 @@ impl CanisterQueues {
             .push_request(msg)
             .expect("cannot fail due to checks above");
 
+        self.input_queues_stats.reserved_slots += 1;
         self.memory_usage_stats += mu_stats_delta;
         debug_assert!(self.stats_ok());
 
         Ok(())
+    }
+
+    /// Returns the number of output requests that can be pushed to each
+    /// canister before either the respective input or output queue is full.
+    pub fn available_output_request_slots(&self) -> BTreeMap<CanisterId, usize> {
+        // When pushing a request we need to reserve a slot on the input
+        // queue for the eventual reply. So we are limited by the amount of
+        // space in both the output and input queues.
+        self.canister_queues
+            .iter()
+            .map(|(canister, (input_queue, output_queue))| {
+                (
+                    *canister,
+                    input_queue
+                        .available_slots()
+                        .min(output_queue.available_slots()),
+                )
+            })
+            .collect()
     }
 
     /// Pushes a `Response` type message into the relevant output queue. The
@@ -459,9 +477,10 @@ impl CanisterQueues {
         // that an output queue should exist for pushing responses because one would
         // have been created when the request (that triggered this response) was
         // inducted into the induction pool.
-        self.output_queues
+        self.canister_queues
             .get_mut(&msg.originator)
             .expect("pushing response into inexistent output queue")
+            .1
             .push_response(msg);
 
         self.memory_usage_stats += mu_stats_delta;
@@ -471,7 +490,7 @@ impl CanisterQueues {
     /// Returns a reference to the message at the head of the respective output
     /// queue, if any.
     pub(super) fn peek_output(&self, canister_id: &CanisterId) -> Option<Arc<RequestOrResponse>> {
-        Some(self.output_queues.get(canister_id)?.peek()?.1)
+        Some(self.canister_queues.get(canister_id)?.1.peek()?.1)
     }
 
     /// Tries to induct a message from the output queue to `own_canister_id`
@@ -479,9 +498,9 @@ impl CanisterQueues {
     /// was no message to induct or the input queue was full.
     pub(super) fn induct_message_to_self(&mut self, own_canister_id: CanisterId) -> Result<(), ()> {
         let (_, msg) = self
-            .output_queues
+            .canister_queues
             .get(&own_canister_id)
-            .and_then(OutputQueue::peek)
+            .and_then(|(_, output_queue)| output_queue.peek())
             .ok_or(())?;
 
         self.push_input(
@@ -492,9 +511,10 @@ impl CanisterQueues {
         .map_err(|_| ())?;
 
         let msg = self
-            .output_queues
+            .canister_queues
             .get_mut(&own_canister_id)
             .expect("Output queue existed above so should not fail.")
+            .1
             .pop()
             .expect("Message peeked above so pop should not fail.")
             .1;
@@ -518,10 +538,24 @@ impl CanisterQueues {
         self.input_queues_stats.message_count
     }
 
+    /// Returns the number of reservations across all input queues.
+    pub fn input_queues_reservation_count(&self) -> usize {
+        self.input_queues_stats.reserved_slots as usize
+    }
+
     /// Returns the total byte size of canister input queues (queues +
     /// messages).
     pub fn input_queues_size_bytes(&self) -> usize {
         self.input_queues_stats.size_bytes
+    }
+
+    pub fn input_queues_response_count(&self) -> usize {
+        self.input_queues_stats.response_count
+    }
+
+    /// Returns input queues stats.
+    pub fn input_queues_stats(&self) -> &InputQueuesStats {
+        &self.input_queues_stats
     }
 
     /// Returns the memory usage of this `CanisterQueues`.
@@ -567,16 +601,14 @@ impl CanisterQueues {
         canister_id: &CanisterId,
     ) -> (&mut InputQueue, &mut OutputQueue) {
         let mut queue_bytes = 0;
-        let input_queue = self.input_queues.entry(*canister_id).or_insert_with(|| {
-            let iq = InputQueue::new(DEFAULT_QUEUE_CAPACITY);
-            queue_bytes = iq.calculate_size_bytes();
-            iq
-        });
+        let (input_queue, output_queue) =
+            self.canister_queues.entry(*canister_id).or_insert_with(|| {
+                let input_queue = InputQueue::new(DEFAULT_QUEUE_CAPACITY);
+                let output_queue = OutputQueue::new(DEFAULT_QUEUE_CAPACITY);
+                queue_bytes = input_queue.calculate_size_bytes();
+                (input_queue, output_queue)
+            });
         self.input_queues_stats.size_bytes += queue_bytes;
-        let output_queue = self
-            .output_queues
-            .entry(*canister_id)
-            .or_insert_with(|| OutputQueue::new(DEFAULT_QUEUE_CAPACITY));
         (input_queue, output_queue)
     }
 
@@ -584,26 +616,32 @@ impl CanisterQueues {
     /// by writing `debug_assert!(self.stats_ok())`.
     fn stats_ok(&self) -> bool {
         debug_assert_eq!(
-            Self::calculate_input_queues_stats(&self.input_queues),
+            Self::calculate_input_queues_stats(&self.canister_queues),
             self.input_queues_stats
         );
         debug_assert_eq!(
-            Self::calculate_memory_usage_stats(&self.input_queues, &self.output_queues),
+            Self::calculate_memory_usage_stats(&self.canister_queues),
             self.memory_usage_stats
         );
         true
     }
 
-    /// Computes `input_queues` stats from scratch. Used when deserializing and
+    /// Computes input queues stats from scratch. Used when deserializing and
     /// in `debug_assert!()` checks.
     ///
     /// Time complexity: O(num_messages).
     fn calculate_input_queues_stats(
-        input_queues: &BTreeMap<CanisterId, InputQueue>,
+        canister_queues: &BTreeMap<CanisterId, (InputQueue, OutputQueue)>,
     ) -> InputQueuesStats {
         let mut stats = InputQueuesStats::default();
-        for q in input_queues.values() {
+        let response_count = |msg: &RequestOrResponse| match *msg {
+            RequestOrResponse::Request(_) => 0,
+            RequestOrResponse::Response(_) => 1,
+        };
+        for (q, _) in canister_queues.values() {
             stats.message_count += q.num_messages();
+            stats.response_count += q.calculate_stat_sum(response_count);
+            stats.reserved_slots += q.reserved_slots() as isize;
             stats.size_bytes += q.calculate_size_bytes();
         }
         stats
@@ -614,8 +652,7 @@ impl CanisterQueues {
     ///
     /// Time complexity: O(num_messages).
     fn calculate_memory_usage_stats(
-        input_queues: &BTreeMap<CanisterId, InputQueue>,
-        output_queues: &BTreeMap<CanisterId, OutputQueue>,
+        canister_queues: &BTreeMap<CanisterId, (InputQueue, OutputQueue)>,
     ) -> MemoryUsageStats {
         // Actual byte size for responses, 0 for requests.
         let response_size_bytes = |msg: &RequestOrResponse| match *msg {
@@ -632,15 +669,14 @@ impl CanisterQueues {
         };
 
         let mut stats = MemoryUsageStats::default();
-        for q in input_queues.values() {
-            stats.responses_size_bytes += q.calculate_stat_sum(response_size_bytes);
-            stats.reserved_slots += q.reserved_slots() as i64;
-            stats.oversized_requests_extra_bytes += q.calculate_stat_sum(request_overhead_bytes)
-        }
-        for q in output_queues.values() {
-            stats.responses_size_bytes += q.calculate_stat_sum(response_size_bytes);
-            stats.reserved_slots += q.reserved_slots() as i64;
-            stats.oversized_requests_extra_bytes += q.calculate_stat_sum(request_overhead_bytes)
+        for (iq, oq) in canister_queues.values() {
+            stats.responses_size_bytes += iq.calculate_stat_sum(response_size_bytes);
+            stats.reserved_slots += iq.reserved_slots() as i64;
+            stats.oversized_requests_extra_bytes += iq.calculate_stat_sum(request_overhead_bytes);
+
+            stats.responses_size_bytes += oq.calculate_stat_sum(response_size_bytes);
+            stats.reserved_slots += oq.reserved_slots() as i64;
+            stats.oversized_requests_extra_bytes += oq.calculate_stat_sum(request_overhead_bytes)
         }
         stats
     }
@@ -651,17 +687,17 @@ impl From<&CanisterQueues> for pb_queues::CanisterQueues {
         Self {
             ingress_queue: (&item.ingress_queue).into(),
             input_queues: item
-                .input_queues
+                .canister_queues
                 .iter()
-                .map(|(canid, input_queue)| pb_queues::QueueEntry {
+                .map(|(canid, (input_queue, _))| pb_queues::QueueEntry {
                     canister_id: Some(pb_types::CanisterId::from(*canid)),
                     queue: Some(input_queue.into()),
                 })
                 .collect(),
             output_queues: item
-                .output_queues
+                .canister_queues
                 .iter()
-                .map(|(canid, output_queue)| pb_queues::QueueEntry {
+                .map(|(canid, (_, output_queue))| pb_queues::QueueEntry {
                     canister_id: Some(pb_types::CanisterId::from(*canid)),
                     queue: Some(output_queue.into()),
                 })
@@ -697,37 +733,26 @@ impl TryFrom<pb_queues::CanisterQueues> for CanisterQueues {
                 item.output_queues.len()
             )));
         }
-        if let Some((ie, oe)) = item
+        let mut canister_queues = BTreeMap::new();
+        for (ie, oe) in item
             .input_queues
-            .iter()
-            .zip(item.output_queues.iter())
-            .find(|(ie, oe)| ie.canister_id != oe.canister_id)
+            .into_iter()
+            .zip(item.output_queues.into_iter())
         {
-            return Err(ProxyDecodeError::Other(format!(
-                "Mismatched input {:?} and output {:?} queue entries",
-                ie.canister_id, oe.canister_id
-            )));
-        }
+            if ie.canister_id != oe.canister_id {
+                return Err(ProxyDecodeError::Other(format!(
+                    "Mismatched input {:?} and output {:?} queue entries",
+                    ie.canister_id, oe.canister_id
+                )));
+            }
 
-        let mut input_queues = BTreeMap::<CanisterId, InputQueue>::new();
-        for entry in item.input_queues {
-            let can_id =
-                try_from_option_field(entry.canister_id, "CanisterQueues::input_queues::K")?;
-            let iq: InputQueue =
-                try_from_option_field(entry.queue, "CanisterQueues::input_queues::V")?;
-            input_queues.insert(can_id, iq);
+            let can_id = try_from_option_field(ie.canister_id, "CanisterQueues::input_queues::K")?;
+            let iq = try_from_option_field(ie.queue, "CanisterQueues::input_queues::V")?;
+            let oq = try_from_option_field(oe.queue, "CanisterQueues::output_queues::V")?;
+            canister_queues.insert(can_id, (iq, oq));
         }
-        let input_queues_stats = Self::calculate_input_queues_stats(&input_queues);
-
-        let mut output_queues = BTreeMap::<CanisterId, OutputQueue>::new();
-        for entry in item.output_queues {
-            let can_id =
-                try_from_option_field(entry.canister_id, "CanisterQueues::output_queues::K")?;
-
-            let oq = try_from_option_field(entry.queue, "CanisterQueues::output_queues::V")?;
-            output_queues.insert(can_id, oq);
-        }
-        let memory_usage_stats = Self::calculate_memory_usage_stats(&input_queues, &output_queues);
+        let input_queues_stats = Self::calculate_input_queues_stats(&canister_queues);
+        let memory_usage_stats = Self::calculate_memory_usage_stats(&canister_queues);
 
         let next_input_queue =
             match ProtoNextInputQueue::from_i32(item.next_input_queue).unwrap_or_default() {
@@ -756,8 +781,7 @@ impl TryFrom<pb_queues::CanisterQueues> for CanisterQueues {
 
         Ok(Self {
             ingress_queue: IngressQueue::try_from(item.ingress_queue)?,
-            input_queues,
-            output_queues,
+            canister_queues,
             input_queues_stats,
             memory_usage_stats,
             next_input_queue,
@@ -774,9 +798,16 @@ impl TryFrom<pb_queues::CanisterQueues> for CanisterQueues {
 /// a `QueueOp` that only applied to memory usage stats; and would result in
 /// adding lots of zeros in lots of places.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct InputQueuesStats {
+pub struct InputQueuesStats {
     /// Count of messages in input queues.
     message_count: usize,
+
+    /// Count of responses in input queues.
+    response_count: usize,
+
+    /// Count of reservations in input queue. Signed type because `stats_delta()`
+    /// sometimes returns `-1`.
+    reserved_slots: isize,
 
     /// Byte size of input queues (queues + messages).
     size_bytes: usize,
@@ -785,9 +816,20 @@ struct InputQueuesStats {
 impl InputQueuesStats {
     /// Calculates the change in input queue stats caused by pushing (+) or
     /// popping (-) the given message.
-    fn stats_delta(msg: &RequestOrResponse) -> InputQueuesStats {
+    fn stats_delta(op: QueueOp, msg: &RequestOrResponse) -> InputQueuesStats {
+        let response_count = match msg {
+            RequestOrResponse::Response(_) => 1,
+            RequestOrResponse::Request(_) => 0,
+        };
+        // Consume one reservation iff pushing a response.
+        let reserved_slots = match (op, msg) {
+            (QueueOp::Push, RequestOrResponse::Response(_)) => -1,
+            _ => 0,
+        };
         InputQueuesStats {
             message_count: 1,
+            response_count,
+            reserved_slots,
             size_bytes: msg.count_bytes(),
         }
     }
@@ -796,6 +838,8 @@ impl InputQueuesStats {
 impl AddAssign<InputQueuesStats> for InputQueuesStats {
     fn add_assign(&mut self, rhs: InputQueuesStats) {
         self.message_count += rhs.message_count;
+        self.response_count += rhs.response_count;
+        self.reserved_slots += rhs.reserved_slots;
         self.size_bytes += rhs.size_bytes;
     }
 }
@@ -803,6 +847,8 @@ impl AddAssign<InputQueuesStats> for InputQueuesStats {
 impl SubAssign<InputQueuesStats> for InputQueuesStats {
     fn sub_assign(&mut self, rhs: InputQueuesStats) {
         self.message_count -= rhs.message_count;
+        self.response_count -= rhs.response_count;
+        self.reserved_slots -= rhs.reserved_slots;
         self.size_bytes -= rhs.size_bytes;
     }
 }
@@ -963,7 +1009,7 @@ enum QueueOp {
 }
 
 pub mod testing {
-    use super::CanisterQueues;
+    use super::{CanisterQueues, MemoryUsageStats, QueueOp};
     use crate::{InputQueueType, StateError};
     use ic_interfaces::messages::CanisterInputMessage;
     use ic_types::{
@@ -1019,18 +1065,27 @@ pub mod testing {
             &mut self,
             dst_canister: &CanisterId,
         ) -> Option<(QueueIndex, RequestOrResponse)> {
-            match self.output_queues.get_mut(dst_canister) {
+            match self.canister_queues.get_mut(dst_canister) {
                 None => None,
-                Some(canister_out_queue) => canister_out_queue.pop(),
+                Some((_, canister_out_queue)) => {
+                    let ret = canister_out_queue.pop();
+                    if let Some((_, msg)) = &ret {
+                        self.memory_usage_stats -= MemoryUsageStats::stats_delta(QueueOp::Pop, msg);
+                    }
+                    ret
+                }
             }
         }
 
         fn output_queues_len(&self) -> usize {
-            self.output_queues.len()
+            self.canister_queues.len()
         }
 
         fn output_message_count(&self) -> usize {
-            self.output_queues.values().map(|q| q.num_messages()).sum()
+            self.canister_queues
+                .values()
+                .map(|(_, output_queue)| output_queue.num_messages())
+                .sum()
         }
 
         fn push_input(

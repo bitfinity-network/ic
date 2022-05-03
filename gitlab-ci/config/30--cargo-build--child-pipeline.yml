@@ -4,14 +4,15 @@ cargo-clippy-linux:
     BUILD_COMMAND: "$CI_PROJECT_DIR/gitlab-ci/src/rust_lint/lint.sh"
 
 cargo-clippy-darwin:
-  extends: .cargo-build-macos
+  extends:
+    - .cargo-build-macos
   variables:
     BUILD_COMMAND: "$CI_PROJECT_DIR/gitlab-ci/src/rust_lint/lint.sh"
 
 cargo-build-debug-linux:
   extends: .cargo-build-docker
   variables:
-    BUILD_COMMAND: "placebo -i Cargo.lock -i './**/Cargo.toml' -i './**/*.rs' -- cargo build"
+    BUILD_COMMAND: "cargo build"
 
 cargo-build-debug-darwin:
   extends: .cargo-build-macos
@@ -27,7 +28,7 @@ cargo-build-release-linux:
     paths:
       - artifacts/nix-release/*
   variables:
-    BUILD_COMMAND: "placebo -i Cargo.lock -i './**/Cargo.toml' -i './**/*.rs' -- cargo build --release"
+    BUILD_COMMAND: "cargo build --release"
 
 cargo-build-release-darwin:
   extends: .cargo-build-macos
@@ -36,7 +37,7 @@ cargo-build-release-darwin:
       - artifacts/nix-release/*
   variables:
     BUILD_COMMAND: "cargo build --release"
-    BUILD_COMMAND_POST: "${CI_PROJECT_DIR}/gitlab-ci/src/artifacts/collect_build_binaries.py artifacts/nix-release x86_64-darwin/"
+    BUILD_COMMAND_POST: "cd ${CI_PROJECT_DIR}/gitlab-ci/src && python3 -m artifacts.collect_build_binaries artifacts/nix-release"
 
 cargo-build-release-linux-native:
   extends:
@@ -44,45 +45,18 @@ cargo-build-release-linux-native:
     - .rules-parent-pipeline-autorun-on-trigger
   image:
     # Use the docker image without nix-shell
-    name: "registry.gitlab.com/dfinity-lab/core/docker/ic-build:2021-11-29-4ef9591-c6b3878cb1aae7cccf27043117da415e8d7e9fd6"
+    name: "registry.gitlab.com/dfinity-lab/core/docker/ic-build:2022-04-20-74ee01d22-e0665218c09d248905811b918e31770e240e2221"
   variables:
-    BUILD_COMMAND: ""
     ARTIFACT_EXT: ""
   artifacts:
     paths:
       - "artifacts/release${ARTIFACT_EXT}/*"
-  script:
-    - |
-      set -exuo pipefail
-
-      cd "$CI_PROJECT_DIR/rs" || exit 1
-
-      if [[ -z "${BUILD_COMMAND}" ]]; then
-        buildevents cmd "${PARENT_PIPELINE_ID}" "${CI_JOB_ID}" cargo-build -- \
-        placebo -i Cargo.lock -i "./**/Cargo.toml" -i "./**/*.rs" -- \
-        "$CI_PROJECT_DIR"/gitlab-ci/src/job_scripts/cargo-build-release-linux-native.sh
-      else
-        buildevents cmd "${PARENT_PIPELINE_ID}" "${CI_JOB_ID}" cargo-build -- bash -c "${BUILD_COMMAND}"
-      fi
-
-      ls -l "$CARGO_TARGET_DIR"/x86_64-unknown-linux-gnu/release
-
-      CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu buildevents cmd "${PARENT_PIPELINE_ID}" "${CI_JOB_ID}" collect-artifacts -- "${CI_PROJECT_DIR}"/gitlab-ci/src/artifacts/collect_build_binaries.py "artifacts/release${ARTIFACT_EXT}" ''
-
-      echo -e "\e[0Ksection_start:$(date +%s):sccache_stats[collapsed=true]\r\e[0KClick here to see the sccache stats"
-      "$RUSTC_WRAPPER" --show-stats
-      echo -e "\e[0Ksection_end:$(date +%s):sccache_stats\r\e[0K"
-
-cargo-build-release-linux-native-determinism:
-  extends:
-    - cargo-build-release-linux-native
-  variables:
-    ARTIFACT_EXT: "-determinism"
+  script: >
+    "${CI_PROJECT_DIR}/gitlab-ci/tools/job-driver.py" "${CI_JOB_NAME}"
 
 cargo-build-release-linux-native-malicious:
   extends: cargo-build-release-linux-native
   variables:
-    BUILD_COMMAND: "cd replica; cargo build --features malicious_code --bin replica --release --target x86_64-unknown-linux-gnu ; cd -"
     ARTIFACT_EXT: "-malicious"
 
 cargo-build-canisters:
@@ -93,30 +67,45 @@ cargo-build-canisters:
     ARTIFACT_EXT: ""
   image:
     # Use the docker image without nix-shell
-    name: "registry.gitlab.com/dfinity-lab/core/docker/ic-build:2021-11-29-4ef9591-c6b3878cb1aae7cccf27043117da415e8d7e9fd6"
+    name: "registry.gitlab.com/dfinity-lab/core/docker/ic-build:2022-04-20-74ee01d22-e0665218c09d248905811b918e31770e240e2221"
   artifacts:
     paths:
       - "artifacts/canisters${ARTIFACT_EXT}/*"
+  script: >
+    "${CI_PROJECT_DIR}/gitlab-ci/tools/job-driver.py" "${CI_JOB_NAME}"
+
+dfx-build-release-darwin:
+  extends: .cargo-build-macos
+  artifacts:
+    paths:
+      - artifacts/sdk-release/*
+  variables:
+    BUILD_COMMAND: "${CI_PROJECT_DIR}/gitlab-ci/tools/build-dfx-binaries"
+    BUILD_COMMAND_POST: "cd ${CI_PROJECT_DIR}/gitlab-ci/src && python3 -m artifacts.collect_build_binaries artifacts/sdk-release/x86_64-darwin"
+
+dfx-build-release-linux:
+  extends:
+    - .cargo-build-docker-protected
+    - .rules-parent-pipeline-autorun-on-trigger
+  artifacts:
+    paths:
+      - artifacts/sdk-release/*
+  image:
+    # Use the docker image without nix-shell
+    name: "registry.gitlab.com/dfinity-lab/core/docker/ic-build:2022-04-20-74ee01d22-e0665218c09d248905811b918e31770e240e2221"
+  variables:
+    BUILD_COMMAND: ""
+    CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
+    OPENSSL_INCLUDE_DIR: /usr/include/x86_64-linux-gnu
+    OPENSSL_LIB_DIR: /usr/lib/x86_64-linux-gnu
+    OPENSSL_STATIC: "1"
   script:
     - |
       set -eExuo pipefail
 
-      cd "$CI_PROJECT_DIR"
+      # the pkg-config crate ignores requests to link statically if a dylib is available
+      sudo rm /usr/lib/x86_64-linux-gnu/liblmdb.so*
 
-      gitlab-ci/tools/cargo-build-canisters "${CI_PROJECT_DIR}/artifacts/canisters${ARTIFACT_EXT}"
+      "${CI_PROJECT_DIR}/gitlab-ci/tools/build-dfx-binaries"
 
-      gitlab-ci/src/artifacts/openssl-sign.sh "artifacts/canisters${ARTIFACT_EXT}"
-
-      buildevents cmd "${ROOT_PIPELINE_ID}" "${CI_JOB_ID}" rclone -- \
-        gitlab-ci/src/artifacts/rclone_upload.py "artifacts/canisters${ARTIFACT_EXT}" canisters
-
-      echo -e "\e[0Ksection_start:$(date +%s):sccache_stats[collapsed=true]\r\e[0KClick here to see the sccache stats"
-      "$RUSTC_WRAPPER" --show-stats
-      echo -e "\e[0Ksection_end:$(date +%s):sccache_stats\r\e[0K"
-
-cargo-build-canisters-determinism:
-  extends:
-    - cargo-build-canisters
-  variables:
-    ARTIFACT_EXT: "-determinism"
-
+      cd "${CI_PROJECT_DIR}/gitlab-ci/src" && python3 -m artifacts.collect_build_binaries artifacts/sdk-release/x86_64-linux

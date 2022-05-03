@@ -53,8 +53,8 @@ When building your replica, nodemanger and other IC binaries, be sure *not* to u
 Instead do a docker based build as described here: https://github.com/dfinity/ic#building-the-code
 
   cd rs
-  ../gitlab-ci/tools/docker-run cargo build --bin ic-workload-generator --bin vsock_agent --bin state-tool --bin ic-consensus-pool-util --bin ic-crypto-csp --bin ic-regedit --release
-  ../gitlab-ci/tools/docker-run cargo build -p nodemanager -p ic-replica --release
+  ../gitlab-ci/tools/docker-run cargo build --bin ic-workload-generator --bin vsock_agent --bin state-tool --bin ic-consensus-pool-util --bin ic-crypto-csp --bin ic-regedit --bin ic-btc-adapter --bin ic-canister-http-adapter --release
+  ../gitlab-ci/tools/docker-run cargo build -p orchestrator -p ic-replica --release
   # To build the NNS canisters needed for installing the NNS
   cd ../ic-os/guestos
   ../../gitlab-ci/tools/docker-run gitlab-ci/tools/cargo-build-canisters
@@ -95,8 +95,8 @@ partition image that can be put there as upgrade:
 disk image build). Transfer this in whatever way to the target system
 and install it using the tool included, by running on the *target* *system*:
 
-  cat /tmp/upgrade-image.tar | /opt/ic/bin/install-upgrade.sh
-  reboot
+  /opt/ic/bin/manageboot.sh upgrade-install upgrade-image.tar
+  /opt/ic/bin/manageboot.sh upgrade-commit
 
 After that, the newly installed system will be booted. On next boot, it will
 revert to the original system unless you previously confirm that the new
@@ -212,7 +212,7 @@ This should return a replica version record. Note that the record does not speci
 Then, trigger the upgrade (currently, with a very recent ic-admin, which is not yet on master)
 
     export IP=192.168.178.139
-    ic-admin --nns-url http://[::1]:8080 propose-to-bless-replica-version-flexible 42 foo foo foo foo \
+    ic-admin --nns-url http://[::1]:8080 propose-to-bless-replica-version-flexible 42 \
       http://$IP:8000/upgrade-image.tar e592d1a0aa055da6e9436f95c2a7e7e96ed0417eebb55d6a5af0fa15a4cd0ce4
     ic-admin --nns-url=http://[::1]:8080 forward-test-neuron-vote ${PROPOSAL_ID} && ic-admin --nns-url=http://[::1]:8080 execute-eligible-proposals
     ic-admin --nns-url=http://[::1]:8080 get-replica-version 42

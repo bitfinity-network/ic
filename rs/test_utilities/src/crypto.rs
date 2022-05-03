@@ -9,17 +9,21 @@ use ic_crypto_internal_types::sign::threshold_sig::ni_dkg::ni_dkg_groth20_bls12_
 use ic_crypto_internal_types::sign::threshold_sig::ni_dkg::{
     ni_dkg_groth20_bls12_381, CspNiDkgDealing, CspNiDkgTranscript,
 };
+use ic_crypto_test_utils_canister_threshold_sigs::{
+    create_params_for_dealers, mock_transcript, mock_unmasked_transcript_type, set_of_nodes,
+};
 use ic_interfaces::crypto::{
     BasicSigVerifier, BasicSigVerifierByPublicKey, BasicSigner, CanisterSigVerifier, IDkgProtocol,
-    KeyManager, LoadTranscriptResult, NiDkgAlgorithm, ThresholdEcdsaSigVerifier,
-    ThresholdEcdsaSigner, ThresholdSigVerifier, ThresholdSigVerifierByPublicKey, ThresholdSigner,
+    KeyManager, LoadTranscriptResult, NiDkgAlgorithm, PublicKeyRegistrationStatus,
+    ThresholdEcdsaSigVerifier, ThresholdEcdsaSigner, ThresholdSigVerifier,
+    ThresholdSigVerifierByPublicKey, ThresholdSigner,
 };
 use ic_interfaces::crypto::{MultiSigVerifier, MultiSigner, Signable};
 use ic_interfaces::registry::RegistryClient;
 use ic_protobuf::crypto::v1::NodePublicKeys;
 use ic_registry_client::client::RegistryClientImpl;
-use ic_registry_client::fake::FakeRegistryClient;
-use ic_registry_common::proto_registry_data_provider::ProtoRegistryDataProvider;
+use ic_registry_client_fake::FakeRegistryClient;
+use ic_registry_proto_data_provider::ProtoRegistryDataProvider;
 use ic_types::crypto::canister_threshold_sig::error::*;
 use ic_types::crypto::canister_threshold_sig::idkg::*;
 use ic_types::crypto::canister_threshold_sig::*;
@@ -38,6 +42,7 @@ use ic_types::crypto::{
 };
 use ic_types::*;
 use ic_types::{NodeId, RegistryVersion};
+use ic_types_test_utils::ids::NODE_1;
 use rand::{rngs::StdRng, RngCore, SeedableRng};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
@@ -161,33 +166,170 @@ pub fn empty_ni_dkg_transcripts() -> std::collections::BTreeMap<NiDkgTag, NiDkgT
     empty_ni_dkg_transcripts_with_committee(vec![node_test_id(0)], 0)
 }
 
-pub fn dummy_idkg_transcript_id_for_tests(id: usize) -> IDkgTranscriptId {
+pub fn dummy_idkg_transcript_id_for_tests(id: u64) -> IDkgTranscriptId {
     let subnet = SubnetId::from(PrincipalId::new_subnet_test_id(314159));
-    IDkgTranscriptId::new(subnet, id)
+    let height = Height::new(42);
+    IDkgTranscriptId::new(subnet, id, height)
 }
 
 pub fn dummy_idkg_dealing_for_tests() -> IDkgDealing {
     IDkgDealing {
-        transcript_id: IDkgTranscriptId::new(SubnetId::from(PrincipalId::new_subnet_test_id(1)), 1),
+        transcript_id: IDkgTranscriptId::new(
+            SubnetId::from(PrincipalId::new_subnet_test_id(1)),
+            1,
+            Height::new(1),
+        ),
         dealer_id: NodeId::from(PrincipalId::new_node_test_id(0)),
         internal_dealing_raw: vec![],
     }
 }
 
+pub fn dummy_initial_idkg_dealing_for_tests() -> InitialIDkgDealings {
+    let previous_receivers = set_of_nodes(&[35, 36, 37, 38]);
+    let previous_transcript =
+        mock_transcript(Some(previous_receivers), mock_unmasked_transcript_type());
+    let dealers = set_of_nodes(&[35, 36, 38]);
+
+    // For a Resharing Unmasked transcript, the dealer set should be a subset of the previous receiver set.
+    assert!(dealers.is_subset(previous_transcript.receivers.get()));
+
+    let params = create_params_for_dealers(
+        &dealers,
+        IDkgTranscriptOperation::ReshareOfUnmasked(previous_transcript),
+    );
+    let dealings = mock_dealings(params.transcript_id(), &dealers);
+
+    InitialIDkgDealings::new(params, dealings)
+        .expect("Failed creating IDkgInitialDealings for testing")
+}
+
 pub fn dummy_idkg_complaint_for_tests() -> IDkgComplaint {
     IDkgComplaint {
-        transcript_id: IDkgTranscriptId::new(SubnetId::from(PrincipalId::new_subnet_test_id(1)), 1),
+        transcript_id: IDkgTranscriptId::new(
+            SubnetId::from(PrincipalId::new_subnet_test_id(1)),
+            1,
+            Height::new(1),
+        ),
         dealer_id: NodeId::from(PrincipalId::new_node_test_id(0)),
         internal_complaint_raw: vec![],
     }
 }
 
-pub fn dummy_idkg_opening_for_tests() -> IDkgOpening {
+pub fn dummy_idkg_opening_for_tests(complaint: &IDkgComplaint) -> IDkgOpening {
     IDkgOpening {
-        transcript_id: IDkgTranscriptId::new(SubnetId::from(PrincipalId::new_subnet_test_id(1)), 1),
-        dealer_id: NodeId::from(PrincipalId::new_node_test_id(0)),
+        transcript_id: complaint.transcript_id,
+        dealer_id: complaint.dealer_id,
         internal_opening_raw: vec![],
     }
+}
+
+pub fn dummy_sig_inputs_for_tests(caller: PrincipalId) -> ThresholdEcdsaSigInputs {
+    let (fake_key, fake_presig_quadruple) = {
+        let mut nodes = BTreeSet::new();
+        nodes.insert(node_test_id(1));
+
+        let original_kappa_id = dummy_idkg_transcript_id_for_tests(1);
+        let kappa_id = dummy_idkg_transcript_id_for_tests(2);
+        let lambda_id = dummy_idkg_transcript_id_for_tests(3);
+        let key_id = dummy_idkg_transcript_id_for_tests(4);
+
+        let fake_kappa = IDkgTranscript {
+            transcript_id: kappa_id,
+            receivers: IDkgReceivers::new(nodes.clone()).unwrap(),
+            registry_version: RegistryVersion::from(1),
+            verified_dealings: BTreeMap::new(),
+            transcript_type: IDkgTranscriptType::Unmasked(
+                IDkgUnmaskedTranscriptOrigin::ReshareMasked(original_kappa_id),
+            ),
+            algorithm_id: AlgorithmId::ThresholdEcdsaSecp256k1,
+            internal_transcript_raw: vec![],
+        };
+
+        let fake_lambda = IDkgTranscript {
+            transcript_id: lambda_id,
+            receivers: IDkgReceivers::new(nodes.clone()).unwrap(),
+            registry_version: RegistryVersion::from(1),
+            verified_dealings: BTreeMap::new(),
+            transcript_type: IDkgTranscriptType::Masked(IDkgMaskedTranscriptOrigin::Random),
+            algorithm_id: AlgorithmId::ThresholdEcdsaSecp256k1,
+            internal_transcript_raw: vec![],
+        };
+
+        let fake_kappa_times_lambda = IDkgTranscript {
+            transcript_id: dummy_idkg_transcript_id_for_tests(40),
+            receivers: IDkgReceivers::new(nodes.clone()).unwrap(),
+            registry_version: RegistryVersion::from(1),
+            verified_dealings: BTreeMap::new(),
+            transcript_type: IDkgTranscriptType::Masked(
+                IDkgMaskedTranscriptOrigin::UnmaskedTimesMasked(kappa_id, lambda_id),
+            ),
+            algorithm_id: AlgorithmId::ThresholdEcdsaSecp256k1,
+            internal_transcript_raw: vec![],
+        };
+
+        let fake_key = IDkgTranscript {
+            transcript_id: key_id,
+            receivers: IDkgReceivers::new(nodes.clone()).unwrap(),
+            registry_version: RegistryVersion::from(1),
+            verified_dealings: BTreeMap::new(),
+            transcript_type: IDkgTranscriptType::Unmasked(
+                IDkgUnmaskedTranscriptOrigin::ReshareMasked(dummy_idkg_transcript_id_for_tests(50)),
+            ),
+            algorithm_id: AlgorithmId::ThresholdEcdsaSecp256k1,
+            internal_transcript_raw: vec![],
+        };
+
+        let fake_key_times_lambda = IDkgTranscript {
+            transcript_id: dummy_idkg_transcript_id_for_tests(50),
+            receivers: IDkgReceivers::new(nodes).unwrap(),
+            registry_version: RegistryVersion::from(1),
+            verified_dealings: BTreeMap::new(),
+            transcript_type: IDkgTranscriptType::Masked(
+                IDkgMaskedTranscriptOrigin::UnmaskedTimesMasked(key_id, lambda_id),
+            ),
+            algorithm_id: AlgorithmId::ThresholdEcdsaSecp256k1,
+            internal_transcript_raw: vec![],
+        };
+
+        let presig_quadruple = PreSignatureQuadruple::new(
+            fake_kappa,
+            fake_lambda,
+            fake_kappa_times_lambda,
+            fake_key_times_lambda,
+        )
+        .unwrap();
+
+        (fake_key, presig_quadruple)
+    };
+
+    let derivation_path = ExtendedDerivationPath {
+        caller,
+        derivation_path: vec![],
+    };
+    ThresholdEcdsaSigInputs::new(
+        &derivation_path,
+        &[],
+        Randomness::from([0_u8; 32]),
+        fake_presig_quadruple,
+        fake_key,
+    )
+    .expect("failed to create signature inputs")
+}
+
+pub fn mock_dealings(
+    transcript_id: IDkgTranscriptId,
+    dealers: &BTreeSet<NodeId>,
+) -> BTreeMap<NodeId, IDkgDealing> {
+    let mut dealings = BTreeMap::new();
+    for node_id in dealers {
+        let dealing = IDkgDealing {
+            transcript_id,
+            dealer_id: *node_id,
+            internal_dealing_raw: format!("Dummy raw dealing for dealer {}", node_id).into_bytes(),
+        };
+        dealings.insert(*node_id, dealing);
+    }
+    dealings
 }
 
 #[derive(Default)]
@@ -385,8 +527,11 @@ impl NiDkgAlgorithm for CryptoReturningOk {
 }
 
 impl KeyManager for CryptoReturningOk {
-    fn check_keys_with_registry(&self, _registry_version: RegistryVersion) -> CryptoResult<()> {
-        Ok(())
+    fn check_keys_with_registry(
+        &self,
+        _registry_version: RegistryVersion,
+    ) -> CryptoResult<PublicKeyRegistrationStatus> {
+        Ok(PublicKeyRegistrationStatus::AllKeysRegistered)
     }
 
     fn node_public_keys(&self) -> NodePublicKeys {
@@ -397,14 +542,20 @@ impl KeyManager for CryptoReturningOk {
 impl IDkgProtocol for CryptoReturningOk {
     fn create_dealing(
         &self,
-        _params: &IDkgTranscriptParams,
+        params: &IDkgTranscriptParams,
     ) -> Result<IDkgDealing, IDkgCreateDealingError> {
-        Ok(dummy_idkg_dealing_for_tests())
+        let dealing = IDkgDealing {
+            transcript_id: params.transcript_id(),
+            dealer_id: NODE_1,
+            internal_dealing_raw: vec![],
+        };
+        Ok(dealing)
     }
 
     fn verify_dealing_public(
         &self,
         _params: &IDkgTranscriptParams,
+        _dealer_id: NodeId,
         _dealing: &IDkgDealing,
     ) -> Result<(), IDkgVerifyDealingPublicError> {
         Ok(())
@@ -413,6 +564,7 @@ impl IDkgProtocol for CryptoReturningOk {
     fn verify_dealing_private(
         &self,
         _params: &IDkgTranscriptParams,
+        _dealer_id: NodeId,
         _dealing: &IDkgDealing,
     ) -> Result<(), IDkgVerifyDealingPrivateError> {
         Ok(())
@@ -461,7 +613,7 @@ impl IDkgProtocol for CryptoReturningOk {
     fn verify_complaint(
         &self,
         _transcript: &IDkgTranscript,
-        _complainer: NodeId,
+        _complainer_id: NodeId,
         _complaint: &IDkgComplaint,
     ) -> Result<(), IDkgVerifyComplaintError> {
         Ok(())
@@ -470,9 +622,10 @@ impl IDkgProtocol for CryptoReturningOk {
     fn open_transcript(
         &self,
         _transcript: &IDkgTranscript,
-        _complaint: &IDkgComplaint,
+        _complainer_id: NodeId,
+        complaint: &IDkgComplaint,
     ) -> Result<IDkgOpening, IDkgOpenTranscriptError> {
-        Ok(dummy_idkg_opening_for_tests())
+        Ok(dummy_idkg_opening_for_tests(complaint))
     }
 
     fn verify_opening(
@@ -487,9 +640,9 @@ impl IDkgProtocol for CryptoReturningOk {
 
     fn load_transcript_with_openings(
         &self,
-        _transcript: IDkgTranscript,
-        _openings: BTreeMap<IDkgComplaint, BTreeMap<NodeId, IDkgOpening>>,
-    ) -> Result<(), IDkgLoadTranscriptWithOpeningsError> {
+        _transcript: &IDkgTranscript,
+        _openings: &BTreeMap<IDkgComplaint, BTreeMap<NodeId, IDkgOpening>>,
+    ) -> Result<(), IDkgLoadTranscriptError> {
         Ok(())
     }
 
@@ -520,7 +673,7 @@ impl ThresholdEcdsaSigVerifier for CryptoReturningOk {
     fn combine_sig_shares(
         &self,
         _inputs: &ThresholdEcdsaSigInputs,
-        _shares: &[ThresholdEcdsaSigShare],
+        _shares: &BTreeMap<NodeId, ThresholdEcdsaSigShare>,
     ) -> Result<ThresholdEcdsaCombinedSignature, ThresholdEcdsaCombineSigSharesError> {
         Ok(ThresholdEcdsaCombinedSignature { signature: vec![] })
     }
@@ -531,17 +684,6 @@ impl ThresholdEcdsaSigVerifier for CryptoReturningOk {
         _signature: &ThresholdEcdsaCombinedSignature,
     ) -> Result<(), ThresholdEcdsaVerifyCombinedSignatureError> {
         Ok(())
-    }
-
-    fn get_public_key(
-        &self,
-        _canister_id: PrincipalId,
-        _key_transcript: IDkgTranscript,
-    ) -> Result<EcdsaPublicKey, ThresholdEcdsaGetPublicKeyError> {
-        Ok(EcdsaPublicKey {
-            algorithm_id: AlgorithmId::ThresholdEcdsaSecp256k1,
-            public_key: vec![],
-        })
     }
 }
 

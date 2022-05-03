@@ -4,7 +4,48 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.0] - Unreleased
+
+## [1.5.1] - 2022-04-29
+### Fixed
+- Issue with FOLLOW and NEURON_INFO operations while using hotkeys.
+
+### Changed
+- Controller format (principal or public key) now explicit in operations used with a hotkey.
+
+## [1.5.0] - 2022-04-06
+### Added
+- Support for `NEURON_INFO` operation.
+- Support for `REMOVE_HOTKEY` operation.
+- Support for `FOLLOW` operation.
+
+## [1.4.0] - 2022-03-14
+### Added
+- Support for `MERGE_MATURITY` neuron management operation.
+- Optional parameter `percentage_to_spawn` to allow partial spawning of neuron maturity with the existing `SPAWN` operation.
+
+### Changed
+- --token-name parameter renamed to --token-symbol
+
+### Fixed
+- /network/options always returns the full list of supported operations.
+- Names of some neurons management operations changed to match the documentation:
+  * `START_DISSOLVE` -> `START_DISSOLVING`
+  * `STOP_DISSOLVE` -> `STOP_DISSOLVING`
+  * `ADD_HOT_KEY` -> `ADD_HOTKEY`
+- The output of /construction/submit endpoint now returns operation statuses in the metadata field as stated in the documentation.
+
+## [1.3.0] - 2021-12-28
+### Added
+- /account/balance endpoint can now return information about neurons.
+- Support for custom token names.
+  Use -t command line argument to specify token name other than ICP.
+- Support for `SPAWN` neuron management operation.
+
 ## [1.2.0] - 2021-09-28
+### Added
+- Support for `ADD_HOTKEY` neuron management operation.
+
 ### Changed
 - Neuron address derivation is now supported by /construction/derive endpoint.
   Custom /neuron/derive endpoint is removed.
@@ -38,7 +79,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - BREAKING CHANGE: the internal encoding of transactions changed to support multi-step transactions (e.g., fund staking).
   Any transactions constructed with earlier versions of rosetta node cannot be applied by this version.
-   
+
 
 ## [1.0.2] - 2020-12-10
 ### Added

@@ -1,17 +1,15 @@
 use super::test_fixtures::*;
-use crate::{encoding::types, CURRENT_CERTIFICATION_VERSION};
+use crate::{all_supported_versions, encoding::types};
+use ic_error_types::RejectCode;
 use ic_protobuf::proxy::ProxyDecodeError;
-use ic_types::{
-    messages::{Payload, RejectContext, RequestOrResponse},
-    user_error::RejectCode,
-};
+use ic_types::messages::{Payload, RejectContext, RequestOrResponse};
 use std::convert::{TryFrom, TryInto};
 
 #[test]
 fn roundtrip_conversion_stream_header() {
-    let header = stream_header();
+    for certification_version in all_supported_versions() {
+        let header = stream_header(certification_version);
 
-    for certification_version in 0..=CURRENT_CERTIFICATION_VERSION {
         assert_eq!(
             header,
             types::StreamHeader::from((&header, certification_version))
@@ -21,11 +19,29 @@ fn roundtrip_conversion_stream_header() {
     }
 }
 
+/// Decoding a slice with wildly invalid signals should return an error but not panic.
+#[test]
+fn convert_stream_header_with_invalid_signals() {
+    let header_with_invalid_signals = types::StreamHeader {
+        begin: 23,
+        end: 25,
+        signals_end: 256,
+        reject_signal_deltas: vec![300, 50, 6],
+    };
+    match ic_types::xnet::StreamHeader::try_from(header_with_invalid_signals) {
+        Ok(ctx) => panic!("Expected Err(_), got Ok({:?})", ctx),
+        Err(ProxyDecodeError::Other(message)) => {
+            assert_eq!("StreamHeader: reject signals are invalid, got `signals_end` 256, `reject_signal_deltas` [300, 50, 6]", message)
+        }
+        Err(err) => panic!("Expected Err(ProxyDecodeError::Other), got Err({:?})", err),
+    }
+}
+
 #[test]
 fn roundtrip_conversion_request() {
     let request = request();
 
-    for certification_version in 0..=CURRENT_CERTIFICATION_VERSION {
+    for certification_version in all_supported_versions() {
         assert_eq!(
             request,
             types::RequestOrResponse::from((&request, certification_version))
@@ -39,7 +55,7 @@ fn roundtrip_conversion_request() {
 fn roundtrip_conversion_response() {
     let response = response();
 
-    for certification_version in 0..=CURRENT_CERTIFICATION_VERSION {
+    for certification_version in all_supported_versions() {
         assert_eq!(
             response,
             types::RequestOrResponse::from((&response, certification_version))
@@ -53,7 +69,7 @@ fn roundtrip_conversion_response() {
 fn roundtrip_conversion_reject_response() {
     let response = reject_response();
 
-    for certification_version in 0..=CURRENT_CERTIFICATION_VERSION {
+    for certification_version in all_supported_versions() {
         assert_eq!(
             response,
             types::RequestOrResponse::from((&response, certification_version))
@@ -112,7 +128,7 @@ fn try_from_reject_context_code_zero() {
     match RejectContext::try_from(context) {
         Ok(ctx) => panic!("Expected Err(_), got Ok({:?})", ctx),
         Err(ProxyDecodeError::ValueOutOfRange { typ, err }) => {
-            assert_eq!(("RejectCode", "0"), (typ, err.as_str()))
+            assert_eq!(("RejectContext", "0"), (typ, err.as_str()))
         }
         Err(err) => panic!(
             "Expected Err(ProxyDecodeError::ValueOutOfRange), got Err({:?})",
@@ -132,7 +148,7 @@ fn try_from_reject_context_code_out_of_range() {
     match RejectContext::try_from(context) {
         Ok(ctx) => panic!("Expected Err(_), got Ok({:?})", ctx),
         Err(ProxyDecodeError::ValueOutOfRange { typ, err }) => {
-            assert_eq!(("RejectCode", "6"), (typ, err.as_str()))
+            assert_eq!(("RejectContext", "6"), (typ, err.as_str()))
         }
         Err(err) => panic!(
             "Expected Err(ProxyDecodeError::ValueOutOfRange), got Err({:?})",

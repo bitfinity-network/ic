@@ -4,11 +4,10 @@ use crate::message::{msg_stream_from_file, Message};
 use hex::encode;
 use ic_config::{subnet_config::SubnetConfigs, Config};
 use ic_cycles_account_manager::CyclesAccountManager;
-use ic_execution_environment::setup_execution;
-use ic_interfaces::{
-    execution_environment::IngressHistoryReader, messaging::MessageRouting,
-    state_manager::StateReader,
-};
+use ic_error_types::{ErrorCode, UserError};
+use ic_execution_environment::ExecutionServices;
+use ic_interfaces::{execution_environment::IngressHistoryReader, messaging::MessageRouting};
+use ic_interfaces_state_manager::StateReader;
 use ic_messaging::MessageRoutingImpl;
 use ic_metrics::MetricsRegistry;
 use ic_metrics_exporter::MetricsRuntimeImpl;
@@ -19,29 +18,27 @@ use ic_protobuf::registry::{
 use ic_protobuf::types::v1::PrincipalId as PrincipalIdIdProto;
 use ic_protobuf::types::v1::SubnetId as SubnetIdProto;
 use ic_registry_client::client::RegistryClientImpl;
-use ic_registry_common::proto_registry_data_provider::ProtoRegistryDataProvider;
 use ic_registry_keys::{
     make_provisional_whitelist_record_key, make_routing_table_record_key, ROOT_SUBNET_ID_KEY,
 };
+use ic_registry_proto_data_provider::ProtoRegistryDataProvider;
 use ic_registry_provisional_whitelist::ProvisionalWhitelist;
 use ic_registry_routing_table::{routing_table_insert_subnet, RoutingTable};
 use ic_registry_subnet_type::SubnetType;
 use ic_state_manager::StateManagerImpl;
-use ic_test_utilities::{
-    consensus::fake::FakeVerifier,
-    mock_time,
-    registry::{add_subnet_record, insert_initial_dkg_transcript, SubnetRecordBuilder},
+use ic_test_utilities::consensus::fake::FakeVerifier;
+use ic_test_utilities_registry::{
+    add_subnet_record, insert_initial_dkg_transcript, SubnetRecordBuilder,
 };
 use ic_types::{
-    batch::{Batch, BatchPayload, IngressPayload, SelfValidatingPayload, XNetPayload},
+    batch::{Batch, BatchPayload, IngressPayload},
     ingress::{IngressStatus, WasmResult},
     messages::{MessageId, SignedIngress},
     replica_config::ReplicaConfig,
-    user_error::UserError,
+    time::UNIX_EPOCH,
     CanisterId, NodeId, PrincipalId, Randomness, RegistryVersion, SubnetId,
 };
 use slog::{Drain, Logger};
-use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -117,7 +114,7 @@ fn get_registry(
             Some(root_subnet_id_proto),
         )
         .unwrap();
-    let mut routing_table = RoutingTable::new(BTreeMap::new());
+    let mut routing_table = RoutingTable::new();
     routing_table_insert_subnet(&mut routing_table, subnet_id).unwrap();
     let pb_routing_table = PbRoutingTable::from(routing_table);
     data_provider
@@ -185,7 +182,6 @@ pub fn run_drun(uo: DrunOptions) -> Result<(), String> {
 
     let cycles_account_manager = Arc::new(CyclesAccountManager::new(
         subnet_config.scheduler_config.max_instructions_per_message,
-        cfg.hypervisor.max_cycles_per_canister,
         subnet_type,
         subnet_id,
         subnet_config.cycles_account_manager_config,
@@ -198,10 +194,11 @@ pub fn run_drun(uo: DrunOptions) -> Result<(), String> {
         log.clone().into(),
         &metrics_registry,
         &cfg.state_manager,
+        None,
         ic_types::malicious_flags::MaliciousFlags::default(),
     ));
-    let (_, ingress_history_writer, ingress_hist_reader, query_handler, _, scheduler) =
-        setup_execution(
+    let (_, ingress_history_writer, ingress_hist_reader, query_handler, _, _, scheduler) =
+        ExecutionServices::setup_execution(
             log.clone().into(),
             &metrics_registry,
             replica_config.subnet_id,
@@ -210,7 +207,9 @@ pub fn run_drun(uo: DrunOptions) -> Result<(), String> {
             cfg.hypervisor.clone(),
             Arc::clone(&cycles_account_manager),
             Arc::clone(&state_manager) as Arc<_>,
-        );
+        )
+        .into_parts();
+
     let _metrics_runtime = MetricsRuntimeImpl::new_insecure(
         tokio::runtime::Handle::current(),
         cfg.metrics,
@@ -309,14 +308,12 @@ fn build_batch(message_routing: &dyn MessageRouting, msgs: Vec<SignedIngress>) -
         requires_full_state_hash: !msgs.is_empty(),
         payload: BatchPayload {
             ingress: IngressPayload::from(msgs),
-            xnet: XNetPayload {
-                stream_slices: Default::default(),
-            },
-            self_validating: SelfValidatingPayload::default(),
+            ..BatchPayload::default()
         },
         randomness: Randomness::from([0; 32]),
+        ecdsa_subnet_public_key: None,
         registry_version: RegistryVersion::from(1),
-        time: mock_time(),
+        time: UNIX_EPOCH,
         consensus_responses: vec![],
     }
 }
@@ -349,6 +346,12 @@ fn execute_ingress_message(
         match ingress_result {
             IngressStatus::Completed { result, .. } => return Ok(result),
             IngressStatus::Failed { error, .. } => return Err(error),
+            IngressStatus::Done { .. } => {
+                return Err(UserError::new(
+                    ErrorCode::SubnetOversubscribed,
+                    "The call has completed but the reply/reject data has been pruned.",
+                ))
+            }
             IngressStatus::Received { .. }
             | IngressStatus::Processing { .. }
             | IngressStatus::Unknown => (),

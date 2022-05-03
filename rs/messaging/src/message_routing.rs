@@ -4,20 +4,21 @@ use crate::{
 };
 use ic_config::execution_environment::Config as HypervisorConfig;
 use ic_cycles_account_manager::CyclesAccountManager;
-use ic_interfaces::state_manager::{CertificationScope, StateManagerError};
+use ic_ic00_types::{CanisterStatusType, EcdsaKeyId};
 use ic_interfaces::{
     certified_stream_store::CertifiedStreamStore,
     execution_environment::{IngressHistoryWriter, Scheduler},
     messaging::{MessageRouting, MessageRoutingError},
     registry::RegistryClient,
-    state_manager::StateManager,
 };
+use ic_interfaces_state_manager::{CertificationScope, StateManager, StateManagerError};
 use ic_logger::{debug, fatal, info, warn, ReplicaLogger};
 use ic_metrics::buckets::{add_bucket, decimal_buckets};
 use ic_metrics::{MetricsRegistry, Timer};
 use ic_protobuf::registry::subnet::v1::SubnetRecord;
-use ic_registry_client::helper::{
+use ic_registry_client_helpers::{
     crypto::CryptoRegistry,
+    ecdsa_keys::EcdsaKeysRegistry,
     node::NodeRegistry,
     provisional_whitelist::ProvisionalWhitelistRegistry,
     routing_table::RoutingTableRegistry,
@@ -26,16 +27,12 @@ use ic_registry_client::helper::{
 use ic_registry_provisional_whitelist::ProvisionalWhitelist;
 use ic_registry_subnet_features::SubnetFeatures;
 use ic_registry_subnet_type::SubnetType;
-use ic_replicated_state::{
-    CanisterState, NetworkTopology, NodeTopology, ReplicatedState, SubnetTopology,
-};
+use ic_replicated_state::{NetworkTopology, NodeTopology, ReplicatedState, SubnetTopology};
 use ic_types::{
     batch::Batch,
-    ingress::IngressStatus,
-    messages::MessageId,
     registry::RegistryClientError,
     xnet::{StreamHeader, StreamIndex},
-    CanisterId, Height, NodeId, NumBytes, RegistryVersion, SubnetId,
+    Height, NodeId, NumBytes, RegistryVersion, SubnetId,
 };
 use ic_utils::thread::JoinOnDrop;
 #[cfg(test)]
@@ -66,6 +63,7 @@ const STATUS_SUCCESS: &str = "success";
 
 const PHASE_LOAD_STATE: &str = "load_state";
 const PHASE_COMMIT: &str = "commit";
+const PHASE_REMOVE_CANISTERS: &str = "remove_canisters_not_in_rt";
 
 const METRIC_PROCESS_BATCH_DURATION: &str = "mr_process_batch_duration_seconds";
 const METRIC_PROCESS_BATCH_PHASE_DURATION: &str = "mr_process_batch_phase_duration_seconds";
@@ -366,6 +364,62 @@ impl BatchProcessorImpl {
         provisional_whitelist.unwrap_or_else(|| ProvisionalWhitelist::Set(BTreeSet::new()))
     }
 
+    /// Removes stopped canisters that are missing from the routing table.
+    fn remove_canisters_not_in_routing_table(&self, state: &mut ReplicatedState) {
+        let _timer = self
+            .metrics
+            .process_batch_phase_duration
+            .with_label_values(&[PHASE_REMOVE_CANISTERS])
+            .start_timer();
+
+        let own_subnet_id = state.metadata.own_subnet_id;
+
+        let ids_to_remove =
+            ic_replicated_state::routing::find_canisters_not_in_routing_table(state, own_subnet_id);
+
+        if ids_to_remove.is_empty() {
+            return;
+        }
+
+        for canister_id in ids_to_remove.iter() {
+            use ic_state_layout::{CheckpointLayout, RwPolicy};
+
+            if let Some(canister_state) = state.canister_state(canister_id) {
+                if canister_state.status() != CanisterStatusType::Stopped {
+                    warn!(
+                        self.log,
+                        "Skipped removing canister {} in state {} that is not in the routing table",
+                        canister_id,
+                        canister_state.status()
+                    );
+                    continue;
+                }
+            }
+
+            warn!(
+                self.log,
+                "Removing canister {} that is not in the routing table", canister_id
+            );
+
+            let state_layout = CheckpointLayout::<RwPolicy>::new(
+                state.path().to_path_buf(),
+                ic_types::Height::from(0),
+            )
+            .and_then(|layout| layout.canister(canister_id))
+            .expect("failed to obtain canister layout");
+
+            state_layout.mark_deleted().unwrap_or_else(|e| {
+                fatal!(
+                    self.log,
+                    "Failed to mark canister {} as deleted: {}",
+                    canister_id,
+                    e
+                )
+            });
+            state.canister_states.remove(canister_id);
+        }
+    }
+
     // Populates a `NetworkTopology` from the registry at a specific version.
     //
     // # Warning
@@ -398,7 +452,7 @@ impl BatchProcessorImpl {
         let subnet_ids = subnet_ids_record.unwrap_or_default();
 
         // Populate subnet topologies.
-        let mut subnets: BTreeMap<SubnetId, SubnetTopology> = BTreeMap::new();
+        let mut subnets = BTreeMap::new();
 
         for subnet_id in &subnet_ids {
             let mut nodes: BTreeMap<NodeId, NodeTopology> = BTreeMap::new();
@@ -463,24 +517,39 @@ impl BatchProcessorImpl {
             let public_key =
                 get_subnet_public_key(Arc::clone(&self.registry), *subnet_id, registry_version)?;
             let subnet_type = self.get_subnet_type(*subnet_id, registry_version);
+            let subnet_features = self.get_subnet_features(*subnet_id, registry_version);
+            let ecdsa_keys_held = self.get_ecdsa_keys_held(*subnet_id, registry_version);
             subnets.insert(
                 *subnet_id,
                 SubnetTopology {
                     public_key,
                     nodes,
                     subnet_type,
+                    subnet_features,
+                    ecdsa_keys_held,
                 },
             );
         }
 
         let routing_table_record = self.registry.get_routing_table(registry_version)?;
         let routing_table = routing_table_record.unwrap_or_default();
+        let canister_migrations = self
+            .registry
+            .get_canister_migrations(registry_version)?
+            .unwrap_or_default();
         let nns_subnet_id = self.get_nns_subnet_id(registry_version);
+
+        let ecdsa_keys = self
+            .registry
+            .get_ecdsa_keys(registry_version)?
+            .unwrap_or_default();
 
         Ok(NetworkTopology {
             subnets,
             routing_table: Arc::new(routing_table),
             nns_subnet_id,
+            canister_migrations: Arc::new(canister_migrations),
+            ecdsa_keys,
         })
     }
 
@@ -541,6 +610,26 @@ impl BatchProcessorImpl {
         record.features.unwrap_or_default().into()
     }
 
+    fn get_ecdsa_keys_held(
+        &self,
+        subnet_id: SubnetId,
+        registry_version: RegistryVersion,
+    ) -> BTreeSet<EcdsaKeyId> {
+        let record = self.get_subnet_record(subnet_id, registry_version);
+        record
+            .ecdsa_config
+            .map(|ecdsa_config| {
+                ecdsa_config
+                    .key_ids
+                    .into_iter()
+                    .map(|k| {
+                        EcdsaKeyId::try_from(k).expect("Could not read EcdsaKeyId from protobuf")
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn get_max_number_of_canisters(
         &self,
         subnet_id: SubnetId,
@@ -556,14 +645,14 @@ fn get_subnet_public_key(
     subnet_id: SubnetId,
     registry_version: RegistryVersion,
 ) -> Result<Vec<u8>, RegistryClientError> {
-    use ic_crypto::threshold_sig_public_key_to_der;
+    use ic_crypto_utils_threshold_sig_der::public_key_to_der;
     Ok(registry
         .get_initial_dkg_transcripts(subnet_id, registry_version)?
         .value
         .map(|transcripts| {
             let transcript = transcripts.high_threshold;
             let pk = transcript.public_key();
-            threshold_sig_public_key_to_der(pk).unwrap_or_else(|err| {
+            public_key_to_der(&pk.into_bytes()).unwrap_or_else(|err| {
                 panic!("Invalid public key for subnet {}: {:?}", subnet_id, err)
             })
         })
@@ -575,7 +664,7 @@ impl BatchProcessor for BatchProcessorImpl {
         let timer = Timer::start();
 
         // Fetch the mutable tip from StateManager
-        let state = match self
+        let mut state = match self
             .state_manager
             .take_tip_at(batch.batch_number.decrement())
         {
@@ -615,6 +704,8 @@ impl BatchProcessor for BatchProcessorImpl {
             self.get_subnet_features(state.metadata.own_subnet_id, batch.registry_version);
         let max_number_of_canisters =
             self.get_max_number_of_canisters(state.metadata.own_subnet_id, batch.registry_version);
+
+        self.remove_canisters_not_in_routing_table(&mut state);
 
         let batch_requires_full_state_hash = batch.requires_full_state_hash;
         let mut state_after_round = self.state_machine.execute_round(
@@ -669,26 +760,6 @@ impl FakeBatchProcessorImpl {
     }
 }
 
-fn update_state(
-    ingress_history_writer: &dyn IngressHistoryWriter<State = ReplicatedState>,
-    not_run_canisters: BTreeMap<CanisterId, CanisterState>,
-    state: &mut ReplicatedState,
-    all_canister_states: Vec<CanisterState>,
-    all_ingress_execution_results: Vec<(MessageId, IngressStatus)>,
-) {
-    state.put_canister_states(
-        all_canister_states
-            .into_iter()
-            .map(|canister| (canister.canister_id(), canister))
-            .chain(not_run_canisters.into_iter())
-            .collect(),
-    );
-
-    for (msg_id, status) in all_ingress_execution_results {
-        ingress_history_writer.set_status(state, msg_id, status);
-    }
-}
-
 impl BatchProcessor for FakeBatchProcessorImpl {
     fn process_batch(&self, batch: Batch) {
         // Fetch the mutable tip from StateManager
@@ -722,36 +793,30 @@ impl BatchProcessor for FakeBatchProcessorImpl {
         metadata.batch_time = time;
         state.set_system_metadata(metadata);
 
-        // Get only ingress and ignore xnet messages
-        let (signed_ingress_msgs, _certified_stream_slices) =
+        // Get only ingress and ignore xnet and self-validating messages
+        let (signed_ingress_msgs, _certified_stream_slices, _get_successors_response) =
             batch.payload.into_messages().unwrap();
 
         // Treat all ingress messages as already executed.
-        let canisters = state.take_canister_states();
-        let all_canister_states = Vec::new();
-        let all_ingress_execution_results = signed_ingress_msgs
-            .into_iter()
-            .map(|ingress| {
-                // It is safe to assume valid expiry time here
-                (
-                    ingress.id(),
-                    ic_types::ingress::IngressStatus::Completed {
-                        receiver: ingress.canister_id().get(),
-                        user_id: ingress.sender(),
-                        // The byte content mimicks a good reply for the counter example
-                        result: ic_types::ingress::WasmResult::Reply(vec![68, 73, 68, 76, 0, 0]),
-                        time,
-                    },
-                )
-            })
-            .collect::<Vec<_>>();
-        update_state(
-            self.ingress_history_writer.as_ref(),
-            canisters,
-            &mut state,
-            all_canister_states,
-            all_ingress_execution_results,
-        );
+        let all_ingress_execution_results = signed_ingress_msgs.into_iter().map(|ingress| {
+            // It is safe to assume valid expiry time here
+            (
+                ingress.id(),
+                ic_types::ingress::IngressStatus::Completed {
+                    receiver: ingress.canister_id().get(),
+                    user_id: ingress.sender(),
+                    // The byte content mimicks a good reply for the counter example
+                    result: ic_types::ingress::WasmResult::Reply(vec![68, 73, 68, 76, 0, 0]),
+                    time,
+                },
+            )
+        });
+
+        for (msg_id, status) in all_ingress_execution_results {
+            self.ingress_history_writer
+                .set_status(&mut state, msg_id, status);
+        }
+
         state.prune_ingress_history();
 
         // Postprocess the state and consolidate the Streams.

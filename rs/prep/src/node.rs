@@ -9,25 +9,28 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::util::{write_proto_to_file_raw, write_registry_entry};
-use ic_crypto::utils::{
-    generate_idkg_dealing_encryption_keys, get_node_keys_or_generate_if_missing,
-};
-use ic_protobuf::registry::{
-    crypto::v1::{PublicKey, X509PublicKeyCert},
-    node::v1::{
-        connection_endpoint::Protocol, ConnectionEndpoint as pbConnectionEndpoint,
-        FlowEndpoint as pbFlowEndpoint, NodeRecord as pbNodeRecord,
+use ic_crypto::utils::get_node_keys_or_generate_if_missing;
+use ic_protobuf::{
+    crypto::v1::NodePublicKeys,
+    registry::{
+        crypto::v1::{PublicKey, X509PublicKeyCert},
+        node::v1::{
+            connection_endpoint::Protocol, ConnectionEndpoint as pbConnectionEndpoint,
+            FlowEndpoint as pbFlowEndpoint, NodeRecord as pbNodeRecord,
+        },
     },
 };
-use ic_registry_common::proto_registry_data_provider::ProtoRegistryDataProvider;
 use ic_registry_keys::{make_crypto_node_key, make_crypto_tls_cert_key, make_node_record_key};
+use ic_registry_proto_data_provider::ProtoRegistryDataProvider;
 use ic_types::{
     crypto::KeyPurpose,
     registry::connection_endpoint::{ConnectionEndpoint, ConnectionEndpointTryFromError},
     NodeId, PrincipalId, RegistryVersion,
 };
+use std::os::unix::fs::PermissionsExt;
 
 const CRYPTO_DIR: &str = "crypto";
+pub type SubnetIndex = u64;
 pub type NodeIndex = u64;
 
 #[derive(Clone, Debug)]
@@ -52,7 +55,8 @@ pub struct InitializedNode {
     pub dkg_dealing_encryption_pubkey: PublicKey,
 
     /// The IDKG MEGa encryption public key for this node.
-    pub idkg_mega_encryption_pubkey: PublicKey,
+    /// TODO(NNS1-1197): Remove option when nodes are provisioned for threshold ECDSA subnets
+    pub idkg_mega_encryption_pubkey: Option<PublicKey>,
 }
 
 impl InitializedNode {
@@ -108,14 +112,17 @@ impl InitializedNode {
             self.dkg_dealing_encryption_pubkey.clone(),
         );
 
+        // TODO(NNS1-1197): Refactor this when nodes are provisioned for threshold ECDSA subnets
         // add IDKG MEGa encryption public key for this node
-        write_registry_entry(
-            data_provider,
-            self.node_path.as_path(),
-            make_crypto_node_key(*node_id, KeyPurpose::IDkgMEGaEncryption).as_ref(),
-            version,
-            self.idkg_mega_encryption_pubkey.clone(),
-        );
+        if let Some(idkg_mega_encryption_pubkey) = self.idkg_mega_encryption_pubkey.as_ref() {
+            write_registry_entry(
+                data_provider,
+                self.node_path.as_path(),
+                make_crypto_node_key(*node_id, KeyPurpose::IDkgMEGaEncryption).as_ref(),
+                version,
+                idkg_mega_encryption_pubkey.clone(),
+            );
+        }
 
         // add TLS certificate for this node
         write_registry_entry(
@@ -154,12 +161,15 @@ impl InitializedNode {
             self.node_path.as_path(),
         );
 
+        // TODO(NNS1-1197): Refactor this when nodes are provisioned for threshold ECDSA subnets
         // add IDKG MEGa encryption public key for this node
-        write_proto_to_file_raw(
-            "idkg_mega_encryption_key",
-            self.idkg_mega_encryption_pubkey.clone(),
-            self.node_path.as_path(),
-        );
+        if let Some(idkg_mega_encryption_pubkey) = self.idkg_mega_encryption_pubkey.as_ref() {
+            write_proto_to_file_raw(
+                "idkg_mega_encryption_key",
+                idkg_mega_encryption_pubkey.clone(),
+                self.node_path.as_path(),
+            )
+        }
 
         // add TLS certificate for this node
         write_proto_to_file_raw(
@@ -206,6 +216,21 @@ pub struct NodeConfiguration {
 
     /// The principal id of the node operator that operates this node.
     pub node_operator_principal_id: Option<PrincipalId>,
+
+    /// Disables the setup of iDKG keys for the nodes of the network
+    pub no_idkg_key: bool,
+
+    /// If set, the specified secret key store will be used. Ohterwise, a new
+    /// one will be created when initializing the internet computer.
+    ///
+    /// Creating the secret key store ahead of time allows for the node id to be
+    /// set before all other configuration values must be specified (such as ip
+    /// address, etc.)
+    ///
+    /// **Note**: The path of the secret key store will be *copied* to a new
+    /// directory chosen by ic-prep.
+    #[serde(skip_serializing, skip_deserializing)]
+    pub secret_key_store: Option<NodeSecretKeyStore>,
 }
 
 #[derive(Error, Debug)]
@@ -326,6 +351,11 @@ pub enum InitializeNodeError {
     CreateNodePathFailed { path: String, source: io::Error },
     #[error("saving node id failed: {source}")]
     SavingNodeId { source: io::Error },
+    #[error("copying secret key store failed: {source}")]
+    CouldNotCopySks {
+        #[from]
+        source: fs_extra::error::Error,
+    },
     #[error("could not transform into pb struct: {source}")]
     CreatePbMessage {
         #[from]
@@ -340,20 +370,28 @@ impl NodeConfiguration {
         self,
         node_path: P,
     ) -> Result<InitializedNode, InitializeNodeError> {
-        let crypto_path = InitializedNode::build_crypto_path(node_path.as_ref());
-
         std::fs::create_dir_all(node_path.as_ref()).map_err(|source| {
             InitializeNodeError::CreateNodePathFailed {
                 path: node_path.as_ref().to_string_lossy().to_string(),
                 source,
             }
         })?;
+        let crypto_path = InitializedNode::build_crypto_path(node_path.as_ref());
+        let sks = if let Some(sks) = self.secret_key_store.clone() {
+            let mut options = fs_extra::dir::CopyOptions::new();
+            options.copy_inside = true;
+            fs_extra::dir::copy(sks.path.as_path(), crypto_path.as_path(), &options)
+                .map_err(|e| InitializeNodeError::CouldNotCopySks { source: e })?;
+            NodeSecretKeyStore::set_permissions(&crypto_path)?;
+            sks
+        } else {
+            NodeSecretKeyStore::new(crypto_path)?
+        };
 
-        let (node_pks, node_id) = get_node_keys_or_generate_if_missing(&crypto_path);
-        // CRP-1273: Remove the following call when the encryption keys are generated
-        // together with the rest of the node keys.
-        let idkg_mega_encryption_pubkey = generate_idkg_dealing_encryption_keys(&crypto_path);
-
+        use prost::Message;
+        let node_id = sks.node_id;
+        let node_pks = NodePublicKeys::decode(sks.node_pks.as_slice()).unwrap();
+        let no_idkg_key = self.no_idkg_key;
         Ok(InitializedNode {
             node_id,
             pk_committee_signing: node_pks.committee_signing_pk.unwrap(),
@@ -362,8 +400,60 @@ impl NodeConfiguration {
             node_path: PathBuf::from(node_path.as_ref()),
             node_config: self,
             dkg_dealing_encryption_pubkey: node_pks.dkg_dealing_encryption_pk.unwrap(),
-            idkg_mega_encryption_pubkey,
+            // TODO(NNS1-1197): Re-enable when nodes are provisioned for threshold ECDSA subnets
+            idkg_mega_encryption_pubkey: if no_idkg_key {
+                None
+            } else {
+                node_pks.idkg_dealing_encryption_pk
+            },
         })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NodeSecretKeyStore {
+    pub node_id: NodeId,
+    /// Serialized protobuf of node public keys. The serialized version of the
+    /// buffer is trivially (Partial)Eq + (Partial)Ord
+    pub node_pks: Vec<u8>,
+    pub path: PathBuf,
+}
+
+impl NodeSecretKeyStore {
+    /// Create a secret key store for a node at the path `path`.
+    ///
+    /// If `path` or any of its parent directories do not exist, they will be
+    /// created.
+    pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, InitializeNodeError> {
+        let path = PathBuf::from(path.as_ref());
+        std::fs::create_dir_all(&path).map_err(|source| {
+            InitializeNodeError::CreateNodePathFailed {
+                path: path.to_string_lossy().to_string(),
+                source,
+            }
+        })?;
+        Self::set_permissions(&path)?;
+        let (node_pks, node_id) = get_node_keys_or_generate_if_missing(&path);
+
+        use prost::Message;
+        let node_pks = node_pks.encode_to_vec();
+
+        Ok(Self {
+            node_id,
+            node_pks,
+            path,
+        })
+    }
+
+    /// Sets the permission bits of the given path as expected by the crypto component.
+    fn set_permissions<P: AsRef<Path>>(path: P) -> Result<(), InitializeNodeError> {
+        // Set permissions required for `get_node_keys_or_generate_if_missing`
+        std::fs::set_permissions(path.as_ref(), std::fs::Permissions::from_mode(0o750)).map_err(
+            |source| InitializeNodeError::CreateNodePathFailed {
+                path: path.as_ref().to_string_lossy().to_string(),
+                source,
+            },
+        )
     }
 }
 
@@ -383,6 +473,8 @@ mod node_configuration {
             p2p_num_flows: 2,
             p2p_start_flow_tag: 12,
             node_operator_principal_id: None,
+            no_idkg_key: false,
+            secret_key_store: None,
         };
 
         let got = pbNodeRecord::try_from(node_configuration).unwrap();

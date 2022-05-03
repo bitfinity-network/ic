@@ -8,9 +8,7 @@ use crate::{
     RequestType,
 };
 use backoff::backoff::Backoff;
-use ic_canister_client::{
-    get_backoff_policy, update_path, Agent, HttpClientConfig, Sender as AgentSender,
-};
+use ic_canister_client::{update_path, Agent, HttpClientConfig, Sender as AgentSender};
 use ic_types::{
     messages::{Blob, MessageId, SignedRequestBytes},
     time::current_time_and_expiry_time,
@@ -35,7 +33,7 @@ use tokio::{
         mpsc::{channel, Receiver, Sender},
         OwnedSemaphorePermit, Semaphore,
     },
-    time::sleep,
+    time::{sleep, sleep_until},
 };
 use url::Url;
 
@@ -58,6 +56,8 @@ const START_OFFSET: Duration = Duration::from_millis(500);
 // permits are scaled down based on the response from the replicas.
 const INITIAL_PERMITS_MULTIPLIER: usize = 10;
 
+const QUERY_TIMEOUT: Duration = Duration::from_secs(60 * 5);
+
 #[derive(PartialEq, Eq, Hash)]
 enum CallFailure {
     None,
@@ -77,7 +77,6 @@ pub struct CallResult {
 #[derive(Clone)]
 pub struct Engine {
     agents: Vec<Agent>, // List of agents to be used in round-robin fashion when sending requests.
-    sender: AgentSender,
 }
 
 impl Engine {
@@ -86,27 +85,22 @@ impl Engine {
         agent_sender: AgentSender,
         sender_field: Blob,
         urls: &[String],
-        connections_per_host: u32,
         http_client_config: HttpClientConfig,
     ) -> Engine {
-        let mut agents = Vec::with_capacity(urls.len() * connections_per_host as usize);
-        for _ in 0..connections_per_host {
-            let current_batch = urls.iter().map(|url| {
-                let mut agent = Agent::new_with_http_client_config(
-                    Url::parse(url.as_str()).unwrap(),
-                    agent_sender.clone(),
-                    http_client_config,
-                );
-                agent.sender_field = sender_field.clone();
-                agent
-            });
+        let mut agents = Vec::with_capacity(urls.len());
+        let current_batch = urls.iter().map(|url| {
+            let mut agent = Agent::new_with_http_client_config(
+                Url::parse(url.as_str()).unwrap(),
+                agent_sender.clone(),
+                http_client_config,
+            )
+            .with_query_timeout(QUERY_TIMEOUT);
+            agent.sender_field = sender_field.clone();
+            agent
+        });
 
-            agents.extend(current_batch);
-        }
-        Engine {
-            agents,
-            sender: agent_sender,
-        }
+        agents.extend(current_batch);
+        Engine { agents }
     }
 
     // Goes over all agents and makes sure they are connected and the corresponding
@@ -166,19 +160,15 @@ impl Engine {
             time_origin,
         ));
 
-        // Distribute the RPS within a second. If we just do
-        // .refill_interval(1).refill_amount(rps) we risk of having spikes of requests
-        // at every second.
-        let rate_limiter = RateLimiter::builder()
-            .initial(rps)
-            .interval(Duration::from_secs(1))
-            .refill(rps)
-            .build();
-        // Generate requests as allowed by the rate limiter
-        sleep(START_OFFSET).await;
+        // Time between each two consecutive requests
+        let inter_arrival_time = 1. / rps as f64;
         let mut tx_handles = vec![];
         for n in 0..requests {
-            rate_limiter.acquire_one().await;
+            // Calculate the time at which the request should be running from start time
+            // and inter arrival time.
+            let target_instant =
+                time_origin + START_OFFSET + Duration::from_secs_f64(inter_arrival_time * n as f64);
+            sleep_until(tokio::time::Instant::from_std(target_instant)).await;
             let tx = tx.clone();
             let plan = plan.clone();
             let agent = self.agents[n % self.agents.len()].clone();
@@ -334,12 +324,20 @@ impl Engine {
     ) -> Option<u32> {
         let time_query_start = Instant::now();
         let response = agent.execute_query(&plan.canister_id, &*method, arg).await;
+        let time_query_end = Instant::now();
         debug!("Sent query ({}). Response was: {:?}", n, response);
 
         match response {
             Ok(r) => {
                 QUERY_REPLY.with_label_values(&["replied"]).inc();
-                Engine::check_query(r, tx, time_query_start, plan).await
+
+                if let Ok(f) = env::var("RESULT_FILE") {
+                    let bytes: Vec<u8> = r.clone().unwrap_or_default();
+                    eprintln!("Writing results file: {}", &f);
+                    fs::write(f, bytes).unwrap();
+                }
+
+                Engine::check_query(r, tx, time_query_start, time_query_end).await
             }
             Err(e) => {
                 let err = format!("{:?}", e).to_string();
@@ -353,9 +351,9 @@ impl Engine {
                     fact: Fact::record(
                         ContentLength::new(0),
                         http_status,
-                        Instant::now().duration_since(time_query_start),
+                        time_query_start,
+                        time_query_end,
                         false,
-                        plan.request_type,
                     ),
                     counter: None,
                     call_failure: CallFailure::OnWait,
@@ -384,7 +382,6 @@ impl Engine {
     ) -> bool {
         let nonce = plan.nonce.clone();
         let deadline = Instant::now() + agent.ingress_timeout;
-        let mut backoff = get_backoff_policy();
         let (request, request_id) = agent
             .prepare_update_raw(
                 &plan.canister_id,
@@ -431,9 +428,9 @@ impl Engine {
                     fact: Fact::record(
                         ContentLength::new(0),
                         11,
-                        Instant::now().duration_since(time_start),
+                        time_start,
+                        Instant::now(),
                         false,
-                        plan.request_type,
                     ),
                     counter: None,
                     call_failure: CallFailure::OnSubmit,
@@ -470,9 +467,9 @@ impl Engine {
                         fact: Fact::record(
                             ContentLength::new(0),
                             update_status_code,
-                            Instant::now().duration_since(time_start),
+                            time_start,
+                            Instant::now(),
                             false,
-                            plan.request_type,
                         ),
                         counter: None,
                         call_failure: CallFailure::OnSubmit,
@@ -487,8 +484,23 @@ impl Engine {
 
                 let mut finished = false;
 
+                // https://docs.rs/backoff/latest/backoff/exponential/struct.ExponentialBackoff.html#structfield.initial_interval
+                let mut backoff = backoff::ExponentialBackoff {
+                    initial_interval: Duration::from_millis(50),
+                    current_interval: Duration::from_millis(50), // Should probably be the same as initial_interval
+                    // See fomula here:
+                    // https://docs.rs/backoff/latest/backoff/
+                    randomization_factor: 0.01,
+                    multiplier: 1.2,
+                    start_time: std::time::Instant::now(),
+                    // Stop increasing at this value
+                    max_interval: Duration::from_secs(10),
+                    max_elapsed_time: None,
+                    clock: backoff::SystemClock::default(),
+                };
+
                 // Check request status for the first time after 2s (~ time between blocks)
-                let mut next_poll_time = Instant::now() + Duration::from_secs(2);
+                let mut next_poll_time = Instant::now() + Duration::from_millis(500);
 
                 while !finished && next_poll_time < deadline {
                     tokio::time::sleep_until(tokio::time::Instant::from_std(next_poll_time)).await;
@@ -521,14 +533,13 @@ impl Engine {
                                         Instant::now().duration_since(time_start).as_millis(),
                                         Instant::now().duration_since(time_origin).as_millis()
                                     );
-
                                     tx.send(CallResult {
                                         fact: Fact::record(
                                             ContentLength::new(body.len() as u64),
                                             http_status,
-                                            Instant::now().duration_since(time_start),
+                                            time_start,
+                                            Instant::now(),
                                             true,
-                                            plan.request_type,
                                         ),
                                         counter: Some(counter),
                                         call_failure: CallFailure::None,
@@ -559,9 +570,9 @@ impl Engine {
                                         fact: Fact::record(
                                             ContentLength::new(body.len() as u64),
                                             33,
-                                            Instant::now().duration_since(time_start),
+                                            time_start,
+                                            Instant::now(),
                                             false,
-                                            plan.request_type,
                                         ),
                                         counter: None,
                                         call_failure: CallFailure::OnWait,
@@ -591,9 +602,9 @@ impl Engine {
                         fact: Fact::record(
                             ContentLength::new(0),
                             44,
-                            Instant::now().duration_since(time_start),
+                            time_start,
+                            Instant::now(),
                             false,
-                            plan.request_type,
                         ),
                         counter: None,
                         call_failure: CallFailure::OnWait,
@@ -613,15 +624,14 @@ impl Engine {
         resp: Option<Vec<u8>>,
         tx: Sender<CallResult>,
         time_query_start: Instant,
-        plan: &Plan,
+        time_query_end: Instant,
     ) -> Option<u32> {
+        let latency = time_query_end.duration_since(time_query_start);
         debug!("Response: {:?}", resp);
         let counter = resp
             .as_ref()
             .map(|r| Engine::interpret_counter_canister_response(r));
         debug!("🚀 Got counter value: {:?}", counter);
-
-        let latency = Instant::now().duration_since(time_query_start);
 
         LATENCY_HISTOGRAM
             .with_label_values(&["query", "replied"])
@@ -629,11 +639,11 @@ impl Engine {
 
         tx.send(CallResult {
             fact: Fact::record(
-                ContentLength::new(resp.unwrap_or_else(Vec::new).len() as u64),
+                ContentLength::new(resp.unwrap_or_default().len() as u64),
                 200_u16,
-                latency,
+                time_query_start,
+                time_query_end,
                 true,
-                plan.request_type,
             ),
             counter,
             call_failure: CallFailure::None,

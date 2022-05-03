@@ -31,8 +31,8 @@ use crate::consensus::{
     utils::{find_lowest_ranked_proposals, get_adjusted_notary_delay},
     ConsensusCrypto,
 };
-use ic_interfaces::state_manager::StateManager;
 use ic_interfaces::time_source::TimeSource;
+use ic_interfaces_state_manager::StateManager;
 use ic_logger::{error, trace, warn, ReplicaLogger};
 use ic_metrics::MetricsRegistry;
 use ic_replicated_state::ReplicatedState;
@@ -235,9 +235,9 @@ mod tests {
     use ic_metrics::MetricsRegistry;
     use ic_test_utilities::{
         consensus::fake::*,
-        registry::SubnetRecordBuilder,
         types::ids::{node_test_id, subnet_test_id},
     };
+    use ic_test_utilities_registry::SubnetRecordBuilder;
     use std::sync::Arc;
     use std::time::Duration;
 

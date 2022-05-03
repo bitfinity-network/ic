@@ -3,11 +3,13 @@ use dfn_candid::candid;
 use ic_base_types::{PrincipalId, SubnetId};
 use ic_canister_client::Sender;
 
+use ic_nervous_system_common_test_keys::{
+    TEST_NEURON_1_OWNER_KEYPAIR, TEST_NEURON_2_OWNER_KEYPAIR,
+};
 use ic_nns_common::{
     registry::encode_or_panic,
     types::{NeuronId, ProposalId},
 };
-use ic_nns_constants::ids::{TEST_NEURON_1_OWNER_KEYPAIR, TEST_NEURON_2_OWNER_KEYPAIR};
 use ic_nns_governance::pb::v1::{ManageNeuronResponse, NnsFunction, ProposalStatus, Vote};
 use ic_nns_test_utils::ids::TEST_NEURON_2_ID;
 use ic_nns_test_utils::{
@@ -21,9 +23,9 @@ use ic_registry_keys::make_subnet_record_key;
 use ic_registry_subnet_type::SubnetType;
 use ic_registry_transport::{insert, pb::v1::RegistryAtomicMutateRequest};
 use ic_types::p2p::{
-    build_default_gossip_config, MAX_ARTIFACT_STREAMS_PER_PEER, MAX_CHUNK_SIZE, MAX_CHUNK_WAIT_MS,
-    MAX_DUPLICITY, PFN_EVALUATION_PERIOD_MS, RECEIVE_CHECK_PEER_SET_SIZE, REGISTRY_POLL_PERIOD_MS,
-    RETRANSMISSION_REQUEST_MS,
+    build_default_gossip_config, ADVERT_BEST_EFFORT_PERCENTAGE, MAX_ARTIFACT_STREAMS_PER_PEER,
+    MAX_CHUNK_SIZE, MAX_CHUNK_WAIT_MS, MAX_DUPLICITY, PFN_EVALUATION_PERIOD_MS,
+    RECEIVE_CHECK_PEER_SET_SIZE, REGISTRY_POLL_PERIOD_MS, RETRANSMISSION_REQUEST_MS,
 };
 use registry_canister::mutations::do_update_subnet::UpdateSubnetPayload;
 
@@ -41,7 +43,6 @@ fn test_submit_and_accept_update_subnet_proposal() {
             );
             let initial_subnet_record = SubnetRecord {
                 membership: vec![],
-                ingress_bytes_per_block_soft_cap: 2 * 1024 * 1024,
                 max_ingress_bytes_per_message: 60 * 1024 * 1024,
                 max_ingress_messages_per_block: 1000,
                 max_block_payload_size: 4 * 1024 * 1024,
@@ -70,7 +71,7 @@ fn test_submit_and_accept_update_subnet_proposal() {
                 .with_test_neurons()
                 .with_initial_mutations(vec![RegistryAtomicMutateRequest {
                     mutations: vec![insert(
-                        key.as_bytes().to_vec(),
+                        key.as_bytes(),
                         encode_or_panic(&initial_subnet_record),
                     )],
                     preconditions: vec![],
@@ -85,8 +86,8 @@ fn test_submit_and_accept_update_subnet_proposal() {
 
             let proposal_payload = UpdateSubnetPayload {
                 subnet_id,
-                ingress_bytes_per_block_soft_cap: None,
                 max_ingress_bytes_per_message: Some(10 * 1024 * 1024),
+                max_ingress_messages_per_block: None,
                 max_block_payload_size: None,
                 unit_delay_millis: None,
                 initial_notary_delay_millis: None,
@@ -100,7 +101,7 @@ fn test_submit_and_accept_update_subnet_proposal() {
                 pfn_evaluation_period_ms: Some(PFN_EVALUATION_PERIOD_MS),
                 registry_poll_period_ms: Some(REGISTRY_POLL_PERIOD_MS),
                 retransmission_request_ms: Some(RETRANSMISSION_REQUEST_MS),
-                advert_best_effort_percentage: None,
+                advert_best_effort_percentage: Some(ADVERT_BEST_EFFORT_PERCENTAGE),
                 set_gossip_config_to_default: false,
                 start_as_nns: None,
                 subnet_type: None,
@@ -110,6 +111,7 @@ fn test_submit_and_accept_update_subnet_proposal() {
                 max_instructions_per_install_code: None,
                 features: None,
                 ecdsa_config: None,
+                ecdsa_key_signing_enable: None,
                 max_number_of_canisters: Some(200),
                 ssh_readonly_access: Some(vec!["pub_key_0".to_string()]),
                 ssh_backup_access: Some(vec!["pub_key_1".to_string()]),
@@ -162,7 +164,6 @@ fn test_submit_and_accept_update_subnet_proposal() {
                 subnet_record_after_update,
                 SubnetRecord {
                     membership: vec![],
-                    ingress_bytes_per_block_soft_cap: 2 * 1024 * 1024,
                     max_ingress_bytes_per_message: 10 * 1024 * 1024,
                     max_ingress_messages_per_block: 1000,
                     max_block_payload_size: 4 * 1024 * 1024,

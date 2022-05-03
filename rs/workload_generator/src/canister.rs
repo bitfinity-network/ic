@@ -1,13 +1,11 @@
 //! Module for managing the canisters in test.
 
 use ic_canister_client::{Agent, HttpClient, Sender as AgentSender};
-use ic_types::{
-    ic00::{
-        CanisterIdRecord, InstallCodeArgs, Payload, ProvisionalCreateCanisterWithCyclesArgs, IC_00,
-    },
-    messages::CanisterInstallMode,
-    CanisterId,
+use ic_ic00_types::{
+    CanisterIdRecord, CanisterInstallMode, InstallCodeArgs, Payload,
+    ProvisionalCreateCanisterWithCyclesArgs, IC_00,
 };
+use ic_types::CanisterId;
 use std::{fs::File, io::Read, path::Path, time::Duration};
 use url::Url;
 
@@ -73,8 +71,8 @@ pub(crate) async fn create_canister(
     let creation_result = agent
         .execute_update(
             &IC_00,
-            ic_types::ic00::Method::ProvisionalCreateCanisterWithCycles,
-            ProvisionalCreateCanisterWithCyclesArgs::new(Some(u64::MAX)).encode(),
+            ic_ic00_types::Method::ProvisionalCreateCanisterWithCycles,
+            ProvisionalCreateCanisterWithCyclesArgs::new(Some(u64::MAX as u128)).encode(),
             vec![],
         )
         .await?;

@@ -10,15 +10,34 @@ use ic_test_utilities::types::{
     ids::{canister_test_id, user_test_id},
     messages::{RequestBuilder, ResponseBuilder},
 };
-use ic_types::{freeze_threshold_cycles, messages::RequestOrResponse, Cycles, QueueIndex};
+use ic_types::{
+    messages::{RequestOrResponse, MAX_RESPONSE_COUNT_BYTES},
+    Cycles, QueueIndex,
+};
 
 const CANISTER_AVAILABLE_MEMORY: i64 = 4 << 30;
 const SUBNET_AVAILABLE_MEMORY: i64 = 300 << 30;
 
+/// Figure out how many cycles a canister should have so that it can support the
+/// given amount of storage for the given amount of time, given the storage fee.
+fn mock_freeze_threshold_cycles(
+    freeze_threshold: NumSeconds,
+    gib_storage_per_second_fee: Cycles,
+    expected_canister_size: NumBytes,
+) -> Cycles {
+    let one_gib = 1024 * 1024 * 1024;
+    Cycles::from(
+        expected_canister_size.get() as u128
+            * gib_storage_per_second_fee.get()
+            * freeze_threshold.get() as u128
+            / one_gib,
+    )
+}
+
 #[test]
 fn correct_charging_target_canister_for_a_response() {
     let freeze_threshold = NumSeconds::new(30 * 24 * 60 * 60);
-    let initial_cycles = freeze_threshold_cycles(
+    let initial_cycles = mock_freeze_threshold_cycles(
         freeze_threshold,
         Cycles::from(2_000_000),
         NumBytes::from(4 << 30),
@@ -29,7 +48,7 @@ fn correct_charging_target_canister_for_a_response() {
         initial_cycles,
         freeze_threshold,
     );
-    let initial_cycles_balance = system_state.cycles_balance;
+    let initial_cycles_balance = system_state.balance();
 
     let request = RequestOrResponse::Request(
         RequestBuilder::default()
@@ -54,7 +73,7 @@ fn correct_charging_target_canister_for_a_response() {
 
     // Target canister should not be charged for receiving the request or sending
     // the response
-    assert_eq!(initial_cycles_balance, system_state.cycles_balance);
+    assert_eq!(initial_cycles_balance, system_state.balance());
 }
 
 #[test]
@@ -138,23 +157,64 @@ fn induct_messages_to_self_in_stopping_status_does_not_work() {
 #[test]
 fn induct_messages_to_self_respects_canister_memory_limit() {
     let mut subnet_available_memory = SUBNET_AVAILABLE_MEMORY;
-    induct_messages_to_self_respects_memory_limit_impl(0, &mut subnet_available_memory);
+    induct_messages_to_self_memory_limit_test_impl(
+        0,
+        &mut subnet_available_memory,
+        SubnetType::Application,
+        true,
+    );
     assert_eq!(SUBNET_AVAILABLE_MEMORY, subnet_available_memory);
 }
 
 #[test]
 fn induct_messages_to_self_respects_subnet_memory_limit() {
     let mut subnet_available_memory = 0;
-    induct_messages_to_self_respects_memory_limit_impl(
+    induct_messages_to_self_memory_limit_test_impl(
         CANISTER_AVAILABLE_MEMORY,
         &mut subnet_available_memory,
+        SubnetType::Application,
+        true,
     );
     assert_eq!(0, subnet_available_memory);
 }
 
-fn induct_messages_to_self_respects_memory_limit_impl(
+#[test]
+fn system_subnet_induct_messages_to_self_ignores_canister_memory_limit() {
+    let mut subnet_available_memory = SUBNET_AVAILABLE_MEMORY;
+    let mut expected_subnet_available_memory = subnet_available_memory;
+    induct_messages_to_self_memory_limit_test_impl(
+        0,
+        &mut subnet_available_memory,
+        SubnetType::System,
+        false,
+    );
+    if ENFORCE_MESSAGE_MEMORY_USAGE {
+        expected_subnet_available_memory -= MAX_RESPONSE_COUNT_BYTES as i64
+    };
+    assert_eq!(expected_subnet_available_memory, subnet_available_memory);
+}
+
+#[test]
+fn system_subnet_induct_messages_to_self_ignores_subnet_memory_limit() {
+    let mut subnet_available_memory = 0;
+    let mut expected_subnet_available_memory = subnet_available_memory;
+    induct_messages_to_self_memory_limit_test_impl(
+        CANISTER_AVAILABLE_MEMORY,
+        &mut subnet_available_memory,
+        SubnetType::System,
+        false,
+    );
+    if ENFORCE_MESSAGE_MEMORY_USAGE {
+        expected_subnet_available_memory -= MAX_RESPONSE_COUNT_BYTES as i64
+    };
+    assert_eq!(expected_subnet_available_memory, subnet_available_memory);
+}
+
+fn induct_messages_to_self_memory_limit_test_impl(
     canister_available_memory: i64,
     subnet_available_memory: &mut i64,
+    own_subnet_type: SubnetType,
+    should_enforce_limit: bool,
 ) {
     let canister_id = canister_test_id(1);
 
@@ -203,7 +263,7 @@ fn induct_messages_to_self_respects_memory_limit_impl(
     system_state.induct_messages_to_self(
         canister_available_memory,
         subnet_available_memory,
-        SubnetType::Application,
+        own_subnet_type,
     );
 
     // Expect the response and first request to have been inducted.
@@ -216,7 +276,7 @@ fn induct_messages_to_self_respects_memory_limit_impl(
         system_state.queues_mut().pop_input()
     );
 
-    if ENFORCE_MESSAGE_MEMORY_USAGE {
+    if ENFORCE_MESSAGE_MEMORY_USAGE && should_enforce_limit {
         assert_eq!(None, system_state.queues_mut().pop_input());
 
         // Expect the second request to still be in the output queue.

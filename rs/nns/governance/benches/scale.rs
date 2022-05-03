@@ -19,8 +19,9 @@ use futures::future::FutureExt;
 use std::convert::TryFrom;
 
 use ic_base_types::PrincipalId;
+use ic_nervous_system_common::{ledger::Ledger, NervousSystemError};
 use ic_nns_common::pb::v1::NeuronId;
-use ic_nns_governance::governance::{Environment, Governance, HeapGrowthPotential, Ledger};
+use ic_nns_governance::governance::{Environment, Governance, HeapGrowthPotential};
 
 use ic_nns_governance::pb::v1::neuron;
 use ic_nns_governance::pb::v1::proposal;
@@ -80,18 +81,18 @@ impl Ledger for MockLedger {
         _from_subaccount: Option<Subaccount>,
         _to: AccountIdentifier,
         _memo: u64,
-    ) -> Result<u64, GovernanceError> {
+    ) -> Result<u64, NervousSystemError> {
         unimplemented!()
     }
 
-    async fn total_supply(&self) -> Result<Tokens, GovernanceError> {
+    async fn total_supply(&self) -> Result<Tokens, NervousSystemError> {
         unimplemented!()
     }
 
     async fn account_balance(
         &self,
         _account: AccountIdentifier,
-    ) -> Result<Tokens, GovernanceError> {
+    ) -> Result<Tokens, NervousSystemError> {
         unimplemented!()
     }
 }
@@ -106,6 +107,7 @@ fn make_and_process_proposal(gov: &mut Governance) {
         // Must match neuron 1's serialized_id.
         &PrincipalId::try_from(b"SID0".to_vec()).unwrap(),
         &Proposal {
+            title: Some("Celebrate Good Times".to_string()),
             summary: "test".to_string(),
             action: Some(proposal::Action::Motion(Motion {
                 motion_text: "dummy text".to_string(),
@@ -218,8 +220,8 @@ fn fixture_for_scale(num_neurons: u32, linear_following: bool) -> GovernanceProt
             ),
             //
             followees: [(Topic::Unspecified as i32, neuron::Followees { followees })]
-                .to_vec()
-                .into_iter()
+                .iter()
+                .cloned()
                 .collect(),
             ..Default::default()
         };

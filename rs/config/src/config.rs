@@ -4,6 +4,7 @@
 //! get included here so that it can be parsed.
 
 use crate::{
+    adapters::AdaptersConfig,
     artifact_pool::ArtifactPoolTomlConfig,
     config_parser::{ConfigError, ConfigSource, ConfigValidate},
     consensus::ConsensusConfig,
@@ -19,10 +20,11 @@ use crate::{
     registration::Config as RegistrationConfig,
     registry_client::Config as RegistryClientConfig,
     state_manager::Config as StateManagerConfig,
+    transport::TransportConfig,
 };
-use ic_types::{malicious_behaviour::MaliciousBehaviour, transport::TransportConfig};
+use ic_types::malicious_behaviour::MaliciousBehaviour;
 use serde::{Deserialize, Serialize};
-use std::{convert::TryFrom, path::PathBuf};
+use std::{collections::HashSet, convert::TryFrom, path::PathBuf};
 
 /// The config struct for the replica.  Just consists of `Config`s for
 /// the components.
@@ -38,14 +40,18 @@ pub struct Config {
     pub consensus: ConsensusConfig,
     pub crypto: CryptoConfig,
     pub logger: LoggerConfig,
-    // If `manager_logger` is not specified in the configuration file, it
+    // If `orchestrator_logger` is not specified in the configuration file, it
     // defaults to the value specified for `logger`.
-    pub nodemanager_logger: LoggerConfig,
+    pub orchestrator_logger: LoggerConfig,
+    // If `csp_vault_logger` is not specified in the configuration file, it
+    // defaults to the value specified for `logger`.
+    pub csp_vault_logger: LoggerConfig,
     pub message_routing: MessageRoutingConfig,
     pub malicious_behaviour: MaliciousBehaviour,
     pub firewall: FirewallConfig,
     pub registration: RegistrationConfig,
     pub nns_registry_replicator: NnsRegistryReplicatorConfig,
+    pub adapters_config: AdaptersConfig,
 }
 
 /// Mirrors the Config struct except that fields are made optional. This is
@@ -62,12 +68,14 @@ pub struct ConfigOptional {
     pub consensus: Option<ConsensusConfig>,
     pub crypto: Option<CryptoConfig>,
     pub logger: Option<LoggerConfig>,
-    pub nodemanager_logger: Option<LoggerConfig>,
+    pub orchestrator_logger: Option<LoggerConfig>,
+    pub csp_vault_logger: Option<LoggerConfig>,
     pub message_routing: Option<MessageRoutingConfig>,
     pub malicious_behaviour: Option<MaliciousBehaviour>,
     pub firewall: Option<FirewallConfig>,
     pub registration: Option<RegistrationConfig>,
     pub nns_registry_replicator: Option<NnsRegistryReplicatorConfig>,
+    pub adapters_config: Option<AdaptersConfig>,
 }
 
 impl Config {
@@ -89,12 +97,14 @@ impl Config {
             consensus: ConsensusConfig::default(),
             crypto: CryptoConfig::new(parent_dir.join("crypto")),
             logger: logger.clone(),
-            nodemanager_logger: logger,
+            orchestrator_logger: logger.clone(),
+            csp_vault_logger: logger,
             message_routing: MessageRoutingConfig::default(),
             malicious_behaviour: MaliciousBehaviour::default(),
             firewall: FirewallConfig::default(),
             registration: RegistrationConfig::default(),
             nns_registry_replicator: NnsRegistryReplicatorConfig::default(),
+            adapters_config: AdaptersConfig::default(),
         }
     }
 
@@ -121,9 +131,9 @@ impl Config {
     /// omitted, its value is taken from the given 'default'.
     pub fn load_with_default(source: &ConfigSource, default: Config) -> Result<Self, ConfigError> {
         let cfg = source.load::<ConfigOptional>()?;
-
         let logger = cfg.logger.unwrap_or(default.logger);
-        let nodemanager_logger = cfg.nodemanager_logger.unwrap_or_else(|| logger.clone());
+        let orchestrator_logger = cfg.orchestrator_logger.unwrap_or_else(|| logger.clone());
+        let csp_vault_logger = cfg.csp_vault_logger.unwrap_or_else(|| logger.clone());
 
         Ok(Self {
             registry_client: cfg.registry_client.unwrap_or(default.registry_client),
@@ -141,7 +151,8 @@ impl Config {
             consensus: cfg.consensus.unwrap_or(default.consensus),
             crypto: cfg.crypto.unwrap_or(default.crypto),
             logger,
-            nodemanager_logger,
+            orchestrator_logger,
+            csp_vault_logger,
             message_routing: cfg.message_routing.unwrap_or(default.message_routing),
             malicious_behaviour: cfg
                 .malicious_behaviour
@@ -151,6 +162,7 @@ impl Config {
             nns_registry_replicator: cfg
                 .nns_registry_replicator
                 .unwrap_or(default.nns_registry_replicator),
+            adapters_config: cfg.adapters_config.unwrap_or(default.adapters_config),
         })
     }
 
@@ -167,6 +179,67 @@ impl Config {
 
 impl ConfigValidate for ConfigOptional {
     fn validate(self) -> Result<Self, String> {
+        let mut same_uds_paths = false;
+        if let Some(adapters_config) = &self.adapters_config {
+            let mut uds_paths = HashSet::new();
+            if let Some(uds_path) = &adapters_config.bitcoin_mainnet_uds_path {
+                same_uds_paths |= !uds_paths.insert(uds_path.clone());
+            }
+            if let Some(uds_path) = &adapters_config.bitcoin_testnet_uds_path {
+                same_uds_paths |= !uds_paths.insert(uds_path.clone());
+            }
+            if let Some(uds_path) = &adapters_config.canister_http_uds_path {
+                same_uds_paths |= !uds_paths.insert(uds_path.clone());
+            }
+            if same_uds_paths {
+                return Err(
+                    "Inside Config::adapters_config at least two UDS paths are the same."
+                        .to_string(),
+                );
+            }
+        }
         Ok(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config_sample::SAMPLE_CONFIG;
+    use tempfile::tempdir as tempdir_deleted_at_end_of_scope;
+
+    #[test]
+    fn load_with_default_works_on_old_configs() {
+        let csp_vault_type_entry = "csp_vault_type: { unix_socket: \"/some/path/to/socket\" },";
+        let sample_config_without_csp_vault_type = SAMPLE_CONFIG.replace(csp_vault_type_entry, "");
+        let result = json5::from_str::<Config>(&sample_config_without_csp_vault_type);
+        assert!(
+            result.is_ok(),
+            "JSON5 parsing failed with error: {:?}",
+            result
+        );
+
+        let temp_dir = tempdir_deleted_at_end_of_scope().expect("Failed creating a temp file.");
+        let old_config_file = temp_dir.path().join("old_ic.json5");
+        std::fs::write(&old_config_file, &sample_config_without_csp_vault_type)
+            .expect("Failed writing test config to a file.");
+        let source = ConfigSource::File(old_config_file);
+        let default_config = Config::new(temp_dir.path().to_path_buf());
+        let result = Config::load_with_default(&source, default_config);
+        assert!(
+            result.is_ok(),
+            "load_with_default failed with error: {:?}",
+            result
+        );
+        // Check that `crypto_root` is from `SAMPLE_CONFIG`, not from `CryptoConfig::default()`.
+        assert_eq!(
+            result
+                .expect("Expected Config")
+                .crypto
+                .crypto_root
+                .to_str()
+                .expect("Expected path string"),
+            "/tmp/ic_crypto"
+        );
     }
 }

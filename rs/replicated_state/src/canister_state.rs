@@ -8,14 +8,16 @@ use crate::canister_state::queues::CanisterOutputQueuesIterator;
 use crate::canister_state::system_state::{CanisterStatus, SystemState};
 use crate::{InputQueueType, StateError};
 pub use execution_state::{EmbedderCache, ExecutionState, ExportedFunctions, Global};
+use ic_ic00_types::CanisterStatusType;
 use ic_interfaces::messages::CanisterInputMessage;
 use ic_registry_subnet_type::SubnetType;
 use ic_types::methods::SystemMethod;
+use ic_types::NumInstructions;
 use ic_types::{
     messages::{Ingress, Request, RequestOrResponse, Response},
     methods::WasmMethod,
-    AccumulatedPriority, CanisterId, CanisterStatusType, ComputeAllocation, ExecutionRound,
-    MemoryAllocation, NumBytes, PrincipalId, QueueIndex,
+    AccumulatedPriority, CanisterId, ComputeAllocation, ExecutionRound, MemoryAllocation, NumBytes,
+    NumRounds, PrincipalId, QueueIndex,
 };
 use phantom_newtype::AmountOf;
 pub use queues::{CanisterQueues, DEFAULT_QUEUE_CAPACITY, QUEUE_INDEX_NONE};
@@ -45,18 +47,36 @@ pub struct SchedulerState {
     /// in the vector d that corresponds to this canister.
     pub accumulated_priority: AccumulatedPriority,
 
-    /// The amount of heap delta debit left from the canister's last full
-    /// execution round.
+    /// Keeps the current priority credit of this Canister, accumulated during the
+    /// long execution.
+    ///
+    /// During the long execution, the Canister is temporarily credited with priority
+    /// to slightly boost the long execution priority. Only when the long execution
+    /// is done, then the `accumulated_priority` is decreased by the `priority_credit`.
+    pub priority_credit: AccumulatedPriority,
+
+    /// Tracks the Long Execution progress, i.e. how many rounds the execution lasts.
+    pub long_execution_progress: NumRounds,
+
+    /// The amount of heap delta debit. The canister skips execution of update
+    /// messages if this value is non-zero.
     pub heap_delta_debit: NumBytes,
+
+    /// The amount of install_code instruction debit. The canister rejects
+    /// install_code messages if this value is non-zero.
+    pub install_code_debit: NumInstructions,
 }
 
 impl Default for SchedulerState {
     fn default() -> Self {
         Self {
-            last_full_execution_round: ExecutionRound::from(0),
+            last_full_execution_round: 0.into(),
             compute_allocation: ComputeAllocation::default(),
             accumulated_priority: AccumulatedPriority::default(),
-            heap_delta_debit: NumBytes::from(0),
+            priority_credit: 0.into(),
+            long_execution_progress: 0.into(),
+            heap_delta_debit: 0.into(),
+            install_code_debit: 0.into(),
         }
     }
 }
@@ -120,16 +140,39 @@ impl CanisterState {
         own_subnet_type: SubnetType,
         input_queue_type: InputQueueType,
     ) -> Result<(), (StateError, RequestOrResponse)> {
-        let canister_available_memory = self.memory_limit(max_canister_memory_size).get() as i64
-            - self.memory_usage(own_subnet_type).get() as i64;
         self.system_state.push_input(
             index,
             msg,
-            canister_available_memory,
+            self.available_message_memory(max_canister_memory_size, own_subnet_type),
             subnet_available_memory,
             own_subnet_type,
             input_queue_type,
         )
+    }
+
+    /// Returns the memory available for canister messages based on
+    ///  * the maximum canister memory size;
+    ///  * the canister's memory allocation (overriding the former) if any; and
+    ///  * the subnet type (accounting for execution and message memory usage on
+    ///    application subnets; but only for messages and disregarding any
+    ///    memory allocation on system subnets).
+    fn available_message_memory(
+        &self,
+        max_canister_memory_size: NumBytes,
+        own_subnet_type: SubnetType,
+    ) -> i64 {
+        if own_subnet_type == SubnetType::System {
+            // For system subnets we ignore the canister allocation, if any;
+            // and the execution memory usage; and always allow up to
+            // `max_canister_memory_size` worth of messages.
+            max_canister_memory_size.get() as i64 - self.system_state.memory_usage().get() as i64
+        } else {
+            // For application subnets allow execution plus messages to use up
+            // to the canister's memory allocation, if any; or else
+            // `max_canister_memory_size`.
+            self.memory_limit(max_canister_memory_size).get() as i64
+                - self.memory_usage(own_subnet_type).get() as i64
+        }
     }
 
     /// See `SystemState::pop_input` for documentation.
@@ -193,10 +236,8 @@ impl CanisterState {
         subnet_available_memory: &mut i64,
         own_subnet_type: SubnetType,
     ) {
-        let canister_available_memory = self.memory_limit(max_canister_memory_size).get() as i64
-            - self.memory_usage(own_subnet_type).get() as i64;
         self.system_state.induct_messages_to_self(
-            canister_available_memory,
+            self.available_message_memory(max_canister_memory_size, own_subnet_type),
             subnet_available_memory,
             own_subnet_type,
         )
@@ -222,12 +263,68 @@ impl CanisterState {
         }
     }
 
+    /// Checks the constraints that a canister should always respect.
+    /// These invariants will be verified at the end of each execution round.
+    pub fn check_invariants(
+        &self,
+        own_subnet_type: SubnetType,
+        default_limit: NumBytes,
+    ) -> Result<(), StateError> {
+        let memory_used = self.memory_usage(own_subnet_type);
+        let memory_limit = self.memory_limit(default_limit);
+
+        if memory_used > memory_limit {
+            return Err(StateError::InvariantBroken(format!(
+                "Memory of canister {} exceeds the limit allowed: used {}, allowed {}",
+                self.canister_id(),
+                memory_used,
+                memory_limit
+            )));
+        }
+
+        let num_contexts = self
+            .system_state
+            .call_context_manager()
+            .map(|ccm| ccm.call_contexts().len())
+            .unwrap_or(0);
+        let num_responses = self.system_state.queues().input_queues_response_count();
+        let num_reservations = self.system_state.queues().input_queues_reservation_count();
+        if num_contexts != num_reservations + num_responses {
+            return Err(StateError::InvariantBroken(format!(
+                "Canister {}: Number of call contexts ({}) is different than the accumulated number of reservations and responses ({})",
+                self.canister_id(),
+                num_contexts,
+                num_reservations + num_responses
+            )));
+        }
+
+        Ok(())
+    }
+
     /// The amount of memory currently being used by the canister.
+    ///
+    /// This only includes execution memory (heap, stable, globals, Wasm) for
+    /// system subnets; and execution memory plus system state memory (canister
+    /// messages) for application subnets.
     pub fn memory_usage(&self, own_subnet_type: SubnetType) -> NumBytes {
+        self.memory_usage_impl(own_subnet_type != SubnetType::System)
+    }
+
+    /// Internal `memory_usage()` implementation that allows the caller to
+    /// explicitly select whether message memory usage should be included.
+    ///
+    /// This is still subject to the `ENFORCE_MESSAGE_MEMORY_USAGE` flag. If the
+    /// flag is unset, message memory usage will always be zero regardless.
+    pub(crate) fn memory_usage_impl(&self, with_messages: bool) -> NumBytes {
+        let message_memory_usage = if with_messages {
+            self.system_state.memory_usage()
+        } else {
+            0.into()
+        };
         self.execution_state
             .as_ref()
             .map_or(NumBytes::from(0), |es| es.memory_usage())
-            + self.system_state.memory_usage(own_subnet_type)
+            + message_memory_usage
     }
 
     /// Hack to get the dashboard templating working.
@@ -247,6 +344,8 @@ impl CanisterState {
         self.system_state.memory_allocation
     }
 
+    /// Returns the canister's memory limit: its reservation, if set; else the
+    /// provided `default_limit`.
     pub fn memory_limit(&self, default_limit: NumBytes) -> NumBytes {
         match self.memory_allocation() {
             MemoryAllocation::Reserved(bytes) => bytes,

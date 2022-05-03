@@ -1,7 +1,12 @@
 use crate::api::{CspCreateMEGaKeyError, CspThresholdSignError};
-use crate::types::CspPublicCoefficients;
+use crate::secret_key_store::{Scope, SecretKeyStoreError};
 use crate::types::{CspPop, CspPublicKey, CspSignature};
+use crate::types::{CspPublicCoefficients, CspSecretKey};
 use ic_crypto_internal_threshold_sig_bls12381::api::ni_dkg_errors;
+use ic_crypto_internal_threshold_sig_ecdsa::{
+    CommitmentOpening, IDkgComplaintInternal, IDkgDealingInternal, IDkgTranscriptInternal,
+    IDkgTranscriptOperationInternal, MEGaPublicKey, ThresholdEcdsaSigShareInternal,
+};
 use ic_crypto_internal_types::encrypt::forward_secure::{
     CspFsEncryptionPop, CspFsEncryptionPublicKey,
 };
@@ -10,16 +15,14 @@ use ic_crypto_internal_types::sign::threshold_sig::ni_dkg::{
 };
 use ic_crypto_tls_interfaces::TlsPublicKeyCert;
 use ic_types::crypto::canister_threshold_sig::error::{
-    IDkgCreateDealingError, IDkgLoadTranscriptError,
+    IDkgCreateDealingError, IDkgLoadTranscriptError, IDkgOpenTranscriptError,
+    IDkgVerifyDealingPrivateError, ThresholdEcdsaSignShareError,
 };
+use ic_types::crypto::canister_threshold_sig::ExtendedDerivationPath;
 use ic_types::crypto::{AlgorithmId, KeyId};
-use ic_types::{NodeId, NodeIndex, NumberOfNodes};
+use ic_types::{NodeId, NodeIndex, NumberOfNodes, Randomness};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use tecdsa::{
-    IDkgComplaintInternal, IDkgDealingInternal, IDkgTranscriptInternal,
-    IDkgTranscriptOperationInternal, MEGaPublicKey,
-};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CspBasicSignatureError {
@@ -108,6 +111,7 @@ pub trait CspVault:
     + ThresholdSignatureCspVault
     + NiDkgCspVault
     + IDkgProtocolCspVault
+    + ThresholdEcdsaSignerCspVault
     + SecretKeyStoreCspVault
     + TlsHandshakeCspVault
 {
@@ -120,6 +124,7 @@ impl<T> CspVault for T where
         + ThresholdSignatureCspVault
         + NiDkgCspVault
         + IDkgProtocolCspVault
+        + ThresholdEcdsaSignerCspVault
         + SecretKeyStoreCspVault
         + TlsHandshakeCspVault
 {
@@ -359,6 +364,17 @@ pub trait SecretKeyStoreCspVault {
     /// `key_id`. # Arguments
     /// * `key_id` identifies the key whose presence should be checked.
     fn sks_contains(&self, key_id: &KeyId) -> bool;
+
+    // TODO(CRP-1326): remove this method.
+    fn insert_secret_key(
+        &self,
+        id: KeyId,
+        key: CspSecretKey,
+        scope: Option<Scope>,
+    ) -> Result<(), SecretKeyStoreError>;
+
+    // TODO(CRP-1326): remove this method.
+    fn get_secret_key(&self, id: &KeyId) -> Option<CspSecretKey>;
 }
 
 /// Operations of `CspVault` related to TLS handshakes.
@@ -401,7 +417,7 @@ pub trait TlsHandshakeCspVault: Send + Sync {
     fn tls_sign(&self, message: &[u8], key_id: &KeyId) -> Result<CspSignature, CspTlsSignError>;
 }
 
-/// Operations of `CspVault` related to I-DKG (cf. `IDkgProtocolCspClient`).
+/// Operations of `CspVault` related to I-DKG (cf. `CspIDkgProtocol`).
 pub trait IDkgProtocolCspVault {
     /// Generate an IDkg dealing.
     fn idkg_create_dealing(
@@ -414,6 +430,17 @@ pub trait IDkgProtocolCspVault {
         transcript_operation: &IDkgTranscriptOperationInternal,
     ) -> Result<IDkgDealingInternal, IDkgCreateDealingError>;
 
+    /// See [`CspIDkgProtocol::idkg_verify_dealing_private`].
+    fn idkg_verify_dealing_private(
+        &self,
+        algorithm_id: AlgorithmId,
+        dealing: &IDkgDealingInternal,
+        dealer_index: NodeIndex,
+        receiver_index: NodeIndex,
+        receiver_key_id: KeyId,
+        context_data: &[u8],
+    ) -> Result<(), IDkgVerifyDealingPrivateError>;
+
     /// Compute secret from transcript and store in SKS, generating complaints
     /// if necessary.
     fn idkg_load_transcript(
@@ -423,11 +450,51 @@ pub trait IDkgProtocolCspVault {
         receiver_index: NodeIndex,
         key_id: &KeyId,
         transcript: &IDkgTranscriptInternal,
-    ) -> Result<Vec<IDkgComplaintInternal>, IDkgLoadTranscriptError>;
+    ) -> Result<BTreeMap<NodeIndex, IDkgComplaintInternal>, IDkgLoadTranscriptError>;
+
+    /// See [`CspIDkgProtocol::idkg_load_transcript_with_openings`].
+    fn idkg_load_transcript_with_openings(
+        &self,
+        dealings: &BTreeMap<NodeIndex, IDkgDealingInternal>,
+        openings: &BTreeMap<NodeIndex, BTreeMap<NodeIndex, CommitmentOpening>>,
+        context_data: &[u8],
+        receiver_index: NodeIndex,
+        key_id: &KeyId,
+        transcript: &IDkgTranscriptInternal,
+    ) -> Result<(), IDkgLoadTranscriptError>;
 
     /// Generate a MEGa keypair, for encrypting/decrypting IDkg dealing shares.
     fn idkg_gen_mega_key_pair(
         &self,
         algorithm_id: AlgorithmId,
     ) -> Result<MEGaPublicKey, CspCreateMEGaKeyError>;
+
+    /// Opens the dealing from dealer specified by `dealer_index`.
+    fn idkg_open_dealing(
+        &self,
+        dealing: IDkgDealingInternal,
+        dealer_index: NodeIndex,
+        context_data: &[u8],
+        opener_index: NodeIndex,
+        opener_key_id: &KeyId,
+    ) -> Result<CommitmentOpening, IDkgOpenTranscriptError>;
+}
+
+/// Operations of `CspVault` related to threshold-ECDSA (cf.
+/// `CspThresholdEcdsaSigner`).
+pub trait ThresholdEcdsaSignerCspVault {
+    /// Generate a signature share.
+    #[allow(clippy::too_many_arguments)]
+    fn ecdsa_sign_share(
+        &self,
+        derivation_path: &ExtendedDerivationPath,
+        hashed_message: &[u8],
+        nonce: &Randomness,
+        key: &IDkgTranscriptInternal,
+        kappa_unmasked: &IDkgTranscriptInternal,
+        lambda_masked: &IDkgTranscriptInternal,
+        kappa_times_lambda: &IDkgTranscriptInternal,
+        key_times_lambda: &IDkgTranscriptInternal,
+        algorithm_id: AlgorithmId,
+    ) -> Result<ThresholdEcdsaSigShareInternal, ThresholdEcdsaSignShareError>;
 }

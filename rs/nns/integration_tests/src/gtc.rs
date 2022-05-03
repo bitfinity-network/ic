@@ -2,11 +2,11 @@ use dfn_candid::{candid, candid_one};
 use dfn_protobuf::protobuf;
 use ed25519_dalek::Keypair;
 use ic_canister_client::Sender;
-use ic_nns_common::pb::v1::NeuronId;
-use ic_nns_constants::ids::{
+use ic_nervous_system_common_test_keys::{
     TEST_NEURON_1_OWNER_KEYPAIR, TEST_NEURON_1_OWNER_PRINCIPAL, TEST_NEURON_2_OWNER_KEYPAIR,
     TEST_NEURON_2_OWNER_PRINCIPAL,
 };
+use ic_nns_common::pb::v1::NeuronId;
 use ic_nns_constants::GOVERNANCE_CANISTER_ID;
 use ic_nns_governance::pb::v1::{GovernanceError, Neuron, NeuronInfo};
 use ic_nns_gtc::der_encode;
@@ -17,7 +17,9 @@ use ic_nns_gtc::test_constants::{
 use ic_nns_test_utils::itest_helpers::{
     local_test_on_nns_subnet, NnsCanisters, NnsInitPayloadsBuilder,
 };
-use ledger_canister::{AccountBalanceArgs, AccountIdentifier, Subaccount, Tokens, TRANSACTION_FEE};
+use ledger_canister::{
+    AccountBalanceArgs, AccountIdentifier, Subaccount, Tokens, DEFAULT_TRANSFER_FEE,
+};
 use std::collections::HashSet;
 use std::convert::TryFrom;
 use std::sync::Arc;
@@ -275,13 +277,13 @@ async fn assert_unclaimed_neurons_can_be_forwarded(
     assert!(!account_before_forward.has_donated);
     assert!(!account_before_forward.has_forwarded);
 
-    // Calculate how much ICPT is expected to be forwarded to the custodian
+    // Calculate how much ICP is expected to be forwarded to the custodian
     // neuron.
     let expected_custodian_account_balance_increase: Tokens = Tokens::from_e8s(
         Tokens::from_tokens(account_before_forward.icpts as u64)
             .unwrap()
             .get_e8s()
-            - (TRANSACTION_FEE.get_e8s() * account_before_forward.neuron_ids.len() as u64),
+            - (DEFAULT_TRANSFER_FEE.get_e8s() * account_before_forward.neuron_ids.len() as u64),
     );
 
     // Get the custodian neuron and its ledger account, so that we can later
@@ -424,13 +426,13 @@ async fn assert_neurons_can_be_donated(
     assert!(!account_before_donation.has_donated);
     assert!(!account_before_donation.has_forwarded);
 
-    // Calculate how much ICPT is expected to be donated to the custodian
+    // Calculate how much ICP is expected to be donated to the custodian
     // neuron.
     let expected_custodian_account_balance_increase: Tokens = Tokens::from_e8s(
         Tokens::from_tokens(account_before_donation.icpts as u64)
             .unwrap()
             .get_e8s()
-            - (TRANSACTION_FEE.get_e8s() * account_before_donation.neuron_ids.len() as u64),
+            - (DEFAULT_TRANSFER_FEE.get_e8s() * account_before_donation.neuron_ids.len() as u64),
     );
 
     // Get the custodian neuron and its ledger account, so that we can later

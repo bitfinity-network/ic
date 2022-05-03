@@ -4,11 +4,11 @@
 use std::str::FromStr;
 use std::string::ToString;
 use strum::IntoEnumIterator;
-use strum_macros::{EnumIter, EnumString, ToString};
+use strum_macros::{Display, EnumIter, EnumString};
 
 mod multi;
 
-#[derive(EnumString, EnumIter, ToString)]
+#[derive(EnumString, EnumIter, Display)]
 #[strum(serialize_all = "snake_case")]
 enum Command {
     Sign,
@@ -18,7 +18,7 @@ enum Command {
 
 fn help_str() -> String {
     Command::iter().fold("Subcommands:\n".to_string(), |accumulator, next| {
-        format!("{}{}\n", accumulator, next.to_string())
+        format!("{}{}\n", accumulator, next)
     })
 }
 

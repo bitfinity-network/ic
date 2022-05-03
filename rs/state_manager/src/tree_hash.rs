@@ -60,12 +60,11 @@ pub fn hash_state(state: &ReplicatedState) -> HashTree {
 mod tests {
     use super::*;
     use hex::FromHex;
-    use ic_base_types::NumSeconds;
-    use ic_cow_state::CowMemoryManagerImpl;
+    use ic_base_types::{NumBytes, NumSeconds};
     use ic_crypto_tree_hash::Digest;
     use ic_registry_subnet_type::SubnetType;
     use ic_replicated_state::{
-        canister_state::execution_state::{SandboxExecutionState, WasmBinary},
+        canister_state::execution_state::{WasmBinary, WasmMetadata},
         metadata_state::Stream,
         page_map::{PageIndex, PAGE_SIZE},
         testing::ReplicatedStateTesting,
@@ -82,9 +81,8 @@ mod tests {
         xnet::{StreamIndex, StreamIndexedQueue},
         Cycles, ExecutionRound,
     };
-    use ic_wasm_types::BinaryEncodedWasm;
+    use ic_wasm_types::CanisterModule;
     use std::collections::BTreeSet;
-    use std::sync::Arc;
 
     const INITIAL_CYCLES: Cycles = Cycles::new(1 << 36);
 
@@ -177,8 +175,7 @@ mod tests {
             wasm_memory
                 .page_map
                 .update(&[(PageIndex::from(1), &[0u8; PAGE_SIZE])]);
-            let tmpdir = tempfile::Builder::new().prefix("test").tempdir().unwrap();
-            let wasm_binary = WasmBinary::new(BinaryEncodedWasm::new(vec![]));
+            let wasm_binary = WasmBinary::new(CanisterModule::new(vec![]));
             let execution_state = ExecutionState {
                 canister_root: "NOT_USED".into(),
                 session_nonce: None,
@@ -187,10 +184,8 @@ mod tests {
                 stable_memory: Memory::default(),
                 exported_globals: vec![Global::I32(1)],
                 exports: ExportedFunctions::new(BTreeSet::new()),
+                metadata: WasmMetadata::default(),
                 last_executed_round: ExecutionRound::from(0),
-                cow_mem_mgr: Arc::new(CowMemoryManagerImpl::open_readwrite(tmpdir.path().into())),
-                mapped_state: None,
-                sandbox_state: SandboxExecutionState::new(),
             };
             canister_state.execution_state = Some(execution_state);
 
@@ -210,7 +205,11 @@ mod tests {
             });
 
             for i in 1..6 {
-                state.set_ingress_status(message_test_id(i), IngressStatus::Unknown);
+                state.set_ingress_status(
+                    message_test_id(i),
+                    IngressStatus::Unknown,
+                    NumBytes::from(u64::MAX),
+                );
             }
 
             state.metadata.certification_version = certification_version;

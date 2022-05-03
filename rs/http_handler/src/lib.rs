@@ -1,11 +1,12 @@
-/// This is the entry point of the Internet Computer. This deals with
-/// accepting HTTP connections, parsing messages and forwarding them to the
-/// correct components.
-///
-/// As much as possible the naming of structs in this module should match the
-/// naming used in the [Interface
-/// Specification](https://sdk.dfinity.org/docs/interface-spec/index.html)
+//! This is the entry point of the Internet Computer. This deals with
+//! accepting HTTP connections, parsing messages and forwarding them to the
+//! correct components.
+//!
+//! As much as possible the naming of structs in this module should match the
+//! naming used in the [Interface
+//! Specification](https://sdk.dfinity.org/docs/interface-spec/index.html)
 mod body;
+mod call;
 mod catch_up_package;
 mod common;
 mod dashboard;
@@ -13,66 +14,68 @@ mod metrics;
 mod pprof;
 mod query;
 mod read_state;
+mod state_reader_executor;
 mod status;
-mod submit;
 mod types;
 
 use crate::{
     body::BodyReceiverLayer,
+    call::CallService,
     catch_up_package::CatchUpPackageService,
-    common::{get_cors_headers, map_box_error_to_response},
+    common::{get_cors_headers, make_plaintext_response, map_box_error_to_response},
     dashboard::DashboardService,
     metrics::{
         LABEL_REQUEST_TYPE, LABEL_STATUS, LABEL_TYPE, REQUESTS_LABEL_NAMES, REQUESTS_NUM_LABELS,
     },
     query::QueryService,
     read_state::ReadStateService,
+    state_reader_executor::StateReaderExecutor,
     status::StatusService,
-    submit::CallService,
     types::*,
 };
-use hyper::{server::conn::Http, Body, Request, Response, StatusCode};
-use ic_base_thread::ObservableCountingSemaphore;
+use hyper::{server::conn::Http, Body, Client, Request, Response, StatusCode};
+use ic_async_utils::ObservableCountingSemaphore;
 use ic_config::http_handler::Config;
 use ic_crypto_tls_interfaces::TlsHandshake;
-use ic_crypto_tree_hash::Path;
+use ic_crypto_tree_hash::{lookup_path, LabeledTree, Path};
 use ic_interfaces::{
     consensus_pool::ConsensusPoolCache,
     crypto::IngressSigVerifier,
     execution_environment::{IngressFilterService, QueryExecutionService},
-    p2p::IngressIngestionService,
     registry::RegistryClient,
-    state_manager::StateReader,
 };
+use ic_interfaces_p2p::IngressIngestionService;
+use ic_interfaces_state_manager::StateReader;
 use ic_logger::{debug, error, fatal, info, warn, ReplicaLogger};
 use ic_metrics::{histogram_vec_timer::HistogramVecTimer, MetricsRegistry};
 use ic_registry_subnet_type::SubnetType;
 use ic_replicated_state::{NodeTopology, ReplicatedState};
 use ic_types::{
-    canonical_error::{invalid_argument_error, unknown_error, CanonicalError},
     malicious_flags::MaliciousFlags,
     messages::{
-        Blob, CertificateDelegation, HttpReadState, HttpReadStateContent, HttpReadStateResponse,
-        HttpRequestEnvelope, ReplicaHealthStatus,
+        Blob, Certificate, CertificateDelegation, HttpReadState, HttpReadStateContent,
+        HttpReadStateResponse, HttpRequestEnvelope, ReplicaHealthStatus,
     },
     time::current_time_and_expiry_time,
     SubnetId,
 };
 use metrics::HttpHandlerMetrics;
 use rand::Rng;
-use std::io::{Error, ErrorKind, Write};
-use std::net::SocketAddr;
-use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::{
+    convert::TryFrom,
+    io::{Error, ErrorKind, Write},
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{Arc, RwLock},
+    time::Duration,
+};
 use tempfile::NamedTempFile;
 use tokio::{
     net::{TcpListener, TcpStream},
-    time::{timeout, Instant},
+    time::{sleep, timeout, Instant},
 };
 use tower::{
-    load_shed::LoadShed, service_fn, util::BoxService, BoxError, Service, ServiceBuilder,
-    ServiceExt,
+    load_shed::LoadShed, service_fn, util::BoxService, Service, ServiceBuilder, ServiceExt,
 };
 
 // Constants defining the limits of the HttpHandler.
@@ -128,6 +131,20 @@ const CONTENT_TYPE_CBOR: &str = "application/cbor";
 // Placeholder used when we can't determine the approriate prometheus label.
 const UNKNOWN_LABEL: &str = "unknown";
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct HttpError {
+    pub status: StatusCode,
+    pub message: String,
+}
+
+impl std::fmt::Display for HttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for HttpError {}
+
 /// The struct that handles incoming HTTP requests for the IC replica.
 /// This is collection of thread-safe data members.
 #[derive(Clone)]
@@ -137,7 +154,7 @@ struct HttpHandler {
     subnet_id: SubnetId,
     nns_subnet_id: SubnetId,
     subnet_type: SubnetType,
-    state_reader: Arc<dyn StateReader<State = ReplicatedState>>,
+    state_reader_executor: StateReaderExecutor,
     registry_client: Arc<dyn RegistryClient>,
     validator: Arc<dyn IngressSigVerifier + Send + Sync>,
 
@@ -164,8 +181,9 @@ fn start_server_initialization(
     log: ReplicaLogger,
     delegation_from_nns: Arc<RwLock<Option<CertificateDelegation>>>,
     health_status: Arc<RwLock<ReplicaHealthStatus>>,
+    rt_handle: tokio::runtime::Handle,
 ) {
-    tokio::task::spawn_blocking(move || {
+    rt_handle.spawn(async move {
         info!(log, "Initializing HTTP server...");
         let mut check_count: i32 = 0;
         // Sleep one second between retries, only log every 10th round.
@@ -176,13 +194,13 @@ fn start_server_initialization(
             if check_count % 10 == 0 {
                 info!(log, "Certified state is not yet available...");
             }
-            std::thread::sleep(Duration::from_secs(1));
+            sleep(Duration::from_secs(1)).await;
         }
         info!(log, "Certified state is now available.");
         // Fetch the delegation from the NNS for this subnet to be
         // able to issue certificates.
         *health_status.write().unwrap() = ReplicaHealthStatus::WaitingForRootDelegation;
-        match load_root_delegation(state_reader.as_ref(), subnet_id, nns_subnet_id, &log) {
+        match load_root_delegation(state_reader.as_ref(), subnet_id, nns_subnet_id, &log).await {
             Err(err) => {
                 error!(log, "Could not load nns delegation: {}", err);
             }
@@ -261,6 +279,7 @@ pub async fn start_server(
     backup_spool_path: Option<PathBuf>,
     subnet_type: SubnetType,
     malicious_flags: MaliciousFlags,
+    rt_handle: tokio::runtime::Handle,
 ) -> Result<(), Error> {
     let metrics = HttpHandlerMetrics::new(&metrics_registry);
 
@@ -273,7 +292,7 @@ pub async fn start_server(
         subnet_id,
         nns_subnet_id,
         subnet_type,
-        state_reader,
+        state_reader_executor: StateReaderExecutor::new(state_reader.clone()),
         registry_client,
         validator: ingress_verifier,
         query_execution_service,
@@ -305,12 +324,13 @@ pub async fn start_server(
     }
 
     start_server_initialization(
-        Arc::clone(&http_handler.state_reader),
+        Arc::clone(&state_reader),
         http_handler.subnet_id,
         http_handler.nns_subnet_id,
         http_handler.log.clone(),
         Arc::clone(&http_handler.delegation_from_nns),
         Arc::clone(&http_handler.health_status),
+        rt_handle.clone(),
     );
 
     let outstanding_connections =
@@ -329,7 +349,7 @@ pub async fn start_server(
                 metrics.connections_total.inc();
                 // Start recording connection setup duration.
                 let connection_start_time = Instant::now();
-                tokio::task::spawn(async move {
+                rt_handle.spawn(async move {
                     // Do a move of the permit so it gets dropped at the end of the scope.
                     let _request_permit_deleter = request_permit;
                     let mut b = [0_u8; 1];
@@ -408,12 +428,12 @@ fn create_main_service(
     metrics: HttpHandlerMetrics,
     http_handler: HttpHandler,
     app_layer: AppLayer,
-) -> BoxService<Request<Body>, Response<Body>, CanonicalError> {
+) -> BoxService<Request<Body>, Response<Body>, HttpError> {
     let metrics_for_map_request = metrics.clone();
     let route_service = service_fn(move |req: RequestWithTimer| {
         let metrics = metrics.clone();
         let http_handler = http_handler.clone();
-        async move { Ok::<_, BoxError>(make_router(metrics, http_handler, app_layer, req).await) }
+        async move { Ok::<_, HttpError>(make_router(metrics, http_handler, app_layer, req).await) }
     });
     BoxService::new(
         ServiceBuilder::new()
@@ -435,9 +455,12 @@ fn create_main_service(
                     // str`. It ensures `request_timer` is dropped before `status`.
                     let mut timer = request_timer;
                     timer.set_label(LABEL_STATUS, status.as_str());
-                    Ok::<_, CanonicalError>(response)
+                    Ok::<_, HttpError>(response)
                 }
-                Err(_err) => Err(unknown_error("We should never return an error here.")),
+                Err(err) => {
+                    // This should never happen
+                    Err(err)
+                }
             }),
     )
 }
@@ -512,11 +535,10 @@ type ResponseWithTimer = (
 
 fn set_timer_labels(
     timer: &mut HistogramVecTimer<'static, REQUESTS_NUM_LABELS>,
-    req_type: RequestType,
     api_req_type: ApiReqType,
 ) {
-    timer.set_label(LABEL_TYPE, req_type.as_str());
-    timer.set_label(LABEL_REQUEST_TYPE, api_req_type.as_str());
+    timer.set_label(LABEL_TYPE, to_legacy_request_type(api_req_type));
+    timer.set_label(LABEL_REQUEST_TYPE, api_req_type.into());
 }
 
 async fn make_router(
@@ -545,13 +567,13 @@ async fn make_router(
         http_handler.log.clone(),
         http_handler.config.clone(),
         http_handler.nns_subnet_id,
-        Arc::clone(&http_handler.state_reader),
+        http_handler.state_reader_executor.clone(),
         Arc::clone(&http_handler.health_status),
     ));
     let dashboard_service = BoxService::new(DashboardService::new(
         http_handler.config,
         http_handler.subnet_type,
-        Arc::clone(&http_handler.state_reader),
+        http_handler.state_reader_executor.clone(),
     ));
     let catch_up_package_service = BoxService::new(
         ServiceBuilder::new()
@@ -569,7 +591,7 @@ async fn make_router(
                 metrics.clone(),
                 Arc::clone(&http_handler.health_status),
                 Arc::clone(&http_handler.delegation_from_nns),
-                Arc::clone(&http_handler.state_reader),
+                http_handler.state_reader_executor.clone(),
                 Arc::clone(&http_handler.validator),
                 Arc::clone(&http_handler.registry_client),
                 http_handler.malicious_flags.clone(),
@@ -590,12 +612,11 @@ async fn make_router(
             )),
     );
 
-    let invalid_argument_response = common::make_response(invalid_argument_error(&format!("")));
     metrics
         .protocol_version_total
-        .with_label_values(&[app_layer.as_str(), &format!("{:?}", req.version())])
+        .with_label_values(&[app_layer.into(), &format!("{:?}", req.version())])
         .inc();
-    let svc = match *req.method() {
+    let svc = match req.method().clone() {
         Method::POST => {
             // Check the content-type header
             if !req
@@ -609,104 +630,99 @@ async fn make_router(
                     false
                 })
             {
-                set_timer_labels(
-                    &mut timer,
-                    RequestType::InvalidArgument,
-                    ApiReqType::InvalidArgument,
+                set_timer_labels(&mut timer, ApiReqType::InvalidArgument);
+                return (
+                    make_plaintext_response(
+                        StatusCode::BAD_REQUEST,
+                        format!("Unexpected content-type, expected {}.", CONTENT_TYPE_CBOR),
+                    ),
+                    timer,
                 );
-                return (invalid_argument_response, timer);
             }
 
             // Check the path
             let path = req.uri().path();
             match *path.split('/').collect::<Vec<&str>>().as_slice() {
                 ["", "api", "v2", "canister", _, "call"] => {
-                    set_timer_labels(&mut timer, RequestType::Submit, ApiReqType::Call);
+                    set_timer_labels(&mut timer, ApiReqType::Call);
                     call_service
                 }
                 ["", "api", "v2", "canister", _, "query"] => {
-                    set_timer_labels(&mut timer, RequestType::Query, ApiReqType::Query);
+                    set_timer_labels(&mut timer, ApiReqType::Query);
                     query_service
                 }
                 ["", "api", "v2", "canister", _, "read_state"] => {
-                    set_timer_labels(&mut timer, RequestType::ReadState, ApiReqType::ReadState);
+                    set_timer_labels(&mut timer, ApiReqType::ReadState);
                     read_state_service
                 }
                 ["", "_", "catch_up_package"] => {
-                    set_timer_labels(
-                        &mut timer,
-                        RequestType::CatchUpPackage,
-                        ApiReqType::CatchUpPackage,
-                    );
+                    set_timer_labels(&mut timer, ApiReqType::CatchUpPackage);
                     catch_up_package_service
                 }
                 _ => {
-                    set_timer_labels(
-                        &mut timer,
-                        RequestType::InvalidArgument,
-                        ApiReqType::InvalidArgument,
+                    set_timer_labels(&mut timer, ApiReqType::InvalidArgument);
+                    return (
+                        make_plaintext_response(
+                            StatusCode::NOT_FOUND,
+                            "Unexpected POST request path.".to_string(),
+                        ),
+                        timer,
                     );
-                    return (invalid_argument_response, timer);
                 }
             }
         }
         Method::GET => match req.uri().path() {
             "/api/v2/status" => {
-                set_timer_labels(&mut timer, RequestType::Status, ApiReqType::Status);
+                set_timer_labels(&mut timer, ApiReqType::Status);
                 status_service
             }
             "/" | "/_/" => {
-                set_timer_labels(
-                    &mut timer,
-                    RequestType::RedirectToDashboard,
-                    ApiReqType::RedirectToDashboard,
-                );
+                set_timer_labels(&mut timer, ApiReqType::RedirectToDashboard);
                 return (redirect_to_dasboard_response(), timer);
             }
             HTTP_DASHBOARD_URL_PATH => {
-                set_timer_labels(&mut timer, RequestType::Dashboard, ApiReqType::Dashboard);
+                set_timer_labels(&mut timer, ApiReqType::Dashboard);
                 dashboard_service
             }
             "/_/pprof" => {
-                set_timer_labels(&mut timer, RequestType::PprofHome, ApiReqType::PprofHome);
+                set_timer_labels(&mut timer, ApiReqType::PprofHome);
                 return (pprof::home(), timer);
             }
             "/_/pprof/profile" => {
-                set_timer_labels(
-                    &mut timer,
-                    RequestType::PprofProfile,
-                    ApiReqType::PprofProfile,
-                );
+                set_timer_labels(&mut timer, ApiReqType::PprofProfile);
                 return (pprof::cpu_profile(req.into_parts().0).await, timer);
             }
             "/_/pprof/flamegraph" => {
-                set_timer_labels(
-                    &mut timer,
-                    RequestType::PprofFlamegraph,
-                    ApiReqType::PprofFlamegraph,
-                );
+                set_timer_labels(&mut timer, ApiReqType::PprofFlamegraph);
                 return (pprof::cpu_flamegraph(req.into_parts().0).await, timer);
             }
             _ => {
-                set_timer_labels(
-                    &mut timer,
-                    RequestType::InvalidArgument,
-                    ApiReqType::InvalidArgument,
+                set_timer_labels(&mut timer, ApiReqType::InvalidArgument);
+                return (
+                    make_plaintext_response(
+                        StatusCode::NOT_FOUND,
+                        "Unexpected GET request path.".to_string(),
+                    ),
+                    timer,
                 );
-                return (invalid_argument_response, timer);
             }
         },
         Method::OPTIONS => {
-            set_timer_labels(&mut timer, RequestType::Options, ApiReqType::Options);
+            set_timer_labels(&mut timer, ApiReqType::Options);
             return (no_content_response(), timer);
         }
         _ => {
-            set_timer_labels(
-                &mut timer,
-                RequestType::InvalidArgument,
-                ApiReqType::InvalidArgument,
+            set_timer_labels(&mut timer, ApiReqType::InvalidArgument);
+            return (
+                make_plaintext_response(
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    format!(
+                        "Unsupported method: {}. supported methods: POST, GET, OPTIONS.",
+                        req.method()
+                    ),
+                ),
+                timer,
             );
-            return (invalid_argument_response, timer);
         }
     };
     (
@@ -723,7 +739,7 @@ async fn make_router(
 
 // Fetches a delegation from the NNS subnet to allow this subnet to issue
 // certificates on its behalf. On the NNS subnet this method is a no-op.
-fn load_root_delegation(
+async fn load_root_delegation(
     state_reader: &dyn StateReader<State = ReplicatedState>,
     subnet_id: SubnetId,
     nns_subnet_id: SubnetId,
@@ -738,10 +754,9 @@ fn load_root_delegation(
     for _ in 0..MAX_FETCH_DELEGATION_ATTEMPTS {
         info!(log, "Fetching delegation from the nns subnet...");
 
-        let log_err_and_backoff = |err: &dyn std::error::Error| {
+        async fn log_err_and_backoff(log: &ReplicaLogger, err: impl std::fmt::Display) {
             // Fetching the NNS delegation failed. Do a random backoff and try again.
-            let mut rng = rand::thread_rng();
-            let backoff = Duration::from_secs(rng.gen_range(1..15));
+            let backoff = Duration::from_secs(rand::thread_rng().gen_range(1..15));
             warn!(
                 log,
                 "Fetching delegation from nns subnet failed. Retrying again in {} seconds...\n\
@@ -749,8 +764,8 @@ fn load_root_delegation(
                 backoff.as_secs(),
                 err
             );
-            std::thread::sleep(backoff);
-        };
+            sleep(backoff).await
+        }
 
         let node = match get_random_node_from_nns_subnet(state_reader, nns_subnet_id) {
             Ok(node_topology) => node_topology,
@@ -789,7 +804,7 @@ fn load_root_delegation(
         };
 
         let body = serde_cbor::ser::to_vec(&envelope).unwrap();
-        let http_client = reqwest::blocking::Client::new();
+        let http_client = Client::new();
         let ip_addr = node.ip_address.parse().unwrap();
         // any effective canister id can be used when invoking read_state here
         let address = format!(
@@ -800,30 +815,78 @@ fn load_root_delegation(
             log,
             "Attempt to fetch delegation from root subnet node with url `{}`", address
         );
-        let raw_response_res = match http_client
-            .post(&address)
+
+        let nns_request = match Request::builder()
+            .method(hyper::Method::POST)
+            .uri(&address)
             .header(hyper::header::CONTENT_TYPE, CONTENT_TYPE_CBOR)
-            .body(body)
-            .send()
+            .body(Body::from(body))
         {
-            Ok(res) => res.bytes(),
+            Ok(r) => r,
             Err(err) => {
-                log_err_and_backoff(&err);
+                log_err_and_backoff(log, &err).await;
                 continue;
             }
         };
 
-        match raw_response_res {
+        let raw_response_res = match http_client.request(nns_request).await {
+            Ok(res) => res,
+            Err(err) => {
+                log_err_and_backoff(log, &err).await;
+                continue;
+            }
+        };
+
+        match hyper::body::to_bytes(raw_response_res).await {
             Ok(raw_response) => {
                 debug!(log, "Response from nns subnet: {:?}", raw_response);
 
                 let response: HttpReadStateResponse = match serde_cbor::from_slice(&raw_response) {
                     Ok(r) => r,
                     Err(e) => {
-                        log_err_and_backoff(&e);
+                        log_err_and_backoff(log, &e).await;
                         continue;
                     }
                 };
+
+                let parsed_delegation: Certificate =
+                    match serde_cbor::from_slice(&response.certificate) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            log_err_and_backoff(
+                                log,
+                                &format!("failed to parse delegation certificate: {}", e),
+                            )
+                            .await;
+                            continue;
+                        }
+                    };
+
+                let labeled_tree = match LabeledTree::try_from(parsed_delegation.tree) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        log_err_and_backoff(
+                            log,
+                            &format!("invalid hash tree in the delegation certificate: {:?}", e),
+                        )
+                        .await;
+                        continue;
+                    }
+                };
+
+                if lookup_path(
+                    &labeled_tree,
+                    &[b"subnet", subnet_id.get_ref().as_ref(), b"public_key"],
+                )
+                .is_none()
+                {
+                    log_err_and_backoff(
+                        log,
+                        &format!("delegation does not contain current subnet {}", subnet_id),
+                    )
+                    .await;
+                    continue;
+                }
 
                 let delegation = CertificateDelegation {
                     subnet_id: Blob(subnet_id.get().to_vec()),
@@ -835,7 +898,7 @@ fn load_root_delegation(
             }
             Err(err) => {
                 // Fetching the NNS delegation failed. Do a random backoff and try again.
-                log_err_and_backoff(&err);
+                log_err_and_backoff(log, &err).await;
             }
         }
     }

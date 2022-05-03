@@ -20,12 +20,13 @@ use std::convert::TryFrom;
 pub type CatchUpContent = CatchUpContentT<HashedBlock>;
 
 /// A generic struct shared between CatchUpContent and CatchUpContentShare.
+/// Consists of objects all occuring at a specific height which we will refer to
+/// as the catch up height.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, PartialOrd, Ord, Hash)]
 pub struct CatchUpContentT<T> {
     /// Replica version that was running when this CUP was created.
     version: ReplicaVersion,
-    /// A finalized Block that contains DKG summary. We call its height the
-    /// catchup height.
+    /// A finalized Block that contains DKG summary.
     pub block: T,
     /// The RandomBeacon that is used at the catchup height.
     pub random_beacon: HashedRandomBeacon,
@@ -194,7 +195,7 @@ impl From<&CatchUpContent> for CatchUpShareContent {
 /// committee.
 pub type CatchUpPackageShare = Signed<CatchUpShareContent, ThresholdSignatureShare<CatchUpContent>>;
 
-/// The parameters used to request `CatchUpPackage` (by nodemanager).
+/// The parameters used to request `CatchUpPackage` (by orchestrator).
 ///
 /// We make use of the `Ord` trait to determine if one `CatchUpPackage` is newer
 /// than the other:

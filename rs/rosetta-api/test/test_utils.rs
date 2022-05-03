@@ -4,13 +4,15 @@ mod store_tests;
 
 use ic_rosetta_api::errors::ApiError;
 use ic_rosetta_api::models::{
-    AccountBalanceRequest, AccountBalanceResponse, EnvelopePair, NetworkListResponse,
-    NetworkRequest, PartialBlockIdentifier, SignedTransaction,
+    AccountBalanceRequest, EnvelopePair, PartialBlockIdentifier, SignedTransaction,
 };
 use ic_rosetta_api::request_types::{
     Request, RequestResult, RequestType, Status, TransactionResults,
 };
-use ledger_canister::{self, AccountIdentifier, Block, BlockHeight, Operation, SendArgs, Tokens};
+use ledger_canister::{
+    self, AccountIdentifier, Block, BlockHeight, Operation, SendArgs, Tokens, TransferFee,
+    DEFAULT_TRANSFER_FEE,
+};
 use tokio::sync::RwLock;
 
 use async_trait::async_trait;
@@ -20,10 +22,9 @@ use ic_rosetta_api::balance_book::BalanceBook;
 use ic_rosetta_api::convert::{from_arg, to_model_account_identifier};
 use ic_rosetta_api::ledger_client::{Blocks, LedgerAccess};
 use ic_rosetta_api::rosetta_server::RosettaApiServer;
-use ic_rosetta_api::store::BlockStore;
-use ic_rosetta_api::{store::HashedBlock, RosettaRequestHandler};
+use ic_rosetta_api::{store::HashedBlock, RosettaRequestHandler, DEFAULT_TOKEN_SYMBOL};
 use ic_types::{
-    messages::{HttpCanisterUpdate, HttpSubmitContent},
+    messages::{HttpCallContent, HttpCanisterUpdate},
     PrincipalId,
 };
 use std::collections::BTreeMap;
@@ -55,34 +56,31 @@ fn create_tmp_dir() -> tempfile::TempDir {
 }
 
 pub struct TestLedger {
-    blockchain: RwLock<Blocks>,
-    canister_id: CanisterId,
-    governance_canister_id: CanisterId,
-    submit_queue: RwLock<Vec<HashedBlock>>,
+    pub blockchain: RwLock<Blocks>,
+    pub canister_id: CanisterId,
+    pub governance_canister_id: CanisterId,
+    pub submit_queue: RwLock<Vec<HashedBlock>>,
+    pub transfer_fee: Tokens,
 }
 
 impl TestLedger {
     pub fn new() -> Self {
         Self {
-            blockchain: RwLock::new(Blocks::default()),
+            blockchain: RwLock::new(Blocks::new_in_memory()),
             canister_id: CanisterId::new(
                 PrincipalId::from_str("5v3p4-iyaaa-aaaaa-qaaaa-cai").unwrap(),
             )
             .unwrap(),
             governance_canister_id: ic_nns_constants::GOVERNANCE_CANISTER_ID,
             submit_queue: RwLock::new(Vec::new()),
+            transfer_fee: DEFAULT_TRANSFER_FEE,
         }
     }
 
     pub fn from_blockchain(blocks: Blocks) -> Self {
         Self {
             blockchain: RwLock::new(blocks),
-            canister_id: CanisterId::new(
-                PrincipalId::from_str("5v3p4-iyaaa-aaaaa-qaaaa-cai").unwrap(),
-            )
-            .unwrap(),
-            governance_canister_id: ic_nns_constants::GOVERNANCE_CANISTER_ID,
-            submit_queue: RwLock::new(Vec::new()),
+            ..Default::default()
         }
     }
 
@@ -106,27 +104,6 @@ impl Default for TestLedger {
     }
 }
 
-async fn post_json_request(
-    http_client: &reqwest::Client,
-    url: &str,
-    body: Vec<u8>,
-) -> Result<(Vec<u8>, reqwest::StatusCode), String> {
-    let resp = http_client
-        .post(url)
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(body)
-        .send()
-        .await
-        .map_err(|err| format!("sending post request failed with {}: ", err))?;
-    let resp_status = resp.status();
-    let resp_body = resp
-        .bytes()
-        .await
-        .map_err(|err| format!("receive post response failed with {}: ", err))?
-        .to_vec();
-    Ok((resp_body, resp_status))
-}
-
 #[async_trait]
 impl LedgerAccess for TestLedger {
     async fn read_blocks<'a>(&'a self) -> Box<dyn Deref<Target = Blocks> + 'a> {
@@ -134,6 +111,10 @@ impl LedgerAccess for TestLedger {
     }
 
     async fn cleanup(&self) {}
+
+    fn token_symbol(&self) -> &str {
+        DEFAULT_TOKEN_SYMBOL
+    }
 
     async fn sync_blocks(&self, _stopped: Arc<AtomicBool>) -> Result<(), ApiError> {
         let mut queue = self.submit_queue.write().await;
@@ -168,7 +149,7 @@ impl LedgerAccess for TestLedger {
             let EnvelopePair { update, .. } = &request[0];
 
             let HttpCanisterUpdate { arg, sender, .. } = match update.content.clone() {
-                HttpSubmitContent::Call { update } => update,
+                HttpCallContent::Call { update } => update,
             };
 
             let from = PrincipalId::try_from(sender.0)
@@ -219,6 +200,7 @@ impl LedgerAccess for TestLedger {
                 block_index: None,
                 neuron_id: None,
                 status: Status::Completed,
+                response: None,
             });
         }
 
@@ -231,6 +213,12 @@ impl LedgerAccess for TestLedger {
         _: bool,
     ) -> Result<NeuronInfo, ApiError> {
         panic!("Neuron info not available through TestLedger");
+    }
+
+    async fn transfer_fee(&self) -> Result<TransferFee, ApiError> {
+        Ok(TransferFee {
+            transfer_fee: self.transfer_fee,
+        })
     }
 }
 
@@ -260,83 +248,4 @@ pub async fn get_balance(
     msg.block_identifier = block_id;
     let resp = req_handler.account_balance(msg).await?;
     Ok(Tokens::from_e8s(resp.balances[0].value.parse().unwrap()))
-}
-
-#[actix_rt::test]
-async fn smoke_test_with_server() {
-    init_test_logger();
-
-    let addr = "127.0.0.1:8090".to_string();
-
-    let mut scribe = Scribe::new();
-    let num_transactions = 1000;
-    let num_accounts = 100;
-
-    scribe.gen_accounts(num_accounts, 1_000_000);
-    for _i in 0..num_transactions {
-        scribe.gen_transaction();
-    }
-
-    let ledger = Arc::new(TestLedger::new());
-    let req_handler = RosettaRequestHandler::new(ledger.clone());
-    for b in &scribe.blockchain {
-        ledger.add_block(b.clone()).await.ok();
-    }
-
-    let serv_ledger = ledger.clone();
-    let serv_req_handler = req_handler.clone();
-
-    let serv = Arc::new(
-        RosettaApiServer::new(serv_ledger, serv_req_handler, addr.clone(), false).unwrap(),
-    );
-    let serv_run = serv.clone();
-    let arbiter = actix_rt::Arbiter::new();
-    arbiter.spawn(Box::pin(async move {
-        log::info!("Spawning server");
-        serv_run.run(Default::default()).await.unwrap();
-        log::info!("Server thread done");
-    }));
-
-    let http_client = reqwest::Client::new();
-
-    let msg = NetworkRequest::new(req_handler.network_id());
-    let http_body = serde_json::to_vec(&msg).unwrap();
-    let (res, _) = post_json_request(
-        &http_client,
-        &format!("http://{}/network/list", addr),
-        http_body,
-    )
-    .await
-    .unwrap();
-    let resp: NetworkListResponse = serde_json::from_slice(&res).unwrap();
-
-    assert_eq!(resp.network_identifiers[0], req_handler.network_id());
-
-    let msg = AccountBalanceRequest::new(
-        req_handler.network_id(),
-        to_model_account_identifier(&acc_id(0)),
-    );
-
-    let http_body = serde_json::to_vec(&msg).unwrap();
-    let (res, _) = post_json_request(
-        &http_client,
-        &format!("http://{}/account/balance", addr),
-        http_body,
-    )
-    .await
-    .unwrap();
-    let res: AccountBalanceResponse = serde_json::from_slice(&res).unwrap();
-
-    assert_eq!(
-        res.block_identifier.index,
-        (num_transactions + num_accounts - 1) as i64
-    );
-    assert_eq!(
-        Tokens::from_e8s(u64::from_str(&res.balances[0].value).unwrap()),
-        *scribe.balance_book.get(&acc_id(0)).unwrap()
-    );
-
-    serv.stop().await;
-    arbiter.stop();
-    arbiter.join().unwrap();
 }

@@ -1,0 +1,33 @@
+.bazel-run:
+  # Run in ZH since BuildFarm is in ZH
+  tags:
+    - dfinity
+    - docker
+    - ubuntu
+    - zh
+  extends:
+    - .ubuntu-nix-docker
+    - .rules-parent-pipeline-autorun-on-trigger
+  stage: test
+  artifacts:
+    paths:
+      - bazel-build-log*.json
+  before_script:
+    - !reference [before_script]
+    - set -euo pipefail
+    - bazel --version
+
+bazel-build-all:
+  extends:
+    - .bazel-run
+  stage: test
+  script:
+    - bazel build --config ci :all
+    - bazel test --config ci //rs/...
+
+bazel-build-guestos:
+  extends:
+    - .bazel-run
+  stage: test
+  script:
+    - bazel build --config ci //ic-os/guestos:disk.img.tar

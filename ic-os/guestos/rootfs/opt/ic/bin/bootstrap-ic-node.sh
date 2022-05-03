@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Provision a node based on an injected "ic-bootstrap.tar" file. This script
-# is meant to be run as a prerequisite before launching nodemanager/replica.
+# is meant to be run as a prerequisite before launching orchestrator/replica.
 #
 # The configuration format is presently described here:
 # https://docs.google.com/document/d/1W2bDkq3xhNvQyWPIVSKpYuBzaa5d1QN-N4uiXByr2Qg/edit
@@ -17,6 +17,7 @@ set -eo pipefail
 # List all block devices marked as "removable".
 function find_removable_devices() {
     for DEV in $(ls -C /sys/class/block); do
+        echo "Consider device $DEV" >&2
         if [ -e /sys/class/block/"${DEV}"/removable ]; then
             local IS_REMOVABLE=$(cat /sys/class/block/"${DEV}"/removable)
             if [ "${IS_REMOVABLE}" == 1 ]; then
@@ -32,7 +33,7 @@ function find_removable_devices() {
                 fi
                 # Sanity check whether device is usable (it could be a
                 # CD drive with no medium in)
-                if blockdev "$TGT" >/dev/null 2>/dev/null; then
+                if blockdev "${TGT}"; then
                     echo "$TGT"
                 fi
             fi
@@ -58,32 +59,47 @@ function process_bootstrap() {
 
     # take injected config bits and move them to state directories
     if [ -e "${TMPDIR}/ic_crypto" ]; then
+        echo "Installing initial crypto material"
         cp -r -T "${TMPDIR}/ic_crypto" "${STATE_ROOT}/crypto"
     fi
     for DIR in ic_registry_local_store nns_public_key.pem; do
         if [ -e "${TMPDIR}/${DIR}" ]; then
+            echo "Setting up initial ${DIR}"
             cp -r -T "${TMPDIR}/${DIR}" "${STATE_ROOT}/data/${DIR}"
         fi
     done
 
-    # stash a couple of things away to config store
-    for FILE in journalbeat.conf network.conf nns.conf backup.conf; do
+    # stash the following configuration files to config store
+    # note: keep this list in sync with configurations supported in build-bootstrap-config-image.sh
+    for FILE in journalbeat.conf network.conf nns.conf backup.conf log.conf malicious_behavior.conf bitcoind_addr.conf; do
         if [ -e "${TMPDIR}/${FILE}" ]; then
+            echo "Setting up ${FILE}"
             cp "${TMPDIR}/${FILE}" "${CONFIG_ROOT}/${FILE}"
         fi
     done
     for DIR in accounts_ssh_authorized_keys; do
         if [ -e "${TMPDIR}/${DIR}" ]; then
+            echo "Setting up accounts_ssh_authorized_keys"
             cp -r "${TMPDIR}/${DIR}" "${CONFIG_ROOT}/${DIR}"
         fi
     done
 
     rm -rf "${TMPDIR}"
+
+    # Synchronize the above cached writes to persistent storage
+    # to make sure the system can boot successfully after a hard shutdown.
+    sync
 }
 
 MAX_TRIES=10
 
+if [ -f /boot/config/CONFIGURED ]; then
+    echo "Bootstrap completed already"
+    exit 0
+fi
+
 while [ ! -f /boot/config/CONFIGURED ]; do
+    echo "Locating removable device"
     DEV="$(find_removable_devices)"
 
     # Check whether we were provided with a removable device -- on "real"
@@ -93,12 +109,14 @@ while [ ! -f /boot/config/CONFIGURED ]; do
     # is there already -- this might be useful when operating this thing as a
     # docker container instead of full-blown VM.
     if [ "${DEV}" != "" ]; then
+        echo "Found removable device at ${DEV}"
         mount -t vfat -o ro "${DEV}" /mnt
     fi
 
     if [ -e /mnt/ic-bootstrap.tar ]; then
         echo "Processing bootstrap config"
         process_bootstrap /mnt/ic-bootstrap.tar /boot/config /var/lib/ic
+        echo "Successfully processed bootstrap config"
         touch /boot/config/CONFIGURED
     else
         MAX_TRIES=$(("${MAX_TRIES}" - 1))
@@ -118,11 +136,3 @@ while [ ! -f /boot/config/CONFIGURED ]; do
         umount /mnt
     fi
 done
-
-# HACK: This workaround configures Journalbeat in mainnet. Will be removed once
-#       applied to all guests.
-if [ ! -f /boot/config/journalbeat.conf ]; then
-    cat >/boot/config/journalbeat.conf <<EOF
-journalbeat_hosts=elasticsearch.mercury.dfinity.systems:443
-EOF
-fi

@@ -7,6 +7,7 @@ use crate::execution_environment::SUBNET_HEAP_DELTA_CAPACITY;
 use ic_base_types::NumBytes;
 use ic_registry_subnet_type::SubnetType;
 use ic_types::{Cycles, NumInstructions};
+use serde::{Deserialize, Serialize};
 
 const B: u64 = 1_000_000_000;
 const M: u64 = 1_000_000;
@@ -17,6 +18,17 @@ const M: u64 = 1_000_000;
 // Note that decreasing this value may break existing canisters that run
 // long messages.
 pub(crate) const MAX_INSTRUCTIONS_PER_MESSAGE: NumInstructions = NumInstructions::new(5 * B);
+
+// We assume 1 cycles unit ≅ 1 CPU cycle, so on a 2 GHz CPU it takes
+// at most 1ms to enter and exit the Wasm engine.
+const INSTRUCTION_OVERHEAD_PER_MESSAGE: NumInstructions = NumInstructions::new(2 * M);
+
+// Metrics show that finalization can take 13ms when there were 5000 canisters
+// in a subnet. This comes out to about 3us per canister which comes out to
+// 6_000 instructions based on the 1 cycles unit ≅ 1 CPU cycle, 2 GHz CPU
+// calculations. Round this up to 12_000 to be on the safe side.
+const INSTRUCTION_OVERHEAD_PER_CANISTER_FOR_FINALIZATION: NumInstructions =
+    NumInstructions::new(12_000);
 
 // If messages are short, then we expect about 2B=(7B - 5B) instructions to run
 // in a round in about 1 second. Short messages followed by one long message
@@ -63,6 +75,12 @@ pub const MAX_MESSAGE_DURATION_BEFORE_WARN_IN_SECONDS: f64 = 5.0;
 //    If you change this number please adjust other constants as well.
 const NUMBER_OF_EXECUTION_THREADS: usize = 4;
 
+/// Initial estimate of the an ECDSA signature fee is set to the maximum number
+/// of instructions in a round because it will take at least one round to
+/// generate the signature.
+/// TODO(EXC-1004): Change this value based on benchmarks.
+pub const ECDSA_SIGNATURE_FEE: Cycles = Cycles::new(7 * B as u128);
+
 /// The per subnet type configuration for the scheduler component
 #[derive(Clone)]
 pub struct SchedulerConfig {
@@ -77,6 +95,18 @@ pub struct SchedulerConfig {
     /// Maximum amount of instructions a single message's execution can consume.
     /// This should be significantly smaller than `max_instructions_per_round`.
     pub max_instructions_per_message: NumInstructions,
+
+    /// The overhead of entering and exiting the Wasm engine to execute a
+    /// message. The overhead is measured in instructions that are counted
+    /// towards the round limit.
+    pub instruction_overhead_per_message: NumInstructions,
+
+    /// The overhead (per canister) of running the finalization code at the end
+    /// of an iteration. This overhead is counted toward the round limit at the
+    /// end of each iteration. Since finalization is mostly looping over all
+    /// canisters, we estimate the cost per canister and multiply by the number
+    /// of active canisters to get the total overhead.
+    pub instruction_overhead_per_canister_for_finalization: NumInstructions,
 
     /// Maximum number of instructions an `install_code` message can consume.
     pub max_instructions_per_install_code: NumInstructions,
@@ -113,6 +143,12 @@ pub struct SchedulerConfig {
     /// then not run for several rounds until they are back under the allowed
     /// rate.
     pub heap_delta_rate_limit: NumBytes,
+
+    /// Denotes how many instructions each canister is allowed to execute in
+    /// install_code messages per round. Canisters may go over this limit in a
+    /// single round, but will then reject install_code messages for several
+    /// rounds until they are back under the allowed rate.
+    pub install_code_rate_limit: NumInstructions,
 }
 
 impl SchedulerConfig {
@@ -122,12 +158,16 @@ impl SchedulerConfig {
             subnet_heap_delta_capacity: SUBNET_HEAP_DELTA_CAPACITY,
             max_instructions_per_round: MAX_INSTRUCTIONS_PER_ROUND,
             max_instructions_per_message: MAX_INSTRUCTIONS_PER_MESSAGE,
+            instruction_overhead_per_message: INSTRUCTION_OVERHEAD_PER_MESSAGE,
+            instruction_overhead_per_canister_for_finalization:
+                INSTRUCTION_OVERHEAD_PER_CANISTER_FOR_FINALIZATION,
             max_instructions_per_install_code: MAX_INSTRUCTIONS_PER_INSTALL_CODE,
             max_heap_delta_per_iteration: MAX_HEAP_DELTA_PER_ITERATION,
             max_message_duration_before_warn_in_seconds:
                 MAX_MESSAGE_DURATION_BEFORE_WARN_IN_SECONDS,
             only_track_system_heartbeat_errors: true,
-            heap_delta_rate_limit: NumBytes::from(100 * 1024 * 1024),
+            heap_delta_rate_limit: NumBytes::from(75 * 1024 * 1024),
+            install_code_rate_limit: MAX_INSTRUCTIONS_PER_MESSAGE,
         }
     }
 
@@ -138,6 +178,9 @@ impl SchedulerConfig {
             subnet_heap_delta_capacity: SUBNET_HEAP_DELTA_CAPACITY,
             max_instructions_per_round: MAX_INSTRUCTIONS_PER_ROUND * SYSTEM_SUBNET_FACTOR,
             max_instructions_per_message: MAX_INSTRUCTIONS_PER_MESSAGE * SYSTEM_SUBNET_FACTOR,
+            instruction_overhead_per_message: INSTRUCTION_OVERHEAD_PER_MESSAGE,
+            instruction_overhead_per_canister_for_finalization:
+                INSTRUCTION_OVERHEAD_PER_CANISTER_FOR_FINALIZATION,
             max_instructions_per_install_code,
             max_heap_delta_per_iteration: MAX_HEAP_DELTA_PER_ITERATION * SYSTEM_SUBNET_FACTOR,
             max_message_duration_before_warn_in_seconds:
@@ -146,6 +189,9 @@ impl SchedulerConfig {
             // This limit should be high enough (1000T) to effectively disable
             // rate-limiting for the system subnets.
             heap_delta_rate_limit: NumBytes::from(1_000_000_000_000_000),
+            // This limit should be high enough (1000T) to effectively disable
+            // rate-limiting for the system subnets.
+            install_code_rate_limit: NumInstructions::from(1_000_000_000_000_000),
         }
     }
 
@@ -155,12 +201,16 @@ impl SchedulerConfig {
             subnet_heap_delta_capacity: SUBNET_HEAP_DELTA_CAPACITY,
             max_instructions_per_round: MAX_INSTRUCTIONS_PER_ROUND,
             max_instructions_per_message: MAX_INSTRUCTIONS_PER_MESSAGE,
+            instruction_overhead_per_message: INSTRUCTION_OVERHEAD_PER_MESSAGE,
+            instruction_overhead_per_canister_for_finalization:
+                INSTRUCTION_OVERHEAD_PER_CANISTER_FOR_FINALIZATION,
             max_instructions_per_install_code: MAX_INSTRUCTIONS_PER_INSTALL_CODE,
             max_heap_delta_per_iteration: MAX_HEAP_DELTA_PER_ITERATION,
             max_message_duration_before_warn_in_seconds:
                 MAX_MESSAGE_DURATION_BEFORE_WARN_IN_SECONDS,
             only_track_system_heartbeat_errors: true,
-            heap_delta_rate_limit: NumBytes::from(100 * 1024 * 1024),
+            heap_delta_rate_limit: NumBytes::from(75 * 1024 * 1024),
+            install_code_rate_limit: MAX_INSTRUCTIONS_PER_MESSAGE,
         }
     }
 
@@ -173,7 +223,7 @@ impl SchedulerConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CyclesAccountManagerConfig {
     /// Fee for creating canisters on a subnet
     pub canister_creation_fee: Cycles,
@@ -210,6 +260,9 @@ pub struct CyclesAccountManagerConfig {
 
     /// How often to charge canisters for memory and compute allocations.
     pub duration_between_allocation_charges: Duration,
+
+    /// Amount to charge for an ECDSA signature.
+    pub ecdsa_signature_fee: Cycles,
 }
 
 impl CyclesAccountManagerConfig {
@@ -234,6 +287,7 @@ impl CyclesAccountManagerConfig {
             // 4 SDR per GiB per year => 4e12 Cycles per year
             gib_storage_per_second_fee: Cycles::new(127_000),
             duration_between_allocation_charges: Duration::from_secs(10),
+            ecdsa_signature_fee: ECDSA_SIGNATURE_FEE,
         }
     }
 
@@ -250,6 +304,12 @@ impl CyclesAccountManagerConfig {
             ingress_byte_reception_fee: Cycles::new(0),
             gib_storage_per_second_fee: Cycles::new(0),
             duration_between_allocation_charges: Duration::from_secs(10),
+            /// The ECDSA signature fee is the fee charged when creating a
+            /// signature on this subnet. The request likely came from a
+            /// different subnet which is not a system subnet. There is an
+            /// explicit exception for requests originating from the NNS when the
+            /// charging occurs.
+            ecdsa_signature_fee: ECDSA_SIGNATURE_FEE,
         }
     }
 }

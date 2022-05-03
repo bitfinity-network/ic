@@ -4,7 +4,7 @@ use crate::crypto::CryptoHash;
 use bincode::{deserialize, serialize};
 use ic_protobuf::p2p::v1 as pb;
 use ic_protobuf::proxy::ProxyDecodeError;
-use ic_protobuf::registry::subnet::v1::GossipConfig;
+use ic_protobuf::registry::subnet::v1::{GossipAdvertConfig, GossipConfig};
 use serde::{Deserialize, Serialize};
 use std::convert::TryFrom;
 
@@ -12,8 +12,6 @@ use std::convert::TryFrom;
 /// in its artifact pool. The adverts of different artifact types may differ
 /// in their attributes. Upon the reception of an advert, a node can decide
 /// if and when to request the corresponding artifact from the sender.
-// TODO(P2P-481): `GossipAdvert` should not be exposed to clients as it is
-// internal to the gossip module.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct GossipAdvert {
     pub attribute: ArtifactAttribute,
@@ -62,6 +60,11 @@ pub const REGISTRY_POLL_PERIOD_MS: u32 = 3_000;
 /// Period for sending a retransmission request in milliseconds
 pub const RETRANSMISSION_REQUEST_MS: u32 = 60_000;
 
+/// Default value for best effort advert distribution.
+/// This will be changed to be a function of subnet size in a future
+/// change.
+pub const ADVERT_BEST_EFFORT_PERCENTAGE: u32 = 20;
+
 /// Helper function to build a gossip config using default values.
 pub fn build_default_gossip_config() -> GossipConfig {
     GossipConfig {
@@ -73,7 +76,9 @@ pub fn build_default_gossip_config() -> GossipConfig {
         pfn_evaluation_period_ms: PFN_EVALUATION_PERIOD_MS,
         registry_poll_period_ms: REGISTRY_POLL_PERIOD_MS,
         retransmission_request_ms: RETRANSMISSION_REQUEST_MS,
-        advert_config: None,
+        advert_config: Some(GossipAdvertConfig {
+            best_effort_percentage: ADVERT_BEST_EFFORT_PERCENTAGE,
+        }),
     }
 }
 

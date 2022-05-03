@@ -6,6 +6,10 @@ use crate::vault::api::{
     CspTlsSignError,
 };
 use ic_crypto_internal_threshold_sig_bls12381::api::ni_dkg_errors;
+use ic_crypto_internal_threshold_sig_ecdsa::{
+    CommitmentOpening, IDkgComplaintInternal, IDkgDealingInternal, IDkgTranscriptInternal,
+    IDkgTranscriptOperationInternal, MEGaPublicKey, ThresholdEcdsaSigShareInternal,
+};
 use ic_crypto_internal_types::encrypt::forward_secure::{
     CspFsEncryptionPop, CspFsEncryptionPublicKey,
 };
@@ -13,20 +17,23 @@ use ic_crypto_internal_types::sign::threshold_sig::ni_dkg::{
     CspNiDkgDealing, CspNiDkgTranscript, Epoch,
 };
 use ic_crypto_tls_interfaces::TlsPublicKeyCert;
+use ic_logger::ReplicaLogger;
 use ic_types::crypto::canister_threshold_sig::error::{
-    IDkgCreateDealingError, IDkgLoadTranscriptError,
+    IDkgCreateDealingError, IDkgLoadTranscriptError, IDkgOpenTranscriptError,
+    IDkgVerifyDealingPrivateError, ThresholdEcdsaSignShareError,
 };
+use ic_types::crypto::canister_threshold_sig::ExtendedDerivationPath;
 use ic_types::crypto::{AlgorithmId, KeyId};
-use ic_types::{NodeId, NodeIndex, NumberOfNodes};
+use ic_types::{NodeId, NodeIndex, NumberOfNodes, Randomness};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use tecdsa::{
-    IDkgComplaintInternal, IDkgDealingInternal, IDkgTranscriptInternal,
-    IDkgTranscriptOperationInternal, MEGaPublicKey,
-};
+use tokio::net::UnixListener;
 
 mod tarpc_csp_vault_client;
 mod tarpc_csp_vault_server;
+
+pub use tarpc_csp_vault_client::RemoteCspVault;
+pub use tarpc_csp_vault_server::TarpcCspVaultServerImpl;
 
 #[cfg(test)]
 mod tests;
@@ -135,6 +142,16 @@ pub trait TarpcCspVault {
         transcript_operation: IDkgTranscriptOperationInternal,
     ) -> Result<IDkgDealingInternal, IDkgCreateDealingError>;
 
+    // Corresponds to `IDkgProtocolCspVault.idkg_verify_dealing_private`
+    async fn idkg_verify_dealing_private(
+        algorithm_id: AlgorithmId,
+        dealing: IDkgDealingInternal,
+        dealer_index: NodeIndex,
+        receiver_index: NodeIndex,
+        receiver_key_id: KeyId,
+        context_data: Vec<u8>,
+    ) -> Result<(), IDkgVerifyDealingPrivateError>;
+
     // Corresponds to `IDkgProtocolCspVault.idkg_load_transcript`
     async fn idkg_load_transcript(
         dealings: BTreeMap<NodeIndex, IDkgDealingInternal>,
@@ -142,15 +159,49 @@ pub trait TarpcCspVault {
         receiver_index: NodeIndex,
         key_id: KeyId,
         transcript: IDkgTranscriptInternal,
-    ) -> Result<Vec<IDkgComplaintInternal>, IDkgLoadTranscriptError>;
+    ) -> Result<BTreeMap<NodeIndex, IDkgComplaintInternal>, IDkgLoadTranscriptError>;
+
+    // Corresponds to `IDkgProtocolCspVault.idkg_load_transcript_with_openings`
+    #[allow(clippy::too_many_arguments)]
+    async fn idkg_load_transcript_with_openings(
+        dealings: BTreeMap<NodeIndex, IDkgDealingInternal>,
+        openings: BTreeMap<NodeIndex, BTreeMap<NodeIndex, CommitmentOpening>>,
+        context_data: Vec<u8>,
+        receiver_index: NodeIndex,
+        key_id: KeyId,
+        transcript: IDkgTranscriptInternal,
+    ) -> Result<(), IDkgLoadTranscriptError>;
 
     // Corresponds to `IDkgProtocolCspVault.idkg_gen_mega_key_pair`
     async fn idkg_gen_mega_key_pair(
         algorithm_id: AlgorithmId,
     ) -> Result<MEGaPublicKey, CspCreateMEGaKeyError>;
+
+    // Corresponds to `IDkgProtocolCspVault.idkg_open_dealing`
+    async fn idkg_open_dealing(
+        dealing: IDkgDealingInternal,
+        dealer_index: NodeIndex,
+        context_data: Vec<u8>,
+        opener_index: NodeIndex,
+        opener_key_id: KeyId,
+    ) -> Result<CommitmentOpening, IDkgOpenTranscriptError>;
+
+    // Corresponds to `ThresholdEcdsaSignerCspVault.ecdsa_sign_share`
+    #[allow(clippy::too_many_arguments)]
+    async fn ecdsa_sign_share(
+        derivation_path: ExtendedDerivationPath,
+        hashed_message: Vec<u8>,
+        nonce: Randomness,
+        key: IDkgTranscriptInternal,
+        kappa_unmasked: IDkgTranscriptInternal,
+        lambda_masked: IDkgTranscriptInternal,
+        kappa_times_lambda: IDkgTranscriptInternal,
+        key_times_lambda: IDkgTranscriptInternal,
+        algorithm_id: AlgorithmId,
+    ) -> Result<ThresholdEcdsaSigShareInternal, ThresholdEcdsaSignShareError>;
 }
 
-pub async fn run_csp_vault_server(sks_dir: &Path, socket_path: &Path) {
-    let server = tarpc_csp_vault_server::TarpcCspVaultServerImpl::new(sks_dir, socket_path);
+pub async fn run_csp_vault_server(sks_dir: &Path, listener: UnixListener, logger: ReplicaLogger) {
+    let server = tarpc_csp_vault_server::TarpcCspVaultServerImpl::new(sks_dir, listener, logger);
     server.run().await
 }

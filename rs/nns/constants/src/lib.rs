@@ -1,11 +1,6 @@
-use std::str::FromStr;
-
-use lazy_static::lazy_static;
-
 use ic_base_types::{CanisterId, PrincipalId, SubnetId};
-
-#[cfg(target_arch = "x86_64")]
-pub mod ids;
+use lazy_static::lazy_static;
+use std::str::FromStr;
 
 // WARNING: The NNS canisters MUST be installed in the NNS subnet,
 // in the following order, otherwise they won't be able to find
@@ -31,12 +26,13 @@ pub const IDENTITY_CANISTER_INDEX_IN_NNS_SUBNET: u64 = 7;
 pub const NNS_UI_CANISTER_INDEX_IN_NNS_SUBNET: u64 = 8;
 
 /// The names of all expected .wasm files to set up the NNS.
-pub const NNS_CANISTER_WASMS: [&str; 9] = [
+pub const NNS_CANISTER_WASMS: [&str; 10] = [
     // The lifeline is not present! Because its wasm is embedded in the source code using
     // include_bytes, it is not provided on the path. We want to change that, though.
     "registry-canister",
     "governance-canister",
-    "ledger-canister",
+    "governance-canister_test",
+    "ledger-canister_notify-method",
     "root-canister",
     "cycles-minting-canister",
     // The lifeline is built differently, which explains why its wasm has a different name pattern.
@@ -53,7 +49,7 @@ lazy_static! {
     );
 }
 
-pub const NUM_NNS_CANISTERS: usize = NNS_CANISTER_WASMS.len();
+pub const NUM_NNS_CANISTERS: usize = ALL_NNS_CANISTER_IDS.len();
 
 pub const REGISTRY_CANISTER_ID: CanisterId =
     CanisterId::from_u64(REGISTRY_CANISTER_INDEX_IN_NNS_SUBNET);
@@ -108,4 +104,4 @@ pub fn memory_allocation_of(canister_id: CanisterId) -> u64 {
 }
 
 /// The whitelist of allowed node types
-pub const NODE_TYPES: &[&str] = &["default", "small", "storage_upgrade"];
+pub const NODE_TYPES: &[&str] = &["type0", "type1", "type2"];

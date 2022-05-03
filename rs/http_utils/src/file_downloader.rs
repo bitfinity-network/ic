@@ -108,8 +108,14 @@ impl FileDownloader {
             info!(logger, "Downloading file from: {}", url);
         }
         let response = self.http_get(url).await?;
+        if let Some(logger) = &self.logger {
+            info!(logger, "Request initiated");
+        }
         self.stream_response_body_to_file(response, file_path)
             .await?;
+        if let Some(logger) = &self.logger {
+            info!(logger, "Response read");
+        }
 
         if let Some(expected_hash) = expected_sha256_hex.as_ref() {
             check_file_hash(file_path, expected_hash)
@@ -124,10 +130,9 @@ impl FileDownloader {
             .parse::<Uri>()
             .map_err(|e| FileDownloadError::bad_url(url, e))?;
 
-        let response = self
-            .http_client
-            .get(url.clone())
+        let response = tokio::time::timeout(self.timeout, self.http_client.get(url.clone()))
             .await
+            .map_err(|_| FileDownloadError::TimeoutError)?
             .map_err(FileDownloadError::from)?;
 
         if response.status().is_success() {
@@ -206,7 +211,7 @@ pub fn extract_tar_gz_into_dir(tar_gz_path: &Path, target_dir: &Path) -> FileDow
 
 pub type FileDownloadResult<T> = Result<T, FileDownloadError>;
 
-/// Enumerates the possible errors that NodeManager may encounter
+/// Enumerates the possible errors that Orchestrator may encounter
 #[derive(Debug)]
 pub enum FileDownloadError {
     /// An IO error occurred

@@ -1,23 +1,19 @@
-use std::{
-    collections::{HashMap, HashSet},
-    path::PathBuf,
-    sync::Arc,
-};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use prost::Message;
 
 use candid::Encode;
 use canister_test::{Canister, Project, Wasm};
 use dfn_candid::candid_one;
-use ic_base_types::CanisterInstallMode;
 use ic_canister_client::Sender;
+use ic_ic00_types::CanisterInstallMode;
+use ic_nervous_system_common_test_keys::{
+    TEST_NEURON_2_OWNER_KEYPAIR, TEST_NEURON_2_OWNER_PRINCIPAL,
+};
 use ic_nns_common::{
     pb::v1::MethodAuthzInfo, types::NeuronId, types::UpdateIcpXdrConversionRatePayload,
 };
-use ic_nns_constants::{
-    ids::{TEST_NEURON_2_OWNER_KEYPAIR, TEST_NEURON_2_OWNER_PRINCIPAL},
-    GOVERNANCE_CANISTER_ID, LIFELINE_CANISTER_ID,
-};
+use ic_nns_constants::{GOVERNANCE_CANISTER_ID, LIFELINE_CANISTER_ID};
 use ic_nns_governance::pb::v1::{Governance as GovernanceProto, NnsFunction};
 use ic_nns_gtc::{
     der_encode,
@@ -283,6 +279,7 @@ fn get_nns_canister_wasm<'a>(
             wasm: Project::cargo_bin_maybe_use_path_relative_to_rs(
                 "rosetta-api/ledger_canister",
                 "ledger-canister",
+                &[],
             ),
             use_root: true,
             canister: &nns_canisters.ledger,
@@ -293,6 +290,7 @@ fn get_nns_canister_wasm<'a>(
             wasm: Project::cargo_bin_maybe_use_path_relative_to_rs(
                 "nns/gtc",
                 "genesis-token-canister",
+                &[],
             ),
             use_root: true,
             canister: &nns_canisters.genesis_token,
@@ -303,6 +301,7 @@ fn get_nns_canister_wasm<'a>(
             wasm: Project::cargo_bin_maybe_use_path_relative_to_rs(
                 "rosetta-api/cycles_minting_canister",
                 "cycles-minting-canister",
+                &[],
             ),
             use_root: true,
             canister: &nns_canisters.cycles_minting,
@@ -320,6 +319,7 @@ fn get_nns_canister_wasm<'a>(
             wasm: Project::cargo_bin_maybe_use_path_relative_to_rs(
                 "nns/governance",
                 "governance-canister",
+                &[],
             ),
             use_root: true,
             canister: &nns_canisters.governance,
@@ -330,6 +330,7 @@ fn get_nns_canister_wasm<'a>(
             wasm: Project::cargo_bin_maybe_use_path_relative_to_rs(
                 "nns/handlers/root",
                 "root-canister",
+                &[],
             ),
             use_root: false,
             canister: &nns_canisters.root,
@@ -340,6 +341,7 @@ fn get_nns_canister_wasm<'a>(
             wasm: Project::cargo_bin_maybe_use_path_relative_to_rs(
                 "registry/canister",
                 "registry-canister",
+                &[],
             ),
             use_root: true,
             canister: &nns_canisters.registry,
@@ -398,14 +400,11 @@ fn construct_init_state() -> NnsInitPayloads {
         (*TEST_NEURON_2_OWNER_PRINCIPAL).into(),
         Tokens::from_tokens(1000).unwrap(),
     );
-    nns_init_payload_builder.ledger = LedgerCanisterInitPayload::new(
-        GOVERNANCE_CANISTER_ID.into(),
-        ledger_init_state,
-        None,
-        None,
-        None,
-        HashSet::new(),
-    );
+    nns_init_payload_builder.ledger = LedgerCanisterInitPayload::builder()
+        .minting_account(GOVERNANCE_CANISTER_ID.into())
+        .initial_values(ledger_init_state)
+        .build()
+        .unwrap();
 
     nns_init_payload_builder
         .genesis_token

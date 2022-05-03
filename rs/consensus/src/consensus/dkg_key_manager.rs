@@ -103,8 +103,9 @@ impl DkgKeyManager {
         metrics_registry: MetricsRegistry,
         crypto: Arc<dyn ConsensusCrypto>,
         logger: ReplicaLogger,
+        pool_reader: &PoolReader<'_>,
     ) -> Self {
-        Self {
+        let mut manager = Self {
             crypto,
             metrics: Metrics::new(&metrics_registry),
             logger,
@@ -112,7 +113,13 @@ impl DkgKeyManager {
             last_cup_height: Default::default(),
             pending_transcript_loads: Default::default(),
             pending_key_removal: Default::default(),
-        }
+        };
+
+        // By calling on state change during initialization, we make sure, that the key store is
+        // initialized. Otherwise, other consensus methods would initially fail, and generate warnings.
+        manager.on_state_change(pool_reader);
+
+        manager
     }
 
     pub(crate) fn on_state_change(&mut self, pool_reader: &PoolReader<'_>) {
@@ -455,10 +462,10 @@ mod tests {
     use ic_metrics::MetricsRegistry;
     use ic_test_utilities::{
         crypto::CryptoReturningOk,
-        registry::SubnetRecordBuilder,
         types::ids::{node_test_id, subnet_test_id},
         with_test_replica_logger,
     };
+    use ic_test_utilities_registry::SubnetRecordBuilder;
 
     #[test]
     fn test_transcripts_get_loaded_and_retained() {
@@ -477,8 +484,12 @@ mod tests {
                     )],
                 );
                 let csp = Arc::new(CryptoReturningOk::default());
-                let mut key_manager =
-                    DkgKeyManager::new(MetricsRegistry::new(), csp.clone(), logger);
+                let mut key_manager = DkgKeyManager::new(
+                    MetricsRegistry::new(),
+                    csp.clone(),
+                    logger,
+                    &PoolReader::new(&pool),
+                );
 
                 // Emulate the first invocation of the dkg key manager and make sure all
                 // transcripts (exactly 2) were loaded from the genesis summary.

@@ -4,6 +4,7 @@ use crate::{
     crypto::threshold_sig::ni_dkg::NiDkgId,
     crypto::*,
     replica_version::ReplicaVersion,
+    signature::*,
     *,
 };
 use ic_protobuf::log::block_log_entry::v1::BlockLogEntry;
@@ -17,6 +18,7 @@ pub mod catchup;
 pub mod certification;
 pub mod dkg;
 pub mod ecdsa;
+mod ecdsa_refs;
 pub mod hashed;
 mod payload;
 pub mod thunk;
@@ -24,49 +26,6 @@ pub mod thunk;
 pub use catchup::*;
 use hashed::Hashed;
 pub use payload::{BlockPayload, DataPayload, Payload, SummaryPayload};
-
-/// BasicSignature captures basic signature on a value and the identity of the
-/// replica that signed it
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct BasicSignature<T> {
-    pub signature: BasicSigOf<T>,
-    pub signer: NodeId,
-}
-
-/// BasicSigned<T> captures a value of type T and a BasicSignature on it
-pub type BasicSigned<T> = Signed<T, BasicSignature<T>>;
-
-/// ThresholdSignature captures a threshold signature on a value and the
-/// DKG id of the threshold key material used to sign
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ThresholdSignature<T> {
-    pub signature: CombinedThresholdSigOf<T>,
-    pub signer: NiDkgId,
-}
-
-/// ThresholdSignatureShare captures a share of a threshold signature on a value
-/// and the identity of the replica that signed
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ThresholdSignatureShare<T> {
-    pub signature: ThresholdSigShareOf<T>,
-    pub signer: NodeId,
-}
-
-/// MultiSignature captures a cryptographic multi-signature, which is one
-/// message signed by multiple signers
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct MultiSignature<T> {
-    pub signature: CombinedMultiSigOf<T>,
-    pub signers: Vec<NodeId>,
-}
-
-/// MultiSignatureShare is a signature from one replica. Multiple shares can be
-/// aggregated into a MultiSignature.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct MultiSignatureShare<T> {
-    pub signature: IndividualMultiSigOf<T>,
-    pub signer: NodeId,
-}
 
 /// Abstract messages with height attribute
 pub trait HasHeight {
@@ -1220,23 +1179,37 @@ pub fn get_faults_tolerated(n: usize) -> usize {
 impl From<&Block> for pb::Block {
     fn from(block: &Block) -> Self {
         let payload: &BlockPayload = block.payload.as_ref();
-        let (dkg_payload, xnet_payload, ingress_payload, self_validating_payload) =
-            if payload.is_summary() {
-                (
-                    pb::DkgPayload::from(&payload.as_summary().dkg),
-                    None,
-                    None,
-                    None,
-                )
-            } else {
-                let batch = &payload.as_data().batch;
-                (
-                    pb::DkgPayload::from(&payload.as_data().dealings),
-                    Some(pb::XNetPayload::from(&batch.xnet)),
-                    Some(pb::IngressPayload::from(&batch.ingress)),
-                    Some(pb::SelfValidatingPayload::from(&batch.self_validating)),
-                )
-            };
+        let (
+            dkg_payload,
+            xnet_payload,
+            ingress_payload,
+            self_validating_payload,
+            canister_http_payload,
+            ecdsa_summary,
+        ) = if payload.is_summary() {
+            (
+                pb::DkgPayload::from(&payload.as_summary().dkg),
+                None,
+                None,
+                None,
+                None,
+                payload
+                    .as_summary()
+                    .ecdsa
+                    .as_ref()
+                    .map(|ecdsa| ecdsa.into()),
+            )
+        } else {
+            let batch = &payload.as_data().batch;
+            (
+                pb::DkgPayload::from(&payload.as_data().dealings),
+                Some(pb::XNetPayload::from(&batch.xnet)),
+                Some(pb::IngressPayload::from(&batch.ingress)),
+                Some(pb::SelfValidatingPayload::from(&batch.self_validating)),
+                Some(pb::CanisterHttpPayload::from(&batch.canister_http)),
+                None,
+            )
+        };
         Self {
             version: block.version.to_string(),
             parent: block.parent.clone().get().0,
@@ -1249,6 +1222,8 @@ impl From<&Block> for pb::Block {
             xnet_payload,
             ingress_payload,
             self_validating_payload,
+            canister_http_payload,
+            ecdsa_summary,
             payload_hash: block.payload.get_hash().clone().get().0,
         }
     }
@@ -1278,6 +1253,11 @@ impl TryFrom<pb::Block> for Block {
                 .map(crate::batch::SelfValidatingPayload::try_from)
                 .transpose()?
                 .unwrap_or_default(),
+            block
+                .canister_http_payload
+                .map(crate::batch::CanisterHttpPayload::try_from)
+                .transpose()?
+                .unwrap_or_default(),
         );
         let payload = match dkg_payload {
             dkg::Payload::Summary(summary) => {
@@ -1285,12 +1265,26 @@ impl TryFrom<pb::Block> for Block {
                     batch.is_empty(),
                     "Error: Summary block has non-empty batch payload."
                 );
+                // Convert the ECDSA summary and adjust the refs to point to
+                // the new summary height
+                let height = Height::from(block.height);
+                let ecdsa = block
+                    .ecdsa_summary
+                    .as_ref()
+                    .map(|ecdsa| (ecdsa, height).try_into())
+                    .transpose()?;
                 BlockPayload::Summary(SummaryPayload {
                     dkg: summary,
-                    ecdsa: ecdsa::Summary::default(),
+                    ecdsa,
                 })
             }
-            dkg::Payload::Dealings(dealings) => (batch, dealings).into(),
+            dkg::Payload::Dealings(dealings) => {
+                assert!(
+                    block.ecdsa_summary.is_none(),
+                    "Error: Payload block has ECDSA summary."
+                );
+                (batch, dealings, None).into()
+            }
         };
         Ok(Block {
             version: ReplicaVersion::try_from(block.version.as_str())

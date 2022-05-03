@@ -9,6 +9,25 @@
       when: manual
       allow_failure: true  # the pipeline continues running even if the manual job is not run
 
+.bazel-rules-child-pipeline:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE == "merge_train"'
+      when: never
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - '**/BUILD.bazel'
+        - '**/*.bzl'
+        - 'gitlab-ci/config/bazel/*'
+        - '.bazelrc'
+        - 'WORKSPACE.bazel'
+      when: always
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TITLE =~ /\[bazel\]/'
+      when: always
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: manual
+      allow_failure: true
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "run-all-master"'
+
 .cargo-rules-autorun-on-trigger:
   # References (anchors) do not work for 'rules' (yet), so we need to copy the `.cargo-rules`
   # https://docs.gitlab.com/ee/ci/yaml/#yaml-anchors-for-scripts
@@ -110,15 +129,15 @@
       # Allow failure needs to be set explicitly, despite what GitLab's documentation says.
       allow_failure: true
 
-# 1. If on the RC branch and "[hotfix]" is in the commit message, then allow manual execution of
-#    prod hourly and nightly tests.
+# 1. If on the RC branch and "hotfix" (case insensitive) is in the commit message,
+#    then allow manual execution of prod hourly and nightly tests.
 # 2. Otherwise, if on the RC branch then perform automatic execution of prod hourly and nightly
 #    tests.
 # 3. Otherwise, if on any other branch and "[hotfix]" is in the commit message, then allow manual
 #    execution of prod hourly and nightly tests.
 .rules-rollout-pipeline-auto:
   rules:
-    - if: '$CI_COMMIT_BRANCH =~ /^rc--/ && $CI_COMMIT_MESSAGE =~ /\[hotfix\]/ && $CI_PIPELINE_SOURCE != "trigger"'
+    - if: '$CI_COMMIT_BRANCH =~ /^rc--/ && $CI_COMMIT_MESSAGE =~ /hotfix/i && $CI_PIPELINE_SOURCE != "trigger"'
       when: manual
       allow_failure: true
     - if: '$CI_COMMIT_BRANCH =~ /^rc--/ && $CI_PIPELINE_SOURCE != "trigger"'
@@ -126,18 +145,33 @@
     - if: '$CI_MERGE_REQUEST_TITLE =~ /\[rc\]/'
       when: manual
       allow_failure: true
+    - if: '$CI_PIPELINE_SOURCE == "trigger"'
+      when: manual
+      allow_failure: true
 
-#  If on the RC branch, whether "[hotfix]" is in the commit message or not, 
+#  If on the RC branch, whether "hotfix" is in the commit message or not,
 #  always perfrom automatic execution of the prod hotfix tests. This means that, hotfix
 #  tests are not only exercised on hotfix pipelines, but are also exercised on nightly
 #  release qualification pipelines to ensure the hotfix tests are always working.
-.rules-prod-hotfix-tests:
+.rules-prod-hotfix-pipeline:
   rules:
+    - if: '$CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "trigger"'
+      when: manual
+      allow_failure: true  # the pipeline continues running even if the manual job is not run
     - if: '$CI_COMMIT_BRANCH =~ /^rc--/'
       when: always
-    - if: '$CI_MERGE_REQUEST_TITLE =~ /\[rc\]/'
+    - if: '$CI_MERGE_REQUEST_TITLE =~ /\[rc\]/ || $CI_MERGE_REQUEST_TITLE =~ /hotfix/i'
+      when: always
+
+.rules-prod-hotfix-tests:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "trigger"'
       when: manual
-      allow_failure: true
+      allow_failure: true  # the pipeline continues running even if the manual job is not run
+    - if: '$CD_ENV == $cd_target_env && $CI_COMMIT_BRANCH =~ /^rc--/'
+      when: always
+    - if: '$CD_ENV == $cd_target_env && ( $CI_MERGE_REQUEST_TITLE =~ /\[rc\]/ || $CI_MERGE_REQUEST_TITLE =~ /hotfix/i )'
+      when: always
 
 .rules-rollout-pipeline-run-on-trigger:
   rules:
@@ -145,21 +179,39 @@
       when: manual
       allow_failure: true  # the pipeline continues running even if the manual job is not run
 
+# Rule for triggering max capacity benchmarks
+.rules-benchmark-tests:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TITLE =~ /\[benchmark\]/'
+      when: manual
+      allow_failure: true
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "BENCHMARK_SUITE"'
+      when: always
+
+# Rule for triggering performance tests
+.rules-benchmark-spot-tests:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TITLE =~ /\[benchmark\]/'
+      when: manual
+      allow_failure: true
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_NAME == "BENCHMARK_NIGHTLY"'
+      when: always
+
 .rules-prod-tests:
   rules:
-    - if: '$CD_ENV == $cd_target_env && $CI_COMMIT_BRANCH =~ /^rc--/ && $CI_COMMIT_MESSAGE =~ /\[hotfix\]/'
+    - if: '$CD_ENV == $cd_target_env && $CI_COMMIT_BRANCH =~ /^rc--/ && $CI_COMMIT_MESSAGE =~ /hotfix/i'
       when: manual
       allow_failure: true
     - if: '$CD_ENV == $cd_target_env && $CI_MERGE_REQUEST_TITLE =~ /\[rc\]/'
       when: manual
       allow_failure: true
-    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - if: '$CI_PIPELINE_SOURCE == "web" && $CD_ENV != "BENCHMARK_SUITE"'
       when: manual
       allow_failure: true  # the pipeline continues running even if the manual job is not run
       # Run debug targets on the debug pipeline, when it is enabled (DEBUG_PIPELINE == 'true')
       # If this is not the DEBUG_PIPELINE, we must ignore '$cd_debug_target' so that it
       # gets included in any case.
-    - if: '$CD_ENV == $cd_target_env && ($DEBUG_PIPELINE != "true" || $cd_debug_target == "true")'
+    - if: '$CD_ENV == $cd_target_env && ($DEBUG_PIPELINE != "true" || $cd_debug_target == "true") && $CD_ENV != "BENCHMARK_SUITE"'
       when: always
 
 .rules-simple-prober:
@@ -186,12 +238,12 @@
       changes:
         - ic-os/generic-guestos/rootfs/Dockerfile.base
         - ic-os/guestos/rootfs/Dockerfile.base
+        - ic-os/guestos/rootfs/packages.common
+        - ic-os/guestos/rootfs/packages.dev
+        - ic-os/hostos/rootfs/Dockerfile.base
+        - ic-os/hostos/rootfs/packages.common
+        - ic-os/hostos/rootfs/packages.dev
 
-.rules-docker-build-all:
+.rules-service-worker-release:
   rules:
-    - if: '$CI_MERGE_REQUEST_TITLE =~ /\[lessci\]/'
-      when: never
-    - if: '$SCHEDULE_NAME == "run-all-master"'
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE != "merge_train"'
-      changes:
-        - gitlab-ci/**/*
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG =~ /^service-worker_v([0-9\.]+)$/'

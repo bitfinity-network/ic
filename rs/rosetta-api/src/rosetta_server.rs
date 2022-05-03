@@ -4,7 +4,7 @@ use actix_web::{get, post, web, App, HttpResponse, HttpServer};
 
 use crate::errors::ApiError;
 use crate::models::*;
-use crate::{ledger_client::LedgerAccess, RosettaRequestHandler};
+use crate::{errors, ledger_client::LedgerAccess, RosettaRequestHandler};
 
 use log::{debug, error, info};
 use prometheus::{
@@ -92,7 +92,7 @@ fn to_rosetta_response<S: serde::Serialize>(result: Result<S, ApiError>) -> Http
             }
         },
         Err(err) => {
-            let err = Error::from(&err);
+            let err = errors::convert_to_error(&err);
             match serde_json::to_string(&err) {
                 Ok(resp) => {
                     let err_code = format!("{}", err.code);
@@ -312,14 +312,14 @@ impl RosettaApiServer {
         expose_metrics: bool,
     ) -> std::io::Result<Self> {
         let stopped = Arc::new(AtomicBool::new(false));
-
         let server = HttpServer::new(move || {
             let app = App::new()
                 .data(
                     web::JsonConfig::default()
                         .limit(4 * 1024 * 1024)
-                        .error_handler(|e, _| {
-                            Error::from(ApiError::invalid_request(format!("{}", e))).into()
+                        .error_handler(move |e, _| {
+                            errors::convert_to_error(&ApiError::invalid_request(format!("{}", e)))
+                                .into()
                         }),
                 )
                 .data(req_handler.clone())
@@ -423,20 +423,10 @@ impl RosettaApiServer {
     }
 }
 
+#[derive(Default)]
 pub struct RosettaApiServerOpt {
     pub exit_on_sync: bool,
     pub offline: bool,
     pub mainnet: bool,
     pub not_whitelisted: bool,
-}
-
-impl Default for RosettaApiServerOpt {
-    fn default() -> RosettaApiServerOpt {
-        RosettaApiServerOpt {
-            exit_on_sync: false,
-            offline: false,
-            mainnet: false,
-            not_whitelisted: false,
-        }
-    }
 }

@@ -1,19 +1,29 @@
+use candid::CandidType;
 use canister_test::*;
 use dfn_candid::{candid, candid_one, CandidOne};
 use dfn_protobuf::protobuf;
+use ic_base_types::{CanisterId, PrincipalId};
 use ic_canister_client::Sender;
-use ic_types::{CanisterId, PrincipalId};
 use ledger_canister::{
-    AccountBalanceArgs, AccountIdentifier, ArchiveOptions, BinaryAccountBalanceArgs, Block,
-    BlockArg, BlockHeight, BlockRes, EncodedBlock, GetBlocksArgs, GetBlocksRes, IterBlocksArgs,
-    IterBlocksRes, LedgerCanisterInitPayload, Memo, NotifyCanisterArgs, Operation, SendArgs,
+    AccountBalanceArgs, AccountIdentifier, ArchiveOptions, Archives, BinaryAccountBalanceArgs,
+    Block, BlockArg, BlockHeight, BlockRange, BlockRes, CandidBlock, EncodedBlock, GetBlocksArgs,
+    GetBlocksError, GetBlocksRes, GetBlocksResult, IterBlocksArgs, IterBlocksRes,
+    LedgerCanisterInitPayload, Memo, NotifyCanisterArgs, Operation, QueryBlocksResponse, SendArgs,
     Subaccount, TimeStamp, Tokens, TotalSupplyArgs, Transaction, TransferArgs, TransferError,
-    MIN_BURN_AMOUNT, TRANSACTION_FEE,
+    TransferFee, TransferFeeArgs, DEFAULT_TRANSFER_FEE,
 };
 use on_wire::IntoWire;
+use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
 use std::time::{Duration, SystemTime};
+
+#[derive(CandidType, Deserialize)]
+struct TestQueryBlocksArgs {
+    ledger: PrincipalId,
+    arg: GetBlocksArgs,
+    result: Vec<CandidBlock>,
+}
 
 fn create_sender(i: u64) -> ic_canister_client::Sender {
     use rand_chacha::ChaChaRng;
@@ -31,7 +41,7 @@ fn example_block() -> Block {
         AccountIdentifier::new(CanisterId::from_u64(1).get(), None),
         AccountIdentifier::new(CanisterId::from_u64(2).get(), None),
         Tokens::new(10000, 50).unwrap(),
-        TRANSACTION_FEE,
+        DEFAULT_TRANSFER_FEE,
         Memo(456),
         TimeStamp::new(2_000_000_000, 123_456_789),
     );
@@ -98,6 +108,53 @@ async fn transfer_candid(
         .expect("transfer call trapped")
 }
 
+async fn get_blocks_pb(
+    archive: &Canister<'_>,
+    range: std::ops::Range<u64>,
+) -> Result<GetBlocksRes, String> {
+    archive
+        .query_(
+            "get_blocks_pb",
+            protobuf,
+            GetBlocksArgs {
+                start: range.start,
+                length: range.end.saturating_sub(range.start) as usize,
+            },
+        )
+        .await
+}
+
+async fn get_blocks_candid(archive: &Canister<'_>, range: std::ops::Range<u64>) -> GetBlocksResult {
+    archive
+        .query_(
+            "get_blocks",
+            candid_one,
+            GetBlocksArgs {
+                start: range.start,
+                length: range.end.saturating_sub(range.start) as usize,
+            },
+        )
+        .await
+        .expect("get_blocks call trapped")
+}
+
+async fn fetch_candid_interface(canister: &Canister<'_>) -> Result<String, String> {
+    canister
+        .query_("__get_candid_interface_tmp_hack", candid_one, ())
+        .await
+}
+
+async fn get_archives(canister: &Canister<'_>) -> Result<Archives, String> {
+    canister.query_("archives", candid_one, ()).await
+}
+
+fn assert_same_blocks(pb: &[EncodedBlock], candid: &[CandidBlock]) {
+    assert_eq!(pb.len(), candid.len());
+    for (pb_block, did_block) in pb.iter().zip(candid.iter()) {
+        assert_eq!(&CandidBlock::from(pb_block.decode().unwrap()), did_block);
+    }
+}
+
 fn make_accounts(num_accounts: u64, num_subaccounts: u8) -> HashMap<AccountIdentifier, Tokens> {
     (1..=num_accounts)
         .flat_map(|i| {
@@ -113,38 +170,43 @@ fn make_accounts(num_accounts: u64, num_subaccounts: u8) -> HashMap<AccountIdent
         .collect()
 }
 
+async fn install_motoko_proxy(r: &canister_test::Runtime) -> Canister<'_> {
+    let manifest_dir = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap())
+        .join("wasm/ledger_proxy.wasm");
+
+    canister_test::Wasm::from_file(manifest_dir)
+        .install_(r, CandidOne(()).into_bytes().unwrap())
+        .await
+        .expect("failed to install the ledger proxy canister")
+}
+
 #[test]
 fn upgrade_test() {
     local_test_e(|r| async move {
-        let proj = Project::new(env!("CARGO_MANIFEST_DIR"));
+        let proj = Project::new(std::env::var("CARGO_MANIFEST_DIR").unwrap());
 
         let accounts = make_accounts(5, 4);
 
         let mut ledger = proj
-            .cargo_bin("ledger-canister")
+            .cargo_bin("ledger-canister", &[])
             .install_(
                 &r,
-                CandidOne(LedgerCanisterInitPayload::new(
-                    CanisterId::from_u64(0).into(),
-                    accounts,
-                    None,
-                    None,
-                    None,
-                    HashSet::new(),
-                )),
+                CandidOne(
+                    LedgerCanisterInitPayload::builder()
+                        .minting_account(CanisterId::from_u64(0).into())
+                        .initial_values(accounts)
+                        .build()
+                        .unwrap(),
+                ),
             )
             .await?;
 
-        let GetBlocksRes(blocks_before) = ledger
-            .query_("get_blocks_pb", protobuf, GetBlocksArgs::new(0u64, 20usize))
-            .await?;
+        let GetBlocksRes(blocks_before) = get_blocks_pb(&ledger, 0..20).await?;
         let blocks_before = blocks_before.unwrap();
 
         ledger.upgrade_to_self_binary(Vec::new()).await?;
 
-        let GetBlocksRes(blocks_after) = ledger
-            .query_("get_blocks_pb", protobuf, GetBlocksArgs::new(0u64, 20usize))
-            .await?;
+        let GetBlocksRes(blocks_after) = get_blocks_pb(&ledger, 0..20).await?;
         let blocks_after = blocks_after.unwrap();
 
         assert_eq!(blocks_before, blocks_after);
@@ -155,7 +217,7 @@ fn upgrade_test() {
 #[test]
 fn archive_blocks_small_test() {
     local_test_e(|r| async move {
-        let proj = Project::new(env!("CARGO_MANIFEST_DIR"));
+        let proj = Project::new(std::env::var("CARGO_MANIFEST_DIR").unwrap());
 
         // 12 blocks
         let accounts = make_accounts(4, 3);
@@ -173,29 +235,31 @@ fn archive_blocks_small_test() {
         let max_message_size_bytes = 192;
         let node_max_memory_size_bytes =
             example_block().encode().unwrap().size_bytes() * blocks_per_archive_node;
-        let archive_options = Some(ArchiveOptions {
+        let archive_options = ArchiveOptions {
             trigger_threshold: 12,
             num_blocks_to_archive: 12,
             node_max_memory_size_bytes: Some(node_max_memory_size_bytes),
             max_message_size_bytes: Some(max_message_size_bytes),
             controller_id: CanisterId::from_u64(876),
-        });
+            cycles_for_archive_creation: Some(0),
+        };
 
         println!("[test] installing ledger canister");
         let minting_account = create_sender(0);
 
         let ledger: canister_test::Canister = {
-            let payload = LedgerCanisterInitPayload {
-                minting_account: CanisterId::try_from(minting_account.get_principal_id())
-                    .unwrap()
-                    .into(),
-                initial_values: accounts,
-                max_message_size_bytes: Some(max_message_size_bytes),
-                transaction_window: None,
-                archive_options,
-                send_whitelist: HashSet::new(),
-            };
-            let mut install = proj.cargo_bin("ledger-canister").install(&r);
+            let payload = LedgerCanisterInitPayload::builder()
+                .minting_account(
+                    CanisterId::try_from(minting_account.get_principal_id())
+                        .unwrap()
+                        .into(),
+                )
+                .initial_values(accounts)
+                .archive_options(archive_options)
+                .max_message_size_bytes(max_message_size_bytes)
+                .build()
+                .unwrap();
+            let mut install = proj.cargo_bin("ledger-canister", &[]).install(&r);
             install.memory_allocation = Some(128 * 1024 * 1024);
             install.bytes(CandidOne(payload).into_bytes()?).await?
         };
@@ -218,10 +282,8 @@ fn archive_blocks_small_test() {
         simple_send(&ledger, &create_sender(12345), &minting_account, 100, 0).await?;
 
         ledger_assert_num_blocks(&ledger, 1).await;
-        let GetBlocksRes(ledger_blocks) = ledger
-            .query_("get_blocks_pb", protobuf, GetBlocksArgs::new(12u64, 1usize))
-            .await?;
-        assert_eq!(ledger_blocks.unwrap().len(), 1);
+        let GetBlocksRes(ledger_blocks) = get_blocks_pb(&ledger, 12..13).await?;
+        assert_eq!(ledger_blocks.as_ref().unwrap().len(), 1);
 
         // First we get the CanisterId of each archive node that has been
         // created
@@ -236,6 +298,12 @@ fn archive_blocks_small_test() {
         for n in nodes {
             println!("[test] retrieving blocks from {}. calling iter_blocks()", n);
             let node = Canister::new(&r, n);
+
+            assert_eq!(
+                fetch_candid_interface(&node).await.unwrap(),
+                include_str!("../ledger_archive.did")
+            );
+
             let IterBlocksRes(mut blocks) = node
                 .query_(
                     "iter_blocks_pb",
@@ -257,6 +325,32 @@ fn archive_blocks_small_test() {
         // Finally check that we retrieved what we have expected
         assert_eq!(blocks_from_archive, blocks);
 
+        // Fetch all blocks through the Motoko proxy canister.
+        let all_blocks: Vec<_> = blocks
+            .into_iter()
+            .chain(ledger_blocks.unwrap().into_iter())
+            .collect();
+
+        let proxy = install_motoko_proxy(&r).await;
+        let () = proxy
+            .update_(
+                "testQueryBlocks",
+                candid_one,
+                TestQueryBlocksArgs {
+                    ledger: ledger.canister_id().into(),
+                    arg: GetBlocksArgs {
+                        start: 0,
+                        length: all_blocks.len(),
+                    },
+                    result: all_blocks
+                        .iter()
+                        .map(|eb| CandidBlock::from(eb.decode().unwrap()))
+                        .collect(),
+                },
+            )
+            .await
+            .expect("ledger proxy call failed");
+
         Ok(())
     })
 }
@@ -264,7 +358,7 @@ fn archive_blocks_small_test() {
 #[test]
 fn archive_blocks_large_test() {
     local_test_e(|r| async move {
-        let proj = Project::new(env!("CARGO_MANIFEST_DIR"));
+        let proj = Project::new(std::env::var("CARGO_MANIFEST_DIR").unwrap());
 
         // 4096 blocks
         let accounts = make_accounts(64, 64);
@@ -275,29 +369,31 @@ fn archive_blocks_large_test() {
         let max_message_size_bytes: usize = 1024 * 1024;
         let node_max_memory_size_bytes: usize =
             example_block().encode().unwrap().size_bytes() * blocks_per_archive_node;
-        let archive_options = Some(ArchiveOptions {
+        let archive_options = ArchiveOptions {
             trigger_threshold: 64 * 64,
             num_blocks_to_archive: 64 * 64,
             node_max_memory_size_bytes: Some(node_max_memory_size_bytes),
             max_message_size_bytes: Some(max_message_size_bytes),
             controller_id: CanisterId::from_u64(876),
-        });
+            cycles_for_archive_creation: Some(0),
+        };
 
         println!("[test] installing ledger canister");
         let minting_account = create_sender(0);
 
         let ledger: canister_test::Canister = {
-            let payload = LedgerCanisterInitPayload {
-                minting_account: CanisterId::try_from(minting_account.get_principal_id())
-                    .unwrap()
-                    .into(),
-                initial_values: accounts,
-                max_message_size_bytes: Some(max_message_size_bytes),
-                transaction_window: None,
-                archive_options,
-                send_whitelist: HashSet::new(),
-            };
-            let mut install = proj.cargo_bin("ledger-canister").install(&r);
+            let payload = LedgerCanisterInitPayload::builder()
+                .minting_account(
+                    CanisterId::try_from(minting_account.get_principal_id())
+                        .unwrap()
+                        .into(),
+                )
+                .initial_values(accounts)
+                .archive_options(archive_options)
+                .max_message_size_bytes(max_message_size_bytes)
+                .build()
+                .unwrap();
+            let mut install = proj.cargo_bin("ledger-canister", &[]).install(&r);
             install.memory_allocation = Some(128 * 1024 * 1024);
             install.bytes(CandidOne(payload).into_bytes()?).await?
         };
@@ -308,7 +404,7 @@ fn archive_blocks_large_test() {
         let blocks = {
             let mut blocks = vec![];
             // Need to make multiple queries due to query message size limit
-            let blocks_per_query: usize = 8192;
+            let blocks_per_query: usize = 2000;
             for i in 0usize..(blocks_per_archive_node / blocks_per_query) - 1 {
                 let offset = i * blocks_per_query;
                 println!(
@@ -354,7 +450,7 @@ fn archive_blocks_large_test() {
             let mut blocks = {
                 let mut blocks = vec![];
                 // Need to make multiple queries due to query message size limit
-                let blocks_per_query: usize = 8192;
+                let blocks_per_query: usize = 2000;
                 for i in 0usize..blocks_per_archive_node / blocks_per_query {
                     let offset = i * blocks_per_query;
                     println!(
@@ -390,9 +486,65 @@ fn archive_blocks_large_test() {
 }
 
 #[test]
+fn query_blocks_certificate() {
+    local_test_e(|r| async move {
+        let proj = Project::new(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+
+        let accounts = make_accounts(4, 3);
+        println!("[test] accounts: {:?}", accounts);
+
+        println!("[test] installing ledger canister");
+        let minting_account = create_sender(0);
+
+        let ledger: canister_test::Canister = {
+            let payload = LedgerCanisterInitPayload::builder()
+                .minting_account(
+                    CanisterId::try_from(minting_account.get_principal_id())
+                        .unwrap()
+                        .into(),
+                )
+                .initial_values(accounts)
+                .build()
+                .unwrap();
+            let mut install = proj.cargo_bin("ledger-canister", &[]).install(&r);
+            install.memory_allocation = Some(128 * 1024 * 1024);
+            install.bytes(CandidOne(payload).into_bytes()?).await?
+        };
+        println!("[test] ledger canister id: {}", ledger.canister_id());
+
+        let result: QueryBlocksResponse = ledger
+            .query_(
+                "query_blocks",
+                candid_one,
+                GetBlocksArgs {
+                    start: 0,
+                    length: 1,
+                },
+            )
+            .await
+            .expect("failed to query blocks");
+        assert!(result.certificate.is_some());
+
+        let result: QueryBlocksResponse = ledger
+            .query_(
+                "query_blocks",
+                candid_one,
+                GetBlocksArgs {
+                    start: 0,
+                    length: 100,
+                },
+            )
+            .await
+            .expect("failed to query blocks");
+        assert!(result.certificate.is_some());
+        Ok(())
+    })
+}
+
+#[test]
 fn notify_timeout_test() {
     local_test_e(|r| async move {
-        let proj = Project::new(env!("CARGO_MANIFEST_DIR"));
+        let proj = Project::new(std::env::var("CARGO_MANIFEST_DIR").unwrap());
         let mut accounts = HashMap::new();
         let sender = create_sender(100);
         accounts.insert(
@@ -401,7 +553,7 @@ fn notify_timeout_test() {
         );
 
         let test_canister = proj
-            .cargo_bin("test-notified")
+            .cargo_bin("test-notified", &[])
             .install_(&r, Vec::new())
             .await?;
 
@@ -411,20 +563,23 @@ fn notify_timeout_test() {
         send_whitelist.insert(test_canister.canister_id());
 
         let ledger_canister = proj
-            .cargo_bin("ledger-canister")
+            .cargo_bin("ledger-canister", &["notify-method"])
             .install_(
                 &r,
-                CandidOne(LedgerCanisterInitPayload {
-                    minting_account: CanisterId::try_from(minting_account.get_principal_id())
-                        .unwrap()
-                        .into(),
-                    initial_values: accounts,
-                    max_message_size_bytes: None,
-                    // A tiny notification window so notifications will fail
-                    transaction_window: Some(Duration::from_millis(1)),
-                    archive_options: None,
-                    send_whitelist,
-                }),
+                CandidOne(
+                    LedgerCanisterInitPayload::builder()
+                        .minting_account(
+                            CanisterId::try_from(minting_account.get_principal_id())
+                                .unwrap()
+                                .into(),
+                        )
+                        .initial_values(accounts)
+                        // A tiny notification window so notifications will fail
+                        .transaction_window(Duration::from_millis(1))
+                        .send_whitelist(send_whitelist)
+                        .build()
+                        .unwrap(),
+                ),
             )
             .await?;
 
@@ -436,7 +591,7 @@ fn notify_timeout_test() {
                     from_subaccount: None,
                     to: test_canister.canister_id().into(),
                     amount: Tokens::from_tokens(1).unwrap(),
-                    fee: TRANSACTION_FEE,
+                    fee: DEFAULT_TRANSFER_FEE,
                     memo: Memo(0),
                     created_at_time: None,
                 },
@@ -446,7 +601,7 @@ fn notify_timeout_test() {
 
         let notify = NotifyCanisterArgs {
             block_height,
-            max_fee: TRANSACTION_FEE,
+            max_fee: DEFAULT_TRANSFER_FEE,
             from_subaccount: None,
             to_canister: test_canister.canister_id(),
             to_subaccount: None,
@@ -457,8 +612,9 @@ fn notify_timeout_test() {
             .await;
 
         assert!(
-            r1.unwrap_err().contains("that is more than"),
-            "Cannot notify after duration"
+            r1.as_ref().unwrap_err().contains("that is more than"),
+            "Notifying after duration should return an error containing \"that is more than\". Instead got {:?}",
+            r1
         );
 
         Ok(())
@@ -468,7 +624,7 @@ fn notify_timeout_test() {
 #[test]
 fn notify_test() {
     local_test_e(|r| async move {
-        let proj = Project::new(env!("CARGO_MANIFEST_DIR"));
+        let proj = Project::new(std::env::var("CARGO_MANIFEST_DIR").unwrap());
         let mut accounts = HashMap::new();
         let sender = create_sender(100);
         accounts.insert(
@@ -477,12 +633,12 @@ fn notify_test() {
         );
 
         let test_canister = proj
-            .cargo_bin("test-notified")
+            .cargo_bin("test-notified", &[])
             .install_(&r, Vec::new())
             .await?;
 
         let test_canister_2 = proj
-            .cargo_bin("test-notified")
+            .cargo_bin("test-notified", &[])
             .install_(&r, Vec::new())
             .await?;
 
@@ -504,28 +660,33 @@ fn notify_test() {
             )
         };
 
-        let archive_options = Some(ArchiveOptions {
+        let archive_options = ArchiveOptions {
             node_max_memory_size_bytes: Some(node_max_memory_size_bytes),
             max_message_size_bytes: Some(max_message_size_bytes),
             controller_id: CanisterId::from_u64(876),
             trigger_threshold: 8,
             num_blocks_to_archive: 3,
-        });
+            cycles_for_archive_creation: Some(0),
+        };
 
         let ledger_canister = proj
-            .cargo_bin("ledger-canister")
+            .cargo_bin("ledger-canister", &["notify-method"])
             .install_(
                 &r,
-                CandidOne(LedgerCanisterInitPayload {
-                    minting_account: CanisterId::try_from(minting_account.get_principal_id())
-                        .unwrap()
-                        .into(),
-                    initial_values: accounts,
-                    max_message_size_bytes: Some(max_message_size_bytes),
-                    transaction_window: None,
-                    archive_options,
-                    send_whitelist,
-                }),
+                CandidOne(
+                    LedgerCanisterInitPayload::builder()
+                        .minting_account(
+                            CanisterId::try_from(minting_account.get_principal_id())
+                                .unwrap()
+                                .into(),
+                        )
+                        .initial_values(accounts)
+                        .archive_options(archive_options)
+                        .max_message_size_bytes(max_message_size_bytes)
+                        .send_whitelist(send_whitelist)
+                        .build()
+                        .unwrap(),
+                ),
             )
             .await?;
 
@@ -537,7 +698,7 @@ fn notify_test() {
                     from_subaccount: None,
                     to: test_canister.canister_id().into(),
                     amount: Tokens::from_tokens(1).unwrap(),
-                    fee: TRANSACTION_FEE,
+                    fee: DEFAULT_TRANSFER_FEE,
                     memo: Memo(0),
                     created_at_time: None,
                 },
@@ -554,7 +715,7 @@ fn notify_test() {
                         from_subaccount: None,
                         to: test_canister.canister_id().into(),
                         amount: Tokens::from_e8s(1),
-                        fee: TRANSACTION_FEE,
+                        fee: DEFAULT_TRANSFER_FEE,
                         memo: Memo(i),
                         created_at_time: None,
                     },
@@ -565,7 +726,7 @@ fn notify_test() {
 
         let notify = NotifyCanisterArgs {
             block_height,
-            max_fee: TRANSACTION_FEE,
+            max_fee: DEFAULT_TRANSFER_FEE,
             from_subaccount: None,
             to_canister: test_canister.canister_id(),
             to_subaccount: None,
@@ -612,7 +773,7 @@ fn notify_test() {
                     from_subaccount: None,
                     to: test_canister_2.canister_id().into(),
                     amount: Tokens::from_tokens(1).unwrap(),
-                    fee: TRANSACTION_FEE,
+                    fee: DEFAULT_TRANSFER_FEE,
                     memo: Memo(0),
                     created_at_time: None,
                 },
@@ -622,7 +783,7 @@ fn notify_test() {
 
         let notify_not_whitelisted = NotifyCanisterArgs {
             block_height,
-            max_fee: TRANSACTION_FEE,
+            max_fee: DEFAULT_TRANSFER_FEE,
             from_subaccount: None,
             to_canister: test_canister_2.canister_id(),
             to_subaccount: None,
@@ -641,9 +802,136 @@ fn notify_test() {
 }
 
 #[test]
+fn notify_disabled_test() {
+    local_test_e(|r| async move {
+        let proj = Project::new(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+        let mut accounts = HashMap::new();
+        let sender = create_sender(100);
+        accounts.insert(
+            sender.get_principal_id().into(),
+            Tokens::from_tokens(100).unwrap(),
+        );
+
+        let test_canister = proj
+            .cargo_bin("test-notified", &[])
+            .install_(&r, Vec::new())
+            .await?;
+
+        let minting_account = create_sender(0);
+
+        let mut send_whitelist = HashSet::new();
+        send_whitelist.insert(test_canister.canister_id());
+
+        let (node_max_memory_size_bytes, max_message_size_bytes): (usize, usize) = {
+            let blocks_per_archive_node = 8;
+
+            let blocks_per_archive_call = 3;
+
+            let e = example_block().encode().unwrap();
+            println!("[test] encoded block size: {}", e.size_bytes());
+            (
+                e.size_bytes() * blocks_per_archive_node,
+                e.size_bytes() * blocks_per_archive_call,
+            )
+        };
+
+        let archive_options = ArchiveOptions {
+            node_max_memory_size_bytes: Some(node_max_memory_size_bytes),
+            max_message_size_bytes: Some(max_message_size_bytes),
+            controller_id: CanisterId::from_u64(876),
+            trigger_threshold: 8,
+            num_blocks_to_archive: 3,
+            cycles_for_archive_creation: Some(0),
+        };
+
+        let ledger_canister = proj
+            .cargo_bin("ledger-canister", &[])
+            .install_(
+                &r,
+                CandidOne(
+                    LedgerCanisterInitPayload::builder()
+                        .minting_account(
+                            CanisterId::try_from(minting_account.get_principal_id())
+                                .unwrap()
+                                .into(),
+                        )
+                        .initial_values(accounts)
+                        .archive_options(archive_options)
+                        .max_message_size_bytes(max_message_size_bytes)
+                        .send_whitelist(send_whitelist)
+                        .build()
+                        .unwrap(),
+                ),
+            )
+            .await?;
+
+        let block_height: BlockHeight = ledger_canister
+            .update_from_sender(
+                "send_pb",
+                protobuf,
+                SendArgs {
+                    from_subaccount: None,
+                    to: test_canister.canister_id().into(),
+                    amount: Tokens::from_tokens(1).unwrap(),
+                    fee: DEFAULT_TRANSFER_FEE,
+                    memo: Memo(0),
+                    created_at_time: None,
+                },
+                &sender,
+            )
+            .await?;
+
+        for i in 1..10 {
+            let _: BlockHeight = ledger_canister
+                .update_from_sender(
+                    "send_pb",
+                    protobuf,
+                    SendArgs {
+                        from_subaccount: None,
+                        to: test_canister.canister_id().into(),
+                        amount: Tokens::from_e8s(1),
+                        fee: DEFAULT_TRANSFER_FEE,
+                        memo: Memo(i),
+                        created_at_time: None,
+                    },
+                    &sender,
+                )
+                .await?;
+        }
+
+        let notify = NotifyCanisterArgs {
+            block_height,
+            max_fee: DEFAULT_TRANSFER_FEE,
+            from_subaccount: None,
+            to_canister: test_canister.canister_id(),
+            to_subaccount: None,
+        };
+
+        let r1: Result<(), String> = ledger_canister
+            .update_from_sender("notify_pb", protobuf, notify.clone(), &sender)
+            .await;
+
+        let r2: Result<(), String> = ledger_canister
+            .update_from_sender("notify_dfx", candid_one, notify.clone(), &sender)
+            .await;
+
+        for r in &[r1, r2] {
+            assert!(
+                r.as_ref().map_err(|e| e.contains("has no update method 'notify"))
+                    .err().unwrap_or(false),
+                "Calling notify_* when notify-method feature is not set should result in an error containing the string has no update method 'notify. Result was: {:?}",
+                r
+            );
+        }
+
+        Ok(())
+    });
+}
+
+#[test]
 fn sub_account_test() {
     local_test_e(|r| async move {
-        let proj = Project::new(env!("CARGO_MANIFEST_DIR"));
+        let proj = Project::new(std::env::var("CARGO_MANIFEST_DIR").unwrap());
 
         let mut initial_values = HashMap::new();
 
@@ -659,17 +947,17 @@ fn sub_account_test() {
         let mut send_whitelist = HashSet::new();
         send_whitelist.insert(CanisterId::new(sender.get_principal_id()).unwrap());
         let ledger_canister = proj
-            .cargo_bin("ledger-canister")
+            .cargo_bin("ledger-canister", &[])
             .install_(
                 &r,
-                CandidOne(LedgerCanisterInitPayload::new(
-                    CanisterId::from_u64(0).into(),
-                    initial_values,
-                    None,
-                    None,
-                    None,
-                    send_whitelist,
-                )),
+                CandidOne(
+                    LedgerCanisterInitPayload::builder()
+                        .minting_account(CanisterId::from_u64(0).into())
+                        .initial_values(initial_values)
+                        .send_whitelist(send_whitelist)
+                        .build()
+                        .unwrap(),
+                ),
             )
             .await?;
 
@@ -682,7 +970,7 @@ fn sub_account_test() {
                     from_subaccount,
                     to: AccountIdentifier::new(sender.get_principal_id(), sub_account(2)),
                     amount: Tokens::from_tokens(1).unwrap(),
-                    fee: TRANSACTION_FEE,
+                    fee: DEFAULT_TRANSFER_FEE,
                     memo: Memo(0),
                     created_at_time: None,
                 },
@@ -731,7 +1019,7 @@ fn sub_account_test() {
 #[should_panic(expected = "Sending from 2vxsx-fae is not allowed")]
 fn check_anonymous_cannot_send() {
     local_test_e(|r| async move {
-        let proj = Project::new(env!("CARGO_MANIFEST_DIR"));
+        let proj = Project::new(std::env::var("CARGO_MANIFEST_DIR").unwrap());
         let sub_account = |x| Some(Subaccount([x; 32]));
         // The principal ID of the test runner
         let us = PrincipalId::new_anonymous();
@@ -742,17 +1030,16 @@ fn check_anonymous_cannot_send() {
         );
 
         let ledger_canister = proj
-            .cargo_bin("ledger-canister")
+            .cargo_bin("ledger-canister", &[])
             .install_(
                 &r,
-                CandidOne(LedgerCanisterInitPayload::new(
-                    CanisterId::from_u64(0).into(),
-                    initial_values,
-                    None,
-                    None,
-                    None,
-                    HashSet::new(),
-                )),
+                CandidOne(
+                    LedgerCanisterInitPayload::builder()
+                        .minting_account(CanisterId::from_u64(0).into())
+                        .initial_values(initial_values)
+                        .build()
+                        .unwrap(),
+                ),
             )
             .await?;
 
@@ -765,7 +1052,7 @@ fn check_anonymous_cannot_send() {
                     from_subaccount: sub_account(1),
                     to: AccountIdentifier::new(us, sub_account(2)),
                     amount: Tokens::from_tokens(1).unwrap(),
-                    fee: TRANSACTION_FEE,
+                    fee: DEFAULT_TRANSFER_FEE,
                     memo: Memo(0),
                     created_at_time: None,
                 },
@@ -776,17 +1063,46 @@ fn check_anonymous_cannot_send() {
 }
 
 #[test]
+fn transfer_fee_test() {
+    local_test_e(|r| async move {
+        let transfer_fee = Tokens::from_e8s(123);
+
+        let ledger = Project::new(env!("CARGO_MANIFEST_DIR"))
+            .cargo_bin("ledger-canister", &[])
+            .install_(
+                &r,
+                CandidOne(
+                    LedgerCanisterInitPayload::builder()
+                        .minting_account(PrincipalId::new_user_test_id(0).into())
+                        .transfer_fee(transfer_fee)
+                        .build()
+                        .unwrap(),
+                ),
+            )
+            .await?;
+
+        let res: TransferFee = ledger
+            .query_("transfer_fee", candid_one, TransferFeeArgs {})
+            .await?;
+
+        assert_eq!(TransferFee { transfer_fee }, res);
+
+        Ok(())
+    })
+}
+
+#[test]
 fn transaction_test() {
     local_test_e(|r| async move {
-        let proj = Project::new(env!("CARGO_MANIFEST_DIR"));
+        let proj = Project::new(std::env::var("CARGO_MANIFEST_DIR").unwrap());
 
         let minting_account = create_sender(0);
         let acc1 = create_sender(1);
         let acc2 = create_sender(2);
 
         // Amount is the send amount + the fee + the amount we burn
-        let acc1_start_amount = 500 + TRANSACTION_FEE.get_e8s();
-        let acc2_start_amount = MIN_BURN_AMOUNT.get_e8s();
+        let acc1_start_amount = 500 + DEFAULT_TRANSFER_FEE.get_e8s();
+        let acc2_start_amount = DEFAULT_TRANSFER_FEE.get_e8s();
 
         let mut accounts = HashMap::new();
         accounts.insert(
@@ -799,19 +1115,20 @@ fn transaction_test() {
         );
 
         let ledger = proj
-            .cargo_bin("ledger-canister")
+            .cargo_bin("ledger-canister", &[])
             .install_(
                 &r,
-                CandidOne(LedgerCanisterInitPayload::new(
-                    CanisterId::try_from(minting_account.get_principal_id())
-                        .unwrap()
-                        .into(),
-                    accounts,
-                    None,
-                    None,
-                    None,
-                    HashSet::new(),
-                )),
+                CandidOne(
+                    LedgerCanisterInitPayload::builder()
+                        .minting_account(
+                            CanisterId::try_from(minting_account.get_principal_id())
+                                .unwrap()
+                                .into(),
+                        )
+                        .initial_values(accounts)
+                        .build()
+                        .unwrap(),
+                ),
             )
             .await?;
 
@@ -843,7 +1160,7 @@ fn transaction_test() {
 
         // perform a send
         let send_amount = 500;
-        let send_fee = TRANSACTION_FEE.get_e8s();
+        let send_fee = DEFAULT_TRANSFER_FEE.get_e8s();
         simple_send(&ledger, &acc2, &acc1, send_amount, send_fee).await?;
 
         let acc1_balance = query_balance(&ledger, &acc1).await?;
@@ -856,7 +1173,7 @@ fn transaction_test() {
         assert_eq!(acc2_balance.get_e8s(), acc2_start_amount + send_amount);
 
         // perform a burn
-        let burn_amount = MIN_BURN_AMOUNT.get_e8s();
+        let burn_amount = DEFAULT_TRANSFER_FEE.get_e8s();
         simple_send(&ledger, &minting_account, &acc2, burn_amount, 0).await?;
 
         let acc2_balance = query_balance(&ledger, &acc2).await?;
@@ -954,7 +1271,7 @@ fn transaction_test() {
 #[test]
 fn get_block_test() {
     local_test_e(|r| async move {
-        let proj = Project::new(env!("CARGO_MANIFEST_DIR"));
+        let proj = Project::new(std::env::var("CARGO_MANIFEST_DIR").unwrap());
 
         // For printing and comparing blocks since they're now hidden behind a
         // trait
@@ -986,6 +1303,7 @@ fn get_block_test() {
             node_max_memory_size_bytes: Some(node_max_memory_size_bytes),
             max_message_size_bytes: Some(max_message_size_bytes),
             controller_id: CanisterId::from_u64(876),
+            cycles_for_archive_creation: Some(0),
         };
 
         println!(
@@ -993,17 +1311,18 @@ fn get_block_test() {
             accounts.len()
         );
         let ledger: canister_test::Canister = {
-            let payload = LedgerCanisterInitPayload::new(
-                CanisterId::try_from(minting_account.get_principal_id())
-                    .unwrap()
-                    .into(),
-                accounts,
-                Some(archive_init_args),
-                Some(max_message_size_bytes),
-                None,
-                HashSet::new(),
-            );
-            let mut install = proj.cargo_bin("ledger-canister").install(&r);
+            let payload = LedgerCanisterInitPayload::builder()
+                .minting_account(
+                    CanisterId::try_from(minting_account.get_principal_id())
+                        .unwrap()
+                        .into(),
+                )
+                .initial_values(accounts)
+                .archive_options(archive_init_args)
+                .max_message_size_bytes(max_message_size_bytes)
+                .build()
+                .unwrap();
+            let mut install = proj.cargo_bin("ledger-canister", &[]).install(&r);
             install.memory_allocation = Some(128 * 1024 * 1024);
             install.bytes(CandidOne(payload).into_bytes()?).await?
         };
@@ -1118,7 +1437,7 @@ fn get_block_test() {
 #[test]
 fn get_multiple_blocks_test() {
     local_test_e(|r| async move {
-        let proj = Project::new(env!("CARGO_MANIFEST_DIR"));
+        let proj = Project::new(std::env::var("CARGO_MANIFEST_DIR").unwrap());
 
         let minting_account = create_sender(0);
 
@@ -1141,30 +1460,33 @@ fn get_multiple_blocks_test() {
             println!("[test] encoded block size: {}", e.size_bytes());
             e.size_bytes() * blocks_per_archive_node
         };
-        let archive_options = Some(ArchiveOptions {
+        let archive_options = ArchiveOptions {
             trigger_threshold: num_blocks as usize,
             num_blocks_to_archive: num_blocks as usize,
             node_max_memory_size_bytes: Some(node_max_memory_size_bytes),
             max_message_size_bytes: Some(max_message_size_bytes),
             controller_id: CanisterId::from_u64(876),
-        });
+            cycles_for_archive_creation: Some(0),
+        };
 
         println!(
             "[test] installing ledger canister with {} accounts",
             accounts.len()
         );
+
         let ledger: canister_test::Canister = {
-            let payload = LedgerCanisterInitPayload::new(
-                CanisterId::try_from(minting_account.get_principal_id())
-                    .unwrap()
-                    .into(),
-                accounts,
-                archive_options,
-                Some(max_message_size_bytes),
-                None,
-                HashSet::new(),
-            );
-            let mut install = proj.cargo_bin("ledger-canister").install(&r);
+            let payload = LedgerCanisterInitPayload::builder()
+                .minting_account(
+                    CanisterId::try_from(minting_account.get_principal_id())
+                        .unwrap()
+                        .into(),
+                )
+                .initial_values(accounts)
+                .archive_options(archive_options)
+                .max_message_size_bytes(max_message_size_bytes)
+                .build()
+                .unwrap();
+            let mut install = proj.cargo_bin("ledger-canister", &[]).install(&r);
             install.memory_allocation = Some(128 * 1024 * 1024);
             install.bytes(CandidOne(payload).into_bytes()?).await?
         };
@@ -1191,44 +1513,40 @@ fn get_multiple_blocks_test() {
         // Query Blocks 10 and 11
         {
             println!("[test] querying blocks 10 and 11");
-            let GetBlocksRes(blocks_from_node) = node
-                .query_("get_blocks_pb", protobuf, GetBlocksArgs::new(10u64, 2usize))
-                .await?;
-
+            let GetBlocksRes(blocks_from_node) = get_blocks_pb(&node, 10..12).await?;
+            let BlockRange { blocks } = get_blocks_candid(&node, 10..12).await.unwrap();
             let blocks_from_node: Vec<EncodedBlock> = blocks_from_node.unwrap();
+            assert_same_blocks(&blocks_from_node, &blocks);
             assert!(blocks_from_node.len() == 2);
         }
 
         // Query Blocks 11 and 12
         {
             println!("[test] querying blocks 11 and 12");
-            let GetBlocksRes(blocks_from_node) = node
-                .query_("get_blocks_pb", protobuf, GetBlocksArgs::new(11u64, 2usize))
-                .await?;
-
+            let GetBlocksRes(blocks_from_node) = get_blocks_pb(&node, 11..13).await?;
+            let BlockRange { blocks } = get_blocks_candid(&node, 11..13).await.unwrap();
             let blocks_from_node: Vec<EncodedBlock> = blocks_from_node.unwrap();
+            assert_same_blocks(&blocks_from_node, &blocks);
             assert!(blocks_from_node.len() == 2);
         }
 
         // Query Blocks 12 and 13
         {
             println!("[test] querying blocks 12 and 13");
-            let GetBlocksRes(blocks_from_node) = node
-                .query_("get_blocks_pb", protobuf, GetBlocksArgs::new(11u64, 2usize))
-                .await?;
-
+            let GetBlocksRes(blocks_from_node) = get_blocks_pb(&node, 12..14).await?;
+            let BlockRange { blocks } = get_blocks_candid(&node, 12..14).await.unwrap();
             let blocks_from_node: Vec<EncodedBlock> = blocks_from_node.unwrap();
+            assert_same_blocks(&blocks_from_node, &blocks);
             assert!(blocks_from_node.len() == 2);
         }
 
         // Query all blocks
         {
             println!("[test] querying all blocks");
-            let GetBlocksRes(blocks_from_node) = node
-                .query_("get_blocks_pb", protobuf, GetBlocksArgs::new(9u64, 5usize))
-                .await?;
-
+            let GetBlocksRes(blocks_from_node) = get_blocks_pb(&node, 9..14).await?;
+            let BlockRange { blocks } = get_blocks_candid(&node, 9..14).await.unwrap();
             let blocks_from_node: Vec<EncodedBlock> = blocks_from_node.unwrap();
+            assert_same_blocks(&blocks_from_node, &blocks);
             assert!(blocks_from_node.len() == 5);
         }
 
@@ -1236,22 +1554,30 @@ fn get_multiple_blocks_test() {
         println!("[test] testing invalid queries to the archive node");
         {
             // outside range left
-            let GetBlocksRes(blocks_from_node) = node
-                .query_("get_blocks_pb", protobuf, GetBlocksArgs::new(8u64, 2usize))
-                .await?;
-            assert!(blocks_from_node.is_err());
+            let GetBlocksRes(blocks_from_node) = get_blocks_pb(&node, 8..10).await?;
+            blocks_from_node.unwrap_err();
+
+            assert_eq!(
+                get_blocks_candid(&node, 8..10).await.unwrap_err(),
+                GetBlocksError::BadFirstBlockIndex {
+                    requested_index: 8,
+                    first_valid_index: 9
+                }
+            );
 
             // outside range right
-            let GetBlocksRes(blocks_from_node) = node
-                .query_("get_blocks_pb", protobuf, GetBlocksArgs::new(10u64, 5usize))
-                .await?;
-            assert!(blocks_from_node.is_err());
+            let GetBlocksRes(blocks_from_node) = get_blocks_pb(&node, 10..16).await?;
+            blocks_from_node.unwrap_err();
+
+            // The candid endpoint succeeds and returns the valid prefix of the request.
+            assert_eq!(
+                get_blocks_candid(&node, 10..18).await.unwrap().blocks.len(),
+                4
+            );
 
             // outside range both sides
-            let GetBlocksRes(blocks_from_node) = node
-                .query_("get_blocks_pb", protobuf, GetBlocksArgs::new(8u64, 6usize))
-                .await?;
-            assert!(blocks_from_node.is_err());
+            let GetBlocksRes(blocks_from_node) = get_blocks_pb(&node, 8..16).await?;
+            blocks_from_node.unwrap_err();
         }
 
         println!("[test] generating additional blocks in the ledger");
@@ -1264,9 +1590,7 @@ fn get_multiple_blocks_test() {
         {
             println!("[test] querying blocks from the ledger");
             // Fetch 2 blocks beginning at BlockHeight 14 from the ledger
-            let GetBlocksRes(blocks_from_ledger) = ledger
-                .query_("get_blocks_pb", protobuf, GetBlocksArgs::new(14u64, 2usize))
-                .await?;
+            let GetBlocksRes(blocks_from_ledger) = get_blocks_pb(&ledger, 14..16).await?;
             let blocks_from_ledger = blocks_from_ledger.unwrap();
             assert!(
                 blocks_from_ledger.len() == 2,
@@ -1275,25 +1599,17 @@ fn get_multiple_blocks_test() {
 
             println!("[test] testing invalid queries to the ledger");
             // And some invalid queries
-            let GetBlocksRes(blocks_from_ledger) = ledger
-                .query_("get_blocks_pb", protobuf, GetBlocksArgs::new(10u64, 2usize))
-                .await?;
-            assert!(blocks_from_ledger.is_err());
+            let GetBlocksRes(blocks_from_ledger) = get_blocks_pb(&ledger, 10..12).await?;
+            blocks_from_ledger.unwrap_err();
 
-            let GetBlocksRes(blocks_from_ledger) = ledger
-                .query_("get_blocks_pb", protobuf, GetBlocksArgs::new(14u64, 3usize))
-                .await?;
-            assert!(blocks_from_ledger.is_err());
+            let GetBlocksRes(blocks_from_ledger) = get_blocks_pb(&ledger, 14..17).await?;
+            blocks_from_ledger.unwrap_err();
 
-            let GetBlocksRes(blocks_from_ledger) = ledger
-                .query_("get_blocks_pb", protobuf, GetBlocksArgs::new(13u64, 2usize))
-                .await?;
-            assert!(blocks_from_ledger.is_err());
+            let GetBlocksRes(blocks_from_ledger) = get_blocks_pb(&ledger, 13..15).await?;
+            blocks_from_ledger.unwrap_err();
 
-            let GetBlocksRes(blocks_from_ledger) = ledger
-                .query_("get_blocks_pb", protobuf, GetBlocksArgs::new(13u64, 7usize))
-                .await?;
-            assert!(blocks_from_ledger.is_err());
+            let GetBlocksRes(blocks_from_ledger) = get_blocks_pb(&ledger, 13..20).await?;
+            blocks_from_ledger.unwrap_err();
         }
 
         Ok(())
@@ -1303,7 +1619,7 @@ fn get_multiple_blocks_test() {
 #[test]
 fn only_ledger_can_append_blocks_to_archive_nodes() {
     local_test_e(|r| async move {
-        let proj = Project::new(env!("CARGO_MANIFEST_DIR"));
+        let proj = Project::new(std::env::var("CARGO_MANIFEST_DIR").unwrap());
 
         let minting_account = create_sender(0);
 
@@ -1321,30 +1637,32 @@ fn only_ledger_can_append_blocks_to_archive_nodes() {
 
         let max_message_size_bytes: usize = 1024 * 1024;
 
-        let archive_options = Some(ArchiveOptions {
+        let archive_options = ArchiveOptions {
             trigger_threshold: num_blocks as usize,
             num_blocks_to_archive: num_blocks as usize,
             node_max_memory_size_bytes: Some(node_max_memory_size_bytes),
             max_message_size_bytes: Some(max_message_size_bytes),
             controller_id: CanisterId::from_u64(876),
-        });
+            cycles_for_archive_creation: Some(0),
+        };
 
         println!(
             "[test] installing ledger canister with {} accounts",
             accounts.len()
         );
         let ledger: canister_test::Canister = {
-            let payload = LedgerCanisterInitPayload::new(
-                CanisterId::try_from(minting_account.get_principal_id())
-                    .unwrap()
-                    .into(),
-                accounts,
-                archive_options,
-                Some(max_message_size_bytes),
-                None,
-                HashSet::new(),
-            );
-            let mut install = proj.cargo_bin("ledger-canister").install(&r);
+            let payload = LedgerCanisterInitPayload::builder()
+                .minting_account(
+                    CanisterId::try_from(minting_account.get_principal_id())
+                        .unwrap()
+                        .into(),
+                )
+                .initial_values(accounts)
+                .archive_options(archive_options)
+                .max_message_size_bytes(max_message_size_bytes)
+                .build()
+                .unwrap();
+            let mut install = proj.cargo_bin("ledger-canister", &[]).install(&r);
             install.memory_allocation = Some(128 * 1024 * 1024);
             install.bytes(CandidOne(payload).into_bytes()?).await?
         };
@@ -1393,9 +1711,97 @@ fn only_ledger_can_append_blocks_to_archive_nodes() {
 }
 
 #[test]
-fn test_transfer_candid() {
+fn test_ledger_candid_interface_endpoint() {
     local_test_e(|r| async move {
         let proj = Project::new(env!("CARGO_MANIFEST_DIR"));
+
+        let minting_account = create_sender(0);
+
+        let ledger = proj
+            .cargo_bin("ledger-canister", &[])
+            .install_(
+                &r,
+                CandidOne(
+                    LedgerCanisterInitPayload::builder()
+                        .minting_account(
+                            CanisterId::try_from(minting_account.get_principal_id())
+                                .unwrap()
+                                .into(),
+                        )
+                        .build()
+                        .unwrap(),
+                ),
+            )
+            .await?;
+
+        let candid_interface: String = fetch_candid_interface(&ledger).await.unwrap();
+        assert_eq!(candid_interface, include_str!("../ledger.did"));
+
+        Ok(())
+    });
+}
+
+#[test]
+fn test_archives_endpoint() {
+    local_test_e(|r| async move {
+        let proj = Project::new(env!("CARGO_MANIFEST_DIR"));
+
+        let minting_account = create_sender(0);
+
+        let minting_canister_id = CanisterId::try_from(minting_account.get_principal_id()).unwrap();
+        let ledger = proj
+            .cargo_bin("ledger-canister", &[])
+            .install_(
+                &r,
+                CandidOne(
+                    LedgerCanisterInitPayload::builder()
+                        .minting_account(minting_canister_id.into())
+                        .archive_options(ArchiveOptions {
+                            trigger_threshold: 0,
+                            num_blocks_to_archive: 1000,
+                            node_max_memory_size_bytes: None,
+                            max_message_size_bytes: None,
+                            controller_id: minting_canister_id,
+                            cycles_for_archive_creation: None,
+                        })
+                        .build()
+                        .unwrap(),
+                ),
+            )
+            .await?;
+
+        let archive_ids = get_archives(&ledger).await.unwrap().archives;
+        assert_eq!(archive_ids, vec![]);
+
+        let sender1 = create_sender(1);
+        let account1: AccountIdentifier = sender1.get_principal_id().into();
+
+        transfer_candid(
+            &ledger,
+            &minting_account,
+            TransferArgs {
+                memo: Default::default(),
+                amount: Tokens::from_e8s(1),
+                fee: Default::default(),
+                from_subaccount: None,
+                to: account1.to_address(),
+                created_at_time: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let archive_ids = get_archives(&ledger).await.unwrap().archives;
+        assert_eq!(archive_ids.len(), 1);
+
+        Ok(())
+    });
+}
+
+#[test]
+fn test_transfer_candid() {
+    local_test_e(|r| async move {
+        let proj = Project::new(std::env::var("CARGO_MANIFEST_DIR").unwrap());
 
         let minting_account = create_sender(0);
         let acc1 = create_sender(1);
@@ -1411,19 +1817,20 @@ fn test_transfer_candid() {
         accounts.insert(acc2_address, Tokens::from_e8s(1_000_000_000));
 
         let ledger = proj
-            .cargo_bin("ledger-canister")
+            .cargo_bin("ledger-canister", &[])
             .install_(
                 &r,
-                CandidOne(LedgerCanisterInitPayload::new(
-                    CanisterId::try_from(minting_account.get_principal_id())
-                        .unwrap()
-                        .into(),
-                    accounts,
-                    None,
-                    None,
-                    None,
-                    HashSet::new(),
-                )),
+                CandidOne(
+                    LedgerCanisterInitPayload::builder()
+                        .minting_account(
+                            CanisterId::try_from(minting_account.get_principal_id())
+                                .unwrap()
+                                .into(),
+                        )
+                        .initial_values(accounts)
+                        .build()
+                        .unwrap(),
+                ),
             )
             .await?;
 
@@ -1573,6 +1980,61 @@ fn test_transfer_candid() {
     });
 }
 
+#[test]
+fn test_transfer_u64_overflow() {
+    local_test_e(|r| async move {
+        let proj = Project::new(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+
+        let minting_account = create_sender(0);
+        let acc1 = create_sender(1);
+        let acc2 = create_sender(2);
+
+        let acc1_address: AccountIdentifier = acc1.get_principal_id().into();
+        let acc2_address: AccountIdentifier = acc2.get_principal_id().into();
+
+        let mut accounts = HashMap::new();
+        accounts.insert(acc1_address, Tokens::from_e8s(1_000_000_000));
+
+        let ledger = proj
+            .cargo_bin("ledger-canister", &[])
+            .install_(
+                &r,
+                CandidOne(
+                    LedgerCanisterInitPayload::builder()
+                        .minting_account(
+                            CanisterId::try_from(minting_account.get_principal_id())
+                                .unwrap()
+                                .into(),
+                        )
+                        .initial_values(accounts)
+                        .build()
+                        .unwrap(),
+                ),
+            )
+            .await?;
+
+        assert_eq!(
+            transfer_candid(
+                &ledger,
+                &acc1,
+                TransferArgs {
+                    memo: Memo(0),
+                    amount: Tokens::from_e8s(u64::MAX - 1),
+                    fee: Tokens::from_e8s(10_000),
+                    from_subaccount: None,
+                    to: acc2_address.to_address(),
+                    created_at_time: None,
+                },
+            )
+            .await,
+            Err(TransferError::InsufficientFunds {
+                balance: Tokens::from_e8s(1_000_000_000)
+            })
+        );
+
+        Ok(())
+    });
+}
 async fn ledger_assert_num_blocks(ledger: &Canister<'_>, num_expected: usize) {
     let IterBlocksRes(blocks) = ledger
         .query_(
@@ -1601,10 +2063,10 @@ async fn ledger_assert_num_nodes(ledger: &Canister<'_>, num_expected: usize) -> 
 #[test]
 fn call_with_cleanup() {
     local_test_e(|r| async move {
-        let proj = Project::new(env!("CARGO_MANIFEST_DIR"));
+        let proj = Project::new(std::env::var("CARGO_MANIFEST_DIR").unwrap());
 
         let test_canister = proj
-            .cargo_bin("test-notified")
+            .cargo_bin("test-notified", &[])
             .install_(&r, Vec::new())
             .await?;
 

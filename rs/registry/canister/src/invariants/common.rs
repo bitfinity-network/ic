@@ -8,8 +8,12 @@ use std::{
 
 use ic_base_types::{NodeId, PrincipalId, SubnetId};
 use ic_nns_common::registry::decode_or_panic;
-use ic_protobuf::registry::{node::v1::NodeRecord, subnet::v1::SubnetListRecord};
-use ic_registry_keys::{get_node_record_node_id, make_subnet_list_record_key};
+use ic_protobuf::registry::{
+    crypto::v1::EcdsaSigningSubnetList, node::v1::NodeRecord, subnet::v1::SubnetListRecord,
+};
+use ic_registry_keys::{
+    get_node_record_node_id, make_subnet_list_record_key, ECDSA_SIGNING_SUBNET_LIST_KEY_PREFIX,
+};
 
 /// A representation of the data held by the registry.
 /// It is kept in-memory only, for global consistency checks before mutations
@@ -24,7 +28,10 @@ pub(crate) struct InvariantCheckError {
 
 impl Display for InvariantCheckError {
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
-        write!(f, "InvariantCheckError: {:?}", self.msg)
+        match &self.source {
+            Some(source) => write!(f, "InvariantCheckError: {}, cause: {}", self.msg, source),
+            None => write!(f, "InvariantCheckError: {}", self.msg),
+        }
     }
 }
 
@@ -42,6 +49,28 @@ pub(crate) fn get_value_from_snapshot<T: Message + Default>(
     snapshot
         .get(key.as_bytes())
         .map(|v| decode_or_panic::<T>(v.clone()))
+}
+
+// Retrieve all records that serve as lists of subnets that can sign with ECDSA keys
+pub(crate) fn get_all_ecdsa_signing_subnet_list_records(
+    snapshot: &RegistrySnapshot,
+) -> BTreeMap<String, EcdsaSigningSubnetList> {
+    let mut result = BTreeMap::<String, EcdsaSigningSubnetList>::new();
+    for key in snapshot.keys() {
+        let signing_subnet_list_key = String::from_utf8(key.clone()).unwrap();
+        if signing_subnet_list_key.starts_with(ECDSA_SIGNING_SUBNET_LIST_KEY_PREFIX) {
+            let ecdsa_signing_subnet_list_record = match snapshot.get(key) {
+                Some(ecdsa_signing_subnet_list_record_bytes) => {
+                    decode_or_panic::<EcdsaSigningSubnetList>(
+                        ecdsa_signing_subnet_list_record_bytes.clone(),
+                    )
+                }
+                None => panic!("Cannot fetch EcdsaSigningSubnetList record for an existing key"),
+            };
+            result.insert(signing_subnet_list_key, ecdsa_signing_subnet_list_record);
+        }
+    }
+    result
 }
 
 /// Returns all node records from the snapshot.

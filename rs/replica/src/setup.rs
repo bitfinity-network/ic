@@ -1,28 +1,26 @@
 use crate::args::ReplicaArgs;
+use clap::Parser;
 use ic_config::{crypto::CryptoConfig, Config, ConfigSource, SAMPLE_CONFIG};
 use ic_crypto::CryptoComponent;
 use ic_crypto_utils_threshold_sig::parse_threshold_sig_key;
 use ic_interfaces::registry::RegistryClient;
-use ic_logger::{fatal, info, new_replica_logger, warn, LoggerImpl, ReplicaLogger};
+use ic_logger::{fatal, info, warn, ReplicaLogger};
 use ic_metrics::MetricsRegistry;
 use ic_protobuf::types::v1 as pb;
 use ic_registry_client::client::{create_data_provider, RegistryClientImpl};
-use ic_registry_client::helper::subnet::{SubnetListRegistry, SubnetRegistry};
-use ic_registry_common::proto_registry_data_provider::ProtoRegistryDataProvider;
+use ic_registry_client_helpers::subnet::{SubnetListRegistry, SubnetRegistry};
+use ic_registry_proto_data_provider::ProtoRegistryDataProvider;
 use ic_registry_subnet_type::SubnetType;
 use ic_types::consensus::catchup::{CUPWithOriginalProtobuf, CatchUpPackage};
 use ic_types::{NodeId, RegistryVersion, ReplicaVersion, SubnetId};
-use slog_async::AsyncGuard;
 use std::convert::TryFrom;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use structopt::clap;
-use structopt::StructOpt;
 
 /// Parse command-line args into `ReplicaArgs`
 pub fn parse_args() -> Result<ReplicaArgs, clap::Error> {
-    let args_result = ReplicaArgs::from_iter_safe(env::args());
+    let args_result = ReplicaArgs::try_parse_from(env::args());
 
     args_result.map(|args| {
         if args.print_sample_config {
@@ -83,7 +81,7 @@ pub fn get_catch_up_package(
 ///
 /// First attempts to look up the node's subnet ID in the registry.
 ///
-/// Panic if this fails after some retries. The node manager should
+/// Panic if this fails after some retries. The orchestrator should
 /// never have booted a replica if our node ID is not assigned to a subntwork
 /// yet.
 pub async fn get_subnet_id(
@@ -104,7 +102,7 @@ pub async fn get_subnet_id(
             .get_subnet_ids(registry_version)
             .ok()
             .flatten()
-            .unwrap_or_else(Vec::new);
+            .unwrap_or_default();
         info!(logger, "Found subnets {:?}", subnet_ids);
 
         for subnet_id in subnet_ids {
@@ -112,7 +110,7 @@ pub async fn get_subnet_id(
                 .get_node_ids_on_subnet(subnet_id, registry_version)
                 .ok()
                 .flatten()
-                .unwrap_or_else(Vec::new);
+                .unwrap_or_default();
 
             info!(
                 logger,
@@ -147,7 +145,10 @@ pub async fn get_subnet_type(
             Ok(subnet_record) => {
                 break match subnet_record {
                     Some(record) => match SubnetType::try_from(record.subnet_type) {
-                        Ok(subnet_type) => subnet_type,
+                        Ok(subnet_type) => {
+                            info!(logger, "Registry subnet record {:?}", record);
+                            subnet_type
+                        }
                         Err(e) => fatal!(logger, "Could not parse SubnetType: {}", e),
                     },
                     // This can only happen if the registry is corrupted, so better to crash.
@@ -179,17 +180,6 @@ pub fn get_config_source(replica_args: &Result<ReplicaArgs, clap::Error>) -> Con
             get_config_source_or_abort(&args)
         }
     }
-}
-
-/// Return a `ReplicaLogger` and its `AsyncGuard`
-///
-/// Note: Do not drop the `AsyncGuard`! If it is dropped, all async logs
-/// (typically logs below level `Error`) will not be logged.
-pub fn get_replica_logger(config: &Config) -> (ReplicaLogger, AsyncGuard) {
-    let base_logger = LoggerImpl::new(&config.logger, "replica".to_string());
-    let logger = new_replica_logger(base_logger.root.clone(), &config.logger);
-
-    (logger, base_logger.async_log_guard)
 }
 
 /// Create the consensus pool directory (if none exists)
@@ -321,13 +311,6 @@ pub fn setup_crypto_provider(
     replica_logger: ReplicaLogger,
     metrics_registry: Option<&MetricsRegistry>,
 ) -> CryptoComponent {
-    std::fs::create_dir_all(&config.crypto_root).unwrap_or_else(|err| {
-        panic!(
-            "Failed to create crypto root directory {}: {}",
-            config.crypto_root.display(),
-            err
-        )
-    });
-    CryptoConfig::set_dir_with_required_permission(&config.crypto_root).unwrap();
+    CryptoConfig::check_dir_has_required_permissions(&config.crypto_root).unwrap();
     CryptoComponent::new(config, registry, replica_logger, metrics_registry)
 }

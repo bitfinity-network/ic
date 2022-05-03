@@ -47,7 +47,12 @@ options may be specified:
   --journalbeat_hosts hosts
     Logging hosts to use. Can be multiple hosts separated by space (make sure
     to quote the argument string so it appears as a single argument to the
-    script, e.g. --journalbeat_hosts "h1.domain.tld:9220 h2.domain.tld:9230").
+    script, e.g. --journalbeat_hosts "h1.domain.tld h2.domain.tld").
+
+  --journalbeat_tags tags
+    Tags to be used by Journalbeat. Can be multiple tags separated by space
+    (make sure to quote the argument string so it appears as a single argument
+    to the script, e.g. --journalbeat_tags "testnet1 slo")
 
   --nns_url url
     URL of NNS nodes for sign up or registry access. Can be multiple nodes
@@ -91,6 +96,10 @@ options may be specified:
     The Json-object corresponds to this Rust-structure:
       ic_types::malicious_behaviour::MaliciousBehaviour
 
+  --bitcoind_addr address
+    The IP address of a running bitcoind instance. To be used in
+    systems tests only.
+
     Be sure to properly quote the string.
 EOF
 }
@@ -106,10 +115,11 @@ function build_ic_bootstrap_tar() {
     local IC_CRYPTO IC_REGISTRY_LOCAL_STORE
     local NNS_URL NNS_PUBLIC_KEY
     local BACKUP_RETENTION_TIME_SECS BACKUP_PURGING_INTERVAL_SECS
-    local JOURNALBEAT_HOSTS
+    local JOURNALBEAT_HOSTS JOURNALBEAT_TAGS
     local ACCOUNTS_SSH_AUTHORIZED_KEYS
     local LOG_DEBUG_OVERRIDES
     local MALICIOUS_BEHAVIOR
+    local BITCOIND_ADDR
     while true; do
         if [ $# == 0 ]; then
             break
@@ -136,6 +146,9 @@ function build_ic_bootstrap_tar() {
             --journalbeat_hosts)
                 JOURNALBEAT_HOSTS="$2"
                 ;;
+            --journalbeat_tags)
+                JOURNALBEAT_TAGS="$2"
+                ;;
             --nns_url)
                 NNS_URL="$2"
                 ;;
@@ -157,6 +170,9 @@ function build_ic_bootstrap_tar() {
             --malicious_behavior)
                 MALICIOUS_BEHAVIOR="$2"
                 ;;
+            --bitcoind_addr)
+                BITCOIND_ADDR="$2"
+                ;;
             *)
                 echo "Unrecognized option: $1"
                 usage
@@ -167,7 +183,7 @@ function build_ic_bootstrap_tar() {
         shift 2
     done
 
-    [[ "$HOSTNAME" == "" ]] || [[ "$HOSTNAME" == [a-zA-Z]*([a-zA-Z0-9])*(-+([a-zA-Z0-9])) ]] || {
+    [[ "$HOSTNAME" == "" ]] || [[ "$HOSTNAME" =~ [a-zA-Z]*([a-zA-Z0-9])*(-+([a-zA-Z0-9])) ]] || {
         echo "Invalid hostname: '$HOSTNAME'" >&2
         exit 1
     }
@@ -182,6 +198,9 @@ hostname=$HOSTNAME
 EOF
     if [ "${JOURNALBEAT_HOSTS}" != "" ]; then
         echo "journalbeat_hosts=$JOURNALBEAT_HOSTS" >"${BOOTSTRAP_TMPDIR}/journalbeat.conf"
+    fi
+    if [ "${JOURNALBEAT_TAGS}" != "" ]; then
+        echo "journalbeat_tags=$JOURNALBEAT_TAGS" >>"${BOOTSTRAP_TMPDIR}/journalbeat.conf"
     fi
     if [ "${NNS_PUBLIC_KEY}" != "" ]; then
         cp "${NNS_PUBLIC_KEY}" "${BOOTSTRAP_TMPDIR}/nns_public_key.pem"
@@ -198,6 +217,9 @@ EOF
     fi
     if [ "${MALICIOUS_BEHAVIOR}" != "" ]; then
         echo "malicious_behavior=${MALICIOUS_BEHAVIOR}" >"${BOOTSTRAP_TMPDIR}/malicious_behavior.conf"
+    fi
+    if [ "${BITCOIND_ADDR}" != "" ]; then
+        echo "bitcoind_addr=${BITCOIND_ADDR}" >"${BOOTSTRAP_TMPDIR}/bitcoind_addr.conf"
     fi
     if [ "${IC_CRYPTO}" != "" ]; then
         cp -r "${IC_CRYPTO}" "${BOOTSTRAP_TMPDIR}/ic_crypto"

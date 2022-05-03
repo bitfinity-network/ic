@@ -1,5 +1,6 @@
 use candid::{CandidType, Deserialize};
 use dfn_core::api::CanisterId;
+use serde::Serialize;
 
 use std::cmp::Eq;
 use std::cmp::PartialEq;
@@ -9,12 +10,9 @@ use std::hash::Hash;
 use std::num::ParseIntError;
 use std::str::FromStr;
 
-use ic_base_types::PrincipalId;
-
 use crate::pb::v1::{
     CanisterId as CanisterIdProto, NeuronId as NeuronIdProto, ProposalId as ProposalIdProto,
 };
-use ic_protobuf::registry::conversion_rate::v1::IcpXdrConversionRateRecord;
 
 impl From<CanisterId> for CanisterIdProto {
     fn from(id: CanisterId) -> Self {
@@ -32,7 +30,7 @@ impl From<CanisterIdProto> for CanisterId {
 
 // A unique Id for a Neuron.
 #[cfg_attr(test, derive(comparable::Comparable))]
-#[derive(CandidType, Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq)]
+#[derive(CandidType, Clone, Copy, Debug, Serialize, Deserialize, Eq, Hash, PartialEq)]
 pub struct NeuronId(pub u64);
 
 impl From<NeuronIdProto> for NeuronId {
@@ -86,49 +84,10 @@ impl Display for ProposalId {
     }
 }
 
-/// Description of a change to the authz of a specific method on a specific
-/// canister that must happen for a given canister change/add/remove
-/// to be viable
-#[derive(candid::CandidType, candid::Deserialize, Clone, Debug)]
-pub struct MethodAuthzChange {
-    pub canister: CanisterId,
-    pub method_name: String,
-    pub principal: Option<PrincipalId>,
-    pub operation: AuthzChangeOp,
-}
-
-/// The operation to execute. Varible names in comments refer to the fields
-/// of AuthzChange.
-#[derive(candid::CandidType, candid::Deserialize, Clone, Debug)]
-pub enum AuthzChangeOp {
-    /// 'canister' must add a principal to the authorized list of 'method_name'.
-    /// If 'add_self' is true, the canister_id to be authorized is the canister
-    /// being added/changed, if it's false, 'principal' is used instead, which
-    /// must be Some in that case..
-    Authorize { add_self: bool },
-    /// 'canister' must remove 'principal' from the authorized list of
-    /// 'method_name'. 'principal' must always be Some.
-    Deauthorize,
-}
-
-/// The payload of a proposal to update the ICP/XDR conversion rate.
-///
-/// See /rs/protobuf/def/registry/conversion_rate/v1/conversion_rate.proto for
-/// the explanation of the fields for the IcpXdrConversionRateRecord.
-/// The fields will be used by the subnet canister to create an
-/// IcpXdrConversionRateRecord.
+/// The payload of a proposal to update the ICP/XDR conversion rate in the CMC.
 #[derive(CandidType, Default, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct UpdateIcpXdrConversionRatePayload {
     pub data_source: String,
     pub timestamp_seconds: u64,
     pub xdr_permyriad_per_icp: u64,
-}
-
-impl From<UpdateIcpXdrConversionRatePayload> for IcpXdrConversionRateRecord {
-    fn from(val: UpdateIcpXdrConversionRatePayload) -> Self {
-        IcpXdrConversionRateRecord {
-            timestamp_seconds: val.timestamp_seconds,
-            xdr_permyriad_per_icp: val.xdr_permyriad_per_icp,
-        }
-    }
 }

@@ -1,8 +1,13 @@
 use crate::consensus::prelude::*;
 use ic_interfaces::{crypto::*, validation::ValidationResult};
-use ic_types::consensus::ecdsa::EcdsaDealing;
-use ic_types::crypto::threshold_sig::ni_dkg::{DkgId, NiDkgId};
-use ic_types::crypto::CryptoError;
+use ic_types::{
+    canister_http::CanisterHttpResponseMetadata,
+    consensus::ecdsa::{EcdsaComplaintContent, EcdsaDealing, EcdsaOpeningContent},
+    crypto::{
+        threshold_sig::ni_dkg::{DkgId, NiDkgId},
+        CryptoError,
+    },
+};
 
 /// A trait that unifies the individual signing and verification interface for
 /// both threshold and multi signatures. It is parameterized by the following:
@@ -71,6 +76,7 @@ impl<Message: Signable, C: BasicSigner<Message> + BasicSigVerifier<Message>>
         self.sign_basic(message, signer, selector)
             .map(|signature| BasicSignature { signature, signer })
     }
+
     fn verify(
         &self,
         message: &Signed<Message, BasicSignature<Message>>,
@@ -79,6 +85,38 @@ impl<Message: Signable, C: BasicSigner<Message> + BasicSigVerifier<Message>>
         self.verify_basic_sig(
             &message.signature.signature,
             &message.content,
+            message.signature.signer,
+            selector,
+        )
+    }
+}
+
+// This allows us to use sign verify directly when we provide a hash value to
+// crypto instead of the actual message.
+impl<Message, C> SignVerify<Message, BasicSignature<CryptoHashOf<Message>>, RegistryVersion> for C
+where
+    Message: CryptoHashable,
+    CryptoHashOf<Message>: Signable,
+    C: BasicSigner<CryptoHashOf<Message>> + BasicSigVerifier<CryptoHashOf<Message>>,
+{
+    fn sign(
+        &self,
+        message: &Message,
+        signer: NodeId,
+        selector: RegistryVersion,
+    ) -> CryptoResult<BasicSignature<CryptoHashOf<Message>>> {
+        self.sign_basic(&ic_crypto::crypto_hash(message), signer, selector)
+            .map(|signature| BasicSignature { signature, signer })
+    }
+
+    fn verify(
+        &self,
+        message: &Signed<Message, BasicSignature<CryptoHashOf<Message>>>,
+        selector: RegistryVersion,
+    ) -> ValidationResult<CryptoError> {
+        self.verify_basic_sig(
+            &message.signature.signature,
+            &ic_crypto::crypto_hash(&message.content),
             message.signature.signer,
             selector,
         )
@@ -97,6 +135,7 @@ impl<Message: Signable, C: MultiSigner<Message> + MultiSigVerifier<Message>>
         self.sign_multi(message, signer, selector)
             .map(|signature| MultiSignatureShare { signature, signer })
     }
+
     fn verify(
         &self,
         message: &Signed<Message, MultiSignatureShare<Message>>,
@@ -105,6 +144,37 @@ impl<Message: Signable, C: MultiSigner<Message> + MultiSigVerifier<Message>>
         self.verify_multi_sig_individual(
             &message.signature.signature,
             &message.content,
+            message.signature.signer,
+            selector,
+        )
+    }
+}
+
+impl<Message, C> SignVerify<Message, MultiSignatureShare<CryptoHashOf<Message>>, RegistryVersion>
+    for C
+where
+    Message: CryptoHashable,
+    CryptoHashOf<Message>: Signable,
+    C: MultiSigner<CryptoHashOf<Message>> + MultiSigVerifier<CryptoHashOf<Message>>,
+{
+    fn sign(
+        &self,
+        message: &Message,
+        signer: NodeId,
+        selector: RegistryVersion,
+    ) -> CryptoResult<MultiSignatureShare<CryptoHashOf<Message>>> {
+        self.sign_multi(&ic_crypto::crypto_hash(message), signer, selector)
+            .map(|signature| MultiSignatureShare { signature, signer })
+    }
+
+    fn verify(
+        &self,
+        message: &Signed<Message, MultiSignatureShare<CryptoHashOf<Message>>>,
+        selector: RegistryVersion,
+    ) -> ValidationResult<CryptoError> {
+        self.verify_multi_sig_individual(
+            &message.signature.signature,
+            &ic_crypto::crypto_hash(&message.content),
             message.signature.signer,
             selector,
         )
@@ -123,6 +193,7 @@ impl<Message: Signable, C: ThresholdSigner<Message> + ThresholdSigVerifier<Messa
         self.sign_threshold(message, DkgId::NiDkgId(dkg_id))
             .map(|signature| ThresholdSignatureShare { signature, signer })
     }
+
     fn verify(
         &self,
         message: &Signed<Message, ThresholdSignatureShare<Message>>,
@@ -211,6 +282,56 @@ impl<Message: Signable, C: MultiSigner<Message> + MultiSigVerifier<Message>>
     }
 }
 
+impl<Message, C: MultiSigner<CryptoHashOf<Message>> + MultiSigVerifier<CryptoHashOf<Message>>>
+    Aggregate<
+        Message,
+        MultiSignatureShare<CryptoHashOf<Message>>,
+        RegistryVersion,
+        MultiSignature<CryptoHashOf<Message>>,
+    > for C
+where
+    Message: CryptoHashable,
+    CryptoHashOf<Message>: Signable,
+{
+    fn as_aggregate(
+        &self,
+    ) -> &dyn Aggregate<
+        Message,
+        MultiSignatureShare<CryptoHashOf<Message>>,
+        RegistryVersion,
+        MultiSignature<CryptoHashOf<Message>>,
+    > {
+        self
+    }
+
+    fn aggregate(
+        &self,
+        shares: Vec<&MultiSignatureShare<CryptoHashOf<Message>>>,
+        selector: RegistryVersion,
+    ) -> CryptoResult<MultiSignature<CryptoHashOf<Message>>> {
+        let signer_share_map = shares
+            .iter()
+            .map(|share| (share.signer, share.signature.clone()))
+            .collect();
+        let signature = self.combine_multi_sig_individuals(signer_share_map, selector)?;
+        let signers = shares.iter().map(|share| share.signer).collect();
+        Ok(MultiSignature { signature, signers })
+    }
+
+    fn verify_aggregate(
+        &self,
+        message: &Signed<Message, MultiSignature<CryptoHashOf<Message>>>,
+        selector: RegistryVersion,
+    ) -> ValidationResult<CryptoError> {
+        self.verify_multi_sig_combined(
+            &message.signature.signature,
+            &ic_crypto::crypto_hash(&message.content),
+            message.signature.signers.iter().cloned().collect(),
+            selector,
+        )
+    }
+}
+
 impl<Message: Signable, C: ThresholdSigner<Message> + ThresholdSigVerifier<Message>>
     Aggregate<Message, ThresholdSignatureShare<Message>, NiDkgId, ThresholdSignature<Message>>
     for C
@@ -265,10 +386,22 @@ pub trait ConsensusCrypto:
     + SignVerify<NotarizationContent, MultiSignatureShare<NotarizationContent>, RegistryVersion>
     + SignVerify<FinalizationContent, MultiSignatureShare<FinalizationContent>, RegistryVersion>
     + SignVerify<EcdsaDealing, MultiSignatureShare<EcdsaDealing>, RegistryVersion>
+    + SignVerify<EcdsaDealing, BasicSignature<EcdsaDealing>, RegistryVersion>
+    + SignVerify<EcdsaComplaintContent, BasicSignature<EcdsaComplaintContent>, RegistryVersion>
+    + SignVerify<EcdsaOpeningContent, BasicSignature<EcdsaOpeningContent>, RegistryVersion>
     + SignVerify<RandomBeaconContent, ThresholdSignatureShare<RandomBeaconContent>, NiDkgId>
     + SignVerify<RandomTapeContent, ThresholdSignatureShare<RandomTapeContent>, NiDkgId>
     + SignVerify<CatchUpContent, ThresholdSignatureShare<CatchUpContent>, NiDkgId>
-    + Aggregate<
+    + SignVerify<dkg::DealingContent, BasicSignature<dkg::DealingContent>, RegistryVersion>
+    + SignVerify<
+        CanisterHttpResponseMetadata,
+        MultiSignatureShare<CanisterHttpResponseMetadata>,
+        RegistryVersion,
+    > + SignVerify<
+        CanisterHttpResponseMetadata,
+        MultiSignatureShare<CanisterHttpResponseMetadata>,
+        RegistryVersion,
+    > + Aggregate<
         NotarizationContent,
         MultiSignatureShare<NotarizationContent>,
         RegistryVersion,
@@ -298,8 +431,12 @@ pub trait ConsensusCrypto:
         ThresholdSignatureShare<CatchUpContent>,
         NiDkgId,
         ThresholdSignature<CatchUpContent>,
-    > + SignVerify<dkg::DealingContent, BasicSignature<dkg::DealingContent>, RegistryVersion>
-    + Crypto
+    > + Aggregate<
+        CanisterHttpResponseMetadata,
+        MultiSignatureShare<CanisterHttpResponseMetadata>,
+        RegistryVersion,
+        MultiSignature<CanisterHttpResponseMetadata>,
+    > + Crypto
     + Send
     + Sync
 {

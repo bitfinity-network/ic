@@ -10,13 +10,13 @@ use ic_interfaces::{
     consensus_pool::ConsensusPoolCache,
     dkg::{ChangeAction, ChangeSet, Dkg, DkgGossip, DkgPool},
     registry::RegistryClient,
-    state_manager::{StateManager, StateManagerError},
     validation::{ValidationError, ValidationResult},
 };
+use ic_interfaces_state_manager::{StateManager, StateManagerError};
 use ic_logger::{error, info, warn, ReplicaLogger};
 use ic_metrics::buckets::{decimal_buckets, linear_buckets};
 use ic_protobuf::registry::subnet::v1::CatchUpPackageContents;
-use ic_registry_client::helper::{
+use ic_registry_client_helpers::{
     crypto::{initial_ni_dkg_transcript_from_registry_record, DkgTranscripts},
     subnet::SubnetRegistry,
 };
@@ -28,7 +28,7 @@ use ic_types::{
         dkg,
         dkg::{DealingContent, Message, Summary},
         get_faults_tolerated, Block, BlockPayload, CatchUpContent, CatchUpPackage, HashedBlock,
-        HashedRandomBeacon, Payload, RandomBeaconContent, Rank, ThresholdSignature,
+        HashedRandomBeacon, Payload, RandomBeaconContent, Rank,
     },
     crypto::{
         threshold_sig::ni_dkg::{
@@ -42,6 +42,7 @@ use ic_types::{
         CryptoError, Signed,
     },
     registry::RegistryClientError,
+    signature::ThresholdSignature,
     Height, NodeId, NumberOfNodes, RegistryVersion, SubnetId, Time,
 };
 
@@ -460,10 +461,9 @@ pub fn validate_payload(
             validation_context,
             ic_logger::replica_logger::no_op_logger(),
         )?;
-        let expected_payload = expected_summary.into();
-        if payload != &expected_payload {
+        if payload.as_summary().dkg != expected_summary {
             return Err(PermanentError::MismatchedDkgSummary(
-                expected_payload.as_summary().dkg.clone(),
+                expected_summary,
                 payload.as_summary().dkg.clone(),
             )
             .into());
@@ -1340,7 +1340,7 @@ pub fn make_registry_cup(
         versioned_record.version
     };
     // We do not use `registry_version` here because doing so would cause issues
-    // for full NNS (4b) disaster recovery. When we are calling
+    // for full NNS (4b) subnet recovery. When we are calling
     // make_registry_cup, our notion of the the NNS registry is still that of
     // the temporary NNS that is used to spawn the recovered NNS. However the
     // registry version store in `registry_store_uri` is a registry version from
@@ -1360,6 +1360,7 @@ pub fn make_registry_cup(
         }
     };
     let dkg_summary = make_genesis_summary(registry, subnet_id, Some(registry_version));
+    let ecdsa_summary = None;
     let cup_height = Height::new(cup_contents.height);
 
     let low_dkg_id = dkg_summary
@@ -1371,7 +1372,7 @@ pub fn make_registry_cup(
     let block = Block::new_with_replica_version(
         replica_version.clone(),
         Id::from(CryptoHash(Vec::new())),
-        Payload::new(crypto_hash, dkg_summary.into()),
+        Payload::new(crypto_hash, (dkg_summary, ecdsa_summary).into()),
         cup_height,
         Rank(0),
         ValidationContext {
@@ -1428,12 +1429,12 @@ mod tests {
         consensus::fake::FakeContentSigner,
         crypto::CryptoReturningOk,
         mock_time,
-        registry::{add_subnet_record, SubnetRecordBuilder},
         state_manager::RefMockStateManager,
         types::ids::{node_test_id, subnet_test_id},
         types::messages::RequestBuilder,
         with_test_replica_logger,
     };
+    use ic_test_utilities_registry::{add_subnet_record, SubnetRecordBuilder};
     use ic_types::{
         batch::BatchPayload,
         consensus::{ecdsa, DataPayload, HasVersion},
@@ -1472,7 +1473,8 @@ mod tests {
 
                 // Now we instantiate the DKG component for node Id = 1, who is a dealer.
                 let replica_1 = node_test_id(1);
-                let dkg_key_manager = new_dkg_key_manager(crypto.clone(), logger.clone());
+                let dkg_key_manager =
+                    new_dkg_key_manager(crypto.clone(), logger.clone(), &PoolReader::new(&pool));
                 let dkg = DkgImpl::new(
                     replica_1,
                     crypto.clone(),
@@ -1538,7 +1540,8 @@ mod tests {
                 // Create another dealer and add his dealings into the unvalidated pool of
                 // replica 1.
                 let replica_2 = node_test_id(2);
-                let dkg_key_manager_2 = new_dkg_key_manager(crypto.clone(), logger.clone());
+                let dkg_key_manager_2 =
+                    new_dkg_key_manager(crypto.clone(), logger.clone(), &PoolReader::new(&pool));
                 let dkg_2 = DkgImpl::new(
                     replica_2,
                     crypto,
@@ -1978,7 +1981,8 @@ mod tests {
                 } = dependencies(pool_config.clone(), 2);
                 let mut dkg_pool = DkgPoolImpl::new(MetricsRegistry::new());
                 // Let's check that replica 3, who's not a dealer, does not produce dealings.
-                let dkg_key_manager = new_dkg_key_manager(crypto.clone(), logger.clone());
+                let dkg_key_manager =
+                    new_dkg_key_manager(crypto.clone(), logger.clone(), &PoolReader::new(&pool));
                 let dkg = DkgImpl::new(
                     node_test_id(3),
                     crypto.clone(),
@@ -1990,7 +1994,8 @@ mod tests {
                 assert!(dkg.on_state_change(&dkg_pool).is_empty());
 
                 // Now we instantiate the DKG component for node Id = 1, who is a dealer.
-                let dkg_key_manager = new_dkg_key_manager(crypto.clone(), logger.clone());
+                let dkg_key_manager =
+                    new_dkg_key_manager(crypto.clone(), logger.clone(), &PoolReader::new(&pool));
                 let dkg = DkgImpl::new(
                     node_test_id(1),
                     crypto,
@@ -2067,9 +2072,12 @@ mod tests {
         }
 
         let mut mock = state_manager.get_mut();
-        let expectation = mock.expect_get_state_at().return_const(Ok(
-            ic_interfaces::state_manager::Labeled::new(Height::new(0), Arc::new(state)),
-        ));
+        let expectation =
+            mock.expect_get_state_at()
+                .return_const(Ok(ic_interfaces_state_manager::Labeled::new(
+                    Height::new(0),
+                    Arc::new(state),
+                )));
         if let Some(times) = times {
             expectation.times(times);
         }
@@ -2110,7 +2118,8 @@ mod tests {
                 );
 
                 // Now we instantiate the DKG component for node Id = 1, who is a dealer.
-                let dkg_key_manager = new_dkg_key_manager(crypto.clone(), logger.clone());
+                let dkg_key_manager =
+                    new_dkg_key_manager(crypto.clone(), logger.clone(), &PoolReader::new(&pool));
                 let dkg = DkgImpl::new(
                     node_test_id(1),
                     crypto,
@@ -2273,7 +2282,11 @@ mod tests {
 
                 with_test_replica_logger(|logger| {
                     // We instantiate the DKG component for node Id = 1 nd Id = 2.
-                    let dkg_key_manager_1 = new_dkg_key_manager(crypto.clone(), logger.clone());
+                    let dkg_key_manager_1 = new_dkg_key_manager(
+                        crypto.clone(),
+                        logger.clone(),
+                        &PoolReader::new(&consensus_pool_1),
+                    );
                     let dkg_1 = DkgImpl::new(
                         node_id_1,
                         crypto.clone(),
@@ -2283,7 +2296,11 @@ mod tests {
                         logger.clone(),
                     );
 
-                    let dkg_key_manager_2 = new_dkg_key_manager(crypto.clone(), logger.clone());
+                    let dkg_key_manager_2 = new_dkg_key_manager(
+                        crypto.clone(),
+                        logger.clone(),
+                        &PoolReader::new(&consensus_pool_2),
+                    );
                     let dkg_2 = DkgImpl::new(
                         node_id_2,
                         crypto.clone(),
@@ -2710,7 +2727,11 @@ mod tests {
                     }
 
                     // Now we instantiate the DKG components. Node Id = 1 is a dealer.
-                    let dgk_key_manager_1 = new_dkg_key_manager(crypto_1.clone(), logger.clone());
+                    let dgk_key_manager_1 = new_dkg_key_manager(
+                        crypto_1.clone(),
+                        logger.clone(),
+                        &PoolReader::new(&pool_1),
+                    );
                     let dkg_1 = DkgImpl::new(
                         node_test_id(1),
                         crypto_1,
@@ -2724,7 +2745,7 @@ mod tests {
                         node_test_id(2),
                         crypto_2.clone(),
                         pool_2.get_cache(),
-                        new_dkg_key_manager(crypto_2, logger.clone()),
+                        new_dkg_key_manager(crypto_2, logger.clone(), &PoolReader::new(&pool_2)),
                         MetricsRegistry::new(),
                         logger,
                     );
@@ -3353,11 +3374,12 @@ mod tests {
                 RegistryVersion::from(5),
                 "The latest available version was used for the summary block."
             );
-            let dkg_summary = BlockPayload::from(dkg_block.payload).into_summary().dkg;
+            let summary = BlockPayload::from(dkg_block.payload).into_summary();
+            let dkg_summary = &summary.dkg;
             assert_eq!(dkg_summary.registry_version, RegistryVersion::from(5));
             assert_eq!(dkg_summary.height, Height::from(0));
             assert_eq!(
-                dkg_summary.get_subnet_membership_version(),
+                summary.get_oldest_registry_version_in_use(),
                 RegistryVersion::from(5)
             );
             for tag in TAGS.iter() {
@@ -3398,13 +3420,14 @@ mod tests {
                 RegistryVersion::from(6),
                 "The newest registry version is used."
             );
-            let dkg_summary = BlockPayload::from(dkg_block.payload).into_summary().dkg;
+            let summary = BlockPayload::from(dkg_block.payload).into_summary();
+            let dkg_summary = &summary.dkg;
             // This registry version corresponds to the registry version from the block
             // context of the previous summary.
             assert_eq!(dkg_summary.registry_version, RegistryVersion::from(5));
             assert_eq!(dkg_summary.height, Height::from(5));
             assert_eq!(
-                dkg_summary.get_subnet_membership_version(),
+                summary.get_oldest_registry_version_in_use(),
                 RegistryVersion::from(5)
             );
             for tag in TAGS.iter() {
@@ -3448,13 +3471,14 @@ mod tests {
                 RegistryVersion::from(10),
                 "The newest registry version is used."
             );
-            let dkg_summary = BlockPayload::from(dkg_block.payload).into_summary().dkg;
+            let summary = BlockPayload::from(dkg_block.payload).into_summary();
+            let dkg_summary = &summary.dkg;
             // This registry version corresponds to the registry version from the block
             // context of the previous summary.
             assert_eq!(dkg_summary.registry_version, RegistryVersion::from(6));
             assert_eq!(dkg_summary.height, Height::from(10));
             assert_eq!(
-                dkg_summary.get_subnet_membership_version(),
+                summary.get_oldest_registry_version_in_use(),
                 RegistryVersion::from(5)
             );
             for tag in TAGS.iter() {
@@ -3486,13 +3510,14 @@ mod tests {
                 RegistryVersion::from(10),
                 "The latest registry version is used."
             );
-            let dkg_summary = BlockPayload::from(dkg_block.payload).into_summary().dkg;
+            let summary = BlockPayload::from(dkg_block.payload).into_summary();
+            let dkg_summary = &summary.dkg;
             // This registry version corresponds to the registry version from the block
             // context of the previous summary.
             assert_eq!(dkg_summary.registry_version, RegistryVersion::from(10));
             assert_eq!(dkg_summary.height, Height::from(15));
             assert_eq!(
-                dkg_summary.get_subnet_membership_version(),
+                summary.get_oldest_registry_version_in_use(),
                 RegistryVersion::from(5)
             );
             for tag in TAGS.iter() {
@@ -3522,13 +3547,14 @@ mod tests {
                 RegistryVersion::from(10),
                 "The latest registry version is used."
             );
-            let dkg_summary = BlockPayload::from(dkg_block.payload).into_summary().dkg;
+            let summary = BlockPayload::from(dkg_block.payload).into_summary();
+            let dkg_summary = &summary.dkg;
             // This registry version corresponds to the registry version from the block
             // context of the previous summary.
             assert_eq!(dkg_summary.registry_version, RegistryVersion::from(10));
             assert_eq!(dkg_summary.height, Height::from(20));
             assert_eq!(
-                dkg_summary.get_subnet_membership_version(),
+                summary.get_oldest_registry_version_in_use(),
                 // The current DKGs finally use `RegistryVersion` 6
                 RegistryVersion::from(6)
             );
@@ -3653,6 +3679,7 @@ mod tests {
                         time: 1,
                         state_hash: vec![1, 2, 3, 4, 5],
                         registry_store_uri: None,
+                        ecdsa_initializations: vec![],
                     };
 
                 // Encode the cup to protobuf
@@ -3700,11 +3727,13 @@ mod tests {
     fn new_dkg_key_manager(
         crypto: Arc<dyn ConsensusCrypto>,
         logger: ReplicaLogger,
+        pool_reader: &PoolReader<'_>,
     ) -> Arc<Mutex<DkgKeyManager>> {
         Arc::new(Mutex::new(DkgKeyManager::new(
             MetricsRegistry::new(),
             crypto,
             logger,
+            pool_reader,
         )))
     }
 

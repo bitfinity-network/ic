@@ -1,6 +1,7 @@
 syntax = "proto3";
 package registry.subnet.v1;
 import "types/v1/types.proto";
+import "registry/crypto/v1/crypto.proto";
 
 // A subnet: A logical group of nodes that run consensus
 message SubnetRecord {
@@ -14,13 +15,8 @@ message SubnetRecord {
   reserved 2;
   reserved "initial_dkg_transcript";
 
-  // Ingress message params used by that subnet.
-  //
-  // Maximum amount of bytes per block. This is a soft cap, which means
-  // we stop adding messages once overall size grows above this limit. This
-  // allows big messages to still get into the block, because the size of
-  // a message can exceed this limit.
-  uint64 ingress_bytes_per_block_soft_cap = 4;
+  reserved 4;
+  reserved "ingress_bytes_per_block_soft_cap";
 
   // Maximum amount of bytes per message. This is a hard cap, which means
   // ingress messages greater than the limit will be dropped.
@@ -82,15 +78,22 @@ message SubnetRecord {
   uint64 max_number_of_canisters = 24;
 
   // The list of public keys whose owners have "readonly" SSH access to all replicas on this subnet,
-  // in case it is necessary to perform disaster recovery.
+  // in case it is necessary to perform subnet recovery.
   repeated string ssh_readonly_access = 25;
 
   // The list of public keys whose owners have "backup" SSH access to nodes on the NNS subnet
   // to make sure the NNS can be backed up.
   repeated string ssh_backup_access = 26;
 
-  // ECDSA Config
+  // ECDSA Config. This field cannot be set back to `None` once it has been set
+  // to `Some`. To turn off ECDSA signing the list of `key_ids` can be set to
+  // the empty list.
   EcdsaConfig ecdsa_config = 27;
+}
+
+message EcdsaInitialization {
+  registry.crypto.v1.EcdsaKeyId key_id = 1;
+  InitialIDkgDealings dealings = 2;
 }
 
 // Contains the initial DKG transcripts for the subnet and materials to construct a base CUP (i.e.
@@ -114,6 +117,9 @@ message CatchUpPackageContents {
 
   // A uri from which data to replace the registry local store should be downloaded
   RegistryStoreUri registry_store_uri = 6;
+
+  /// The initial ECDSA dealings for boot strapping target subnets.
+  repeated EcdsaInitialization ecdsa_initializations = 7;
 }
 
 message RegistryStoreUri {
@@ -127,9 +133,10 @@ message RegistryStoreUri {
 	uint64 registry_version = 3;
 }
 
-// A list of subnet ids of all subnets present in this instance of the IC.
+// Contains information pertaining to all subnets in the IC and their params.
 message SubnetListRecord {
   reserved 1;  // this is from subnet id being a uint64
+  // A list of subnet ids of all subnets present in this instance of the IC.
   repeated bytes subnets = 2;
 }
 
@@ -140,6 +147,84 @@ message InitialNiDkgTranscriptRecord {
   repeated bytes committee = 3;
   uint64 registry_version = 4;
   bytes internal_csp_transcript = 5;
+}
+
+message IDkgTranscriptId {
+  uint64 id = 1;
+  types.v1.SubnetId subnet_id = 2;
+  uint64 source_height = 3;
+}
+
+message VerifiedIDkgDealing {
+  uint32 dealer_index = 1;
+  bytes signature = 2;
+  repeated types.v1.NodeId signers = 3;
+  uint64 requested_height = 4;
+  IDkgDealingTuple dealing_tuple = 5;
+}
+
+message IDkgTranscript {
+  IDkgTranscriptId transcript_id = 1;
+  repeated types.v1.NodeId dealers = 2;
+  repeated types.v1.NodeId receivers = 3;
+  uint64 registry_version = 4;
+  repeated VerifiedIDkgDealing verified_dealings = 5;
+  bytes transcript_type = 6;  // CBOR serialized IDkgTranscriptType
+  crypto.v1.AlgorithmId algorithm_id = 7;
+  bytes raw_transcript = 8;   // serialised InternalRawTranscript
+}
+
+message DealerTuple {
+  types.v1.NodeId dealer_id = 1;
+  uint32 dealer_index = 2;
+}
+
+enum IDkgTranscriptOperation {
+  I_DKG_TRANSCRIPT_OPERATION_UNSPECIFIED = 0;
+  I_DKG_TRANSCRIPT_OPERATION_RANDOM = 1;
+  I_DKG_TRANSCRIPT_OPERATION_RESHARE_OF_MASKED = 2;
+  I_DKG_TRANSCRIPT_OPERATION_RESHARE_OF_UNMASKED = 3;
+  I_DKG_TRANSCRIPT_OPERATION_UNMASKED_TIMES_MASKED = 4;
+}
+
+message IDkgTranscriptParams {
+  IDkgTranscriptId transcript_id = 1;
+  repeated DealerTuple dealers = 2;
+  repeated types.v1.NodeId receivers = 3;
+  uint64 registry_version = 4;
+  crypto.v1.AlgorithmId algorithm_id = 5;
+  IDkgTranscriptOperation idkg_transcript_operation = 6;
+  repeated IDkgTranscript idkg_transcript_operation_args = 7; // 0, 1, or 2 IDkgTranscripts
+}
+
+message IDkgDealing {
+  IDkgTranscriptId transcript_id = 1;
+  bytes raw_dealing = 2;   // serialised InternalRawDealing
+}
+
+message IDkgDealingTuple {
+  types.v1.NodeId dealer = 1;
+  IDkgDealing dealing = 2;
+}
+
+message IDkgSignedDealingTuple {
+  types.v1.NodeId dealer = 1;
+  IDkgDealing dealing = 2;
+  bytes signature = 3;
+}
+
+message InitialIDkgDealings {
+  reserved 3;
+  reserved "dealings";
+
+  uint32 version = 1;
+  IDkgTranscriptParams params = 2;
+  repeated IDkgSignedDealingTuple signed_dealings = 4;
+}
+
+message ExtendedDerivationPath {
+  types.v1.PrincipalId caller = 1;
+  repeated bytes derivation_path = 2;
 }
 
 // Per subnet P2P configuration
@@ -198,16 +283,56 @@ enum SubnetType {
     SUBNET_TYPE_VERIFIED_APPLICATION = 4;
 }
 
+enum BitcoinFeature {
+  // The bitcoin feature is disabled.
+  //
+  // The subnet does not sync the bitcoin chain and requests to the bitcoin
+  // canister are forwarded to another subnet where the feature is enabled.
+  //
+  // WARNING: Transitioning into this state deletes any bitcoin state present
+  // on the subnet, and full sync from genesis would then be required when
+  // enabling this feature again.
+  BITCOIN_FEATURE_UNSPECIFIED = 0;
+
+  // The bitcoin feature is paused.
+  //
+  // The subnet does not sync the bitcoin chain and requests to the bitcoin
+  // canister are forwarded to another subnet where the feature is enabled.
+  //
+  // Transitioning into this state does _not_ delete any bitcoin state that's
+  // present on the subnet.
+  BITCOIN_FEATURE_PAUSED = 1;
+
+  // The bitcoin feature is enabled.
+  //
+  // The subnet syncs the bitcoin chain and handles requests to the bitcoin
+  // canister.
+  BITCOIN_FEATURE_ENABLED = 2;
+}
+
 message SubnetFeatures {
+    // This feature flag controls, whether canisters of this subnet are capable of
+    // issuing threshold ecdsa signatures.
     bool ecdsa_signatures = 1;
     // This feature flag controls whether canister execution happens
     // in sandboxed process or not. It is disabled by default.
     bool canister_sandboxing = 2;
+    // This feature flag controls whether canisters of this subnet are capable of
+    // performing http(s) requests to the web2.
+    bool http_requests = 3;
+
+    reserved 4;
+
+    // Whether or not the subnet is capable of serving requests to the bitcoin testnet canister.
+    // Note that in the near future an identical feature will be introduced for the bitcoin mainnet.
+    optional BitcoinFeature bitcoin_testnet_feature = 5;
 }
 
-// Per subnet P2P configuration
-// Note: protoc is mangling the name P2PConfig to P2pConfig
+// Per subnet ECDSA configuration
 message EcdsaConfig {
   // Number of quadruples to create in advance.
   uint32 quadruples_to_create_in_advance = 1;
+  reserved 2;
+  // Identifiers for threshold ECDSA keys held by the subnet.
+  repeated registry.crypto.v1.EcdsaKeyId key_ids = 3;
 }

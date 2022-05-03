@@ -7,6 +7,7 @@ use crate::{
 use candid::{CandidType, Deserialize};
 #[cfg(target_arch = "wasm32")]
 use dfn_core::println;
+use serde::Serialize;
 
 use ic_base_types::PrincipalId;
 use ic_protobuf::registry::node_operator::v1::NodeOperatorRecord;
@@ -61,6 +62,15 @@ impl Registry {
             node_operator_record.rewardable_nodes = payload.rewardable_nodes;
         }
 
+        if let Some(node_provider_id) = payload.node_provider_id {
+            assert_ne!(
+                node_provider_id, node_operator_id,
+                "The Node Operator ID cannot be the same as the Node Provider ID: {}",
+                node_operator_id
+            );
+            node_operator_record.node_provider_principal_id = node_provider_id.to_vec();
+        }
+
         let mutations = vec![RegistryMutation {
             mutation_type: registry_mutation::Type::Update as i32,
             key: node_operator_record_key,
@@ -75,7 +85,7 @@ impl Registry {
 /// The payload of a proposal to update an existing Node Operator
 ///
 /// See /rs/protobuf/def/registry/node_operator/v1/node_operator.proto
-#[derive(CandidType, Deserialize, Clone, PartialEq, Eq, Message)]
+#[derive(CandidType, Serialize, Deserialize, Clone, PartialEq, Eq, Message)]
 pub struct UpdateNodeOperatorConfigPayload {
     /// The principal id of the node operator. This principal is the entity that
     /// is able to add and remove nodes.
@@ -94,4 +104,8 @@ pub struct UpdateNodeOperatorConfigPayload {
     /// Node Provider should be rewarded.
     #[prost(btree_map = "string, uint32", tag = "4")]
     pub rewardable_nodes: BTreeMap<String, u32>,
+
+    /// The principal id of this node's provider.
+    #[prost(message, optional, tag = "5")]
+    pub node_provider_id: Option<PrincipalId>,
 }

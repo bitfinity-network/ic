@@ -5,7 +5,8 @@ use crate::vault::api::{
     BasicSignatureCspVault, CspBasicSignatureError, CspBasicSignatureKeygenError,
     CspMultiSignatureError, CspMultiSignatureKeygenError, CspThresholdSignatureKeygenError,
     CspTlsKeygenError, CspTlsSignError, IDkgProtocolCspVault, MultiSignatureCspVault,
-    NiDkgCspVault, SecretKeyStoreCspVault, ThresholdSignatureCspVault,
+    NiDkgCspVault, SecretKeyStoreCspVault, ThresholdEcdsaSignerCspVault,
+    ThresholdSignatureCspVault,
 };
 use crate::vault::local_csp_vault::LocalCspVault;
 use crate::vault::remote_csp_vault::TarpcCspVault;
@@ -15,6 +16,10 @@ use ic_crypto_internal_threshold_sig_bls12381::api::ni_dkg_errors::{
     CspDkgCreateFsKeyError, CspDkgCreateReshareDealingError, CspDkgLoadPrivateKeyError,
     CspDkgUpdateFsEpochError,
 };
+use ic_crypto_internal_threshold_sig_ecdsa::{
+    CommitmentOpening, IDkgComplaintInternal, IDkgDealingInternal, IDkgTranscriptInternal,
+    IDkgTranscriptOperationInternal, MEGaPublicKey, ThresholdEcdsaSigShareInternal,
+};
 use ic_crypto_internal_types::encrypt::forward_secure::{
     CspFsEncryptionPop, CspFsEncryptionPublicKey,
 };
@@ -23,33 +28,31 @@ use ic_crypto_internal_types::sign::threshold_sig::ni_dkg::{
 };
 use ic_crypto_internal_types::NodeIndex;
 use ic_crypto_tls_interfaces::TlsPublicKeyCert;
-use ic_logger::new_logger;
-use ic_logger::replica_logger::no_op_logger;
+use ic_logger::{new_logger, ReplicaLogger};
 use ic_types::crypto::canister_threshold_sig::error::{
-    IDkgCreateDealingError, IDkgLoadTranscriptError,
+    IDkgCreateDealingError, IDkgLoadTranscriptError, IDkgOpenTranscriptError,
+    IDkgVerifyDealingPrivateError, ThresholdEcdsaSignShareError,
 };
+use ic_types::crypto::canister_threshold_sig::ExtendedDerivationPath;
 use ic_types::crypto::{AlgorithmId, KeyId};
-use ic_types::{NodeId, NumberOfNodes};
+use ic_types::{NodeId, NumberOfNodes, Randomness};
 use rand::rngs::OsRng;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use tarpc::server::BaseChannel;
 #[allow(unused_imports)]
 use tarpc::server::Serve;
 use tarpc::tokio_serde::formats::Bincode;
 use tarpc::{context, serde_transport, server::Channel};
-use tecdsa::{
-    IDkgComplaintInternal, IDkgDealingInternal, IDkgTranscriptInternal,
-    IDkgTranscriptOperationInternal, MEGaPublicKey,
-};
 use tokio::net::UnixListener;
 use tokio_util::codec::length_delimited::LengthDelimitedCodec;
 
-pub(crate) struct TarpcCspVaultServerImpl {
-    socket_path: PathBuf,
+pub struct TarpcCspVaultServerImpl {
     local_csp_vault: Arc<LocalCspVault<OsRng, ProtoSecretKeyStore, ProtoSecretKeyStore>>,
     listener: UnixListener,
+    #[allow(unused)]
+    logger: ReplicaLogger,
 }
 
 #[derive(Clone)]
@@ -238,6 +241,26 @@ impl TarpcCspVault for TarpcCspVaultServerWorker {
         )
     }
 
+    async fn idkg_verify_dealing_private(
+        self,
+        _: context::Context,
+        algorithm_id: AlgorithmId,
+        dealing: IDkgDealingInternal,
+        dealer_index: NodeIndex,
+        receiver_index: NodeIndex,
+        receiver_key_id: KeyId,
+        context_data: Vec<u8>,
+    ) -> Result<(), IDkgVerifyDealingPrivateError> {
+        self.local_csp_vault.idkg_verify_dealing_private(
+            algorithm_id,
+            &dealing,
+            dealer_index,
+            receiver_index,
+            receiver_key_id,
+            &context_data,
+        )
+    }
+
     async fn idkg_load_transcript(
         self,
         _: context::Context,
@@ -246,9 +269,29 @@ impl TarpcCspVault for TarpcCspVaultServerWorker {
         receiver_index: NodeIndex,
         key_id: KeyId,
         transcript: IDkgTranscriptInternal,
-    ) -> Result<Vec<IDkgComplaintInternal>, IDkgLoadTranscriptError> {
+    ) -> Result<BTreeMap<NodeIndex, IDkgComplaintInternal>, IDkgLoadTranscriptError> {
         self.local_csp_vault.idkg_load_transcript(
             &dealings,
+            &context_data,
+            receiver_index,
+            &key_id,
+            &transcript,
+        )
+    }
+
+    async fn idkg_load_transcript_with_openings(
+        self,
+        _: context::Context,
+        dealings: BTreeMap<NodeIndex, IDkgDealingInternal>,
+        openings: BTreeMap<NodeIndex, BTreeMap<NodeIndex, CommitmentOpening>>,
+        context_data: Vec<u8>,
+        receiver_index: NodeIndex,
+        key_id: KeyId,
+        transcript: IDkgTranscriptInternal,
+    ) -> Result<(), IDkgLoadTranscriptError> {
+        self.local_csp_vault.idkg_load_transcript_with_openings(
+            &dealings,
+            &openings,
             &context_data,
             receiver_index,
             &key_id,
@@ -263,12 +306,55 @@ impl TarpcCspVault for TarpcCspVaultServerWorker {
     ) -> Result<MEGaPublicKey, CspCreateMEGaKeyError> {
         self.local_csp_vault.idkg_gen_mega_key_pair(algorithm_id)
     }
+
+    async fn idkg_open_dealing(
+        self,
+        _: context::Context,
+        dealing: IDkgDealingInternal,
+        dealer_index: NodeIndex,
+        context_data: Vec<u8>,
+        opener_index: NodeIndex,
+        opener_key_id: KeyId,
+    ) -> Result<CommitmentOpening, IDkgOpenTranscriptError> {
+        self.local_csp_vault.idkg_open_dealing(
+            dealing,
+            dealer_index,
+            &context_data,
+            opener_index,
+            &opener_key_id,
+        )
+    }
+
+    // `ThresholdEcdsaSignerCspVault`-methods
+    async fn ecdsa_sign_share(
+        self,
+        _: context::Context,
+        derivation_path: ExtendedDerivationPath,
+        hashed_message: Vec<u8>,
+        nonce: Randomness,
+        key: IDkgTranscriptInternal,
+        kappa_unmasked: IDkgTranscriptInternal,
+        lambda_masked: IDkgTranscriptInternal,
+        kappa_times_lambda: IDkgTranscriptInternal,
+        key_times_lambda: IDkgTranscriptInternal,
+        algorithm_id: AlgorithmId,
+    ) -> Result<ThresholdEcdsaSigShareInternal, ThresholdEcdsaSignShareError> {
+        self.local_csp_vault.ecdsa_sign_share(
+            &derivation_path,
+            &hashed_message,
+            &nonce,
+            &key,
+            &kappa_unmasked,
+            &lambda_masked,
+            &kappa_times_lambda,
+            &key_times_lambda,
+            algorithm_id,
+        )
+    }
 }
 
 impl TarpcCspVaultServerImpl {
-    pub fn new(sks_dir: &Path, socket_path: &Path) -> Self {
-        // TODO(CRP-1254: add a real logger.
-        let logger = no_op_logger();
+    pub fn new(sks_dir: &Path, listener: UnixListener, logger: ReplicaLogger) -> Self {
         let node_secret_key_store =
             ProtoSecretKeyStore::open(sks_dir, SKS_DATA_FILENAME, Some(new_logger!(&logger)));
         let canister_secret_key_store = ProtoSecretKeyStore::open(
@@ -282,19 +368,13 @@ impl TarpcCspVaultServerImpl {
             Arc::new(CryptoMetrics::none()),
             new_logger!(&logger),
         ));
-        let listener = UnixListener::bind(&socket_path).unwrap_or_else(|e| {
-            panic!(
-                "Error binding to socket at {}: {}",
-                socket_path.display(),
-                e
-            )
-        });
         Self {
-            socket_path: socket_path.to_owned(),
             local_csp_vault: local_csp_server,
             listener,
+            logger,
         }
     }
+
     pub async fn run(self) {
         // Wrap data in telegrams with a length header.
         let codec_builder = LengthDelimitedCodec::builder();
@@ -303,8 +383,8 @@ impl TarpcCspVaultServerImpl {
         loop {
             let (conn, _addr) = self.listener.accept().await.unwrap_or_else(|e| {
                 panic!(
-                    "Error listening at socket {}: {}",
-                    &self.socket_path.display(),
+                    "Error listening at socket {:?}: {}",
+                    &self.listener.local_addr(),
                     e
                 )
             });

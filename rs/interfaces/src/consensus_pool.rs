@@ -18,6 +18,7 @@ use ic_types::{
     Height,
 };
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 // tag::change_set[]
 pub type ChangeSet = Vec<ChangeAction>;
@@ -206,6 +207,9 @@ pub trait ConsensusPool {
 
     /// Return a reference to the consensus cache (ConsensusPoolCache).
     fn as_cache(&self) -> &dyn ConsensusPoolCache;
+
+    /// Return a reference to the consensus block cache (ConsensusBlockCache).
+    fn as_block_cache(&self) -> &dyn ConsensusBlockCache;
 }
 
 /// Mutation operations on top of ConsensusPool.
@@ -285,7 +289,7 @@ pub trait ConsensusPoolCache: Send + Sync {
     /// P2P should keep up connections to all nodes registered in any registry
     /// between the one returned from this function and the current
     /// `RegistryVersion`.
-    fn get_subnet_membership_version(&self) -> RegistryVersion {
+    fn get_oldest_registry_version_in_use(&self) -> RegistryVersion {
         self.catch_up_package()
             .content
             .block
@@ -293,9 +297,37 @@ pub trait ConsensusPoolCache: Send + Sync {
             .payload
             .as_ref()
             .as_summary()
-            .dkg
-            .get_subnet_membership_version()
+            .get_oldest_registry_version_in_use()
     }
+
+    /// The target height that the StateManager should start at given
+    /// this consensus pool during startup.
+    fn starting_height(&self) -> Height {
+        let certified_height = self.finalized_block().context.certified_height;
+        let catchup_package_height = self.catch_up_package().height();
+        certified_height.max(catchup_package_height)
+    }
+}
+
+/// Cache of blocks from the block chain.
+pub trait ConsensusBlockCache: Send + Sync {
+    /// Returns the block at the given height from the finalized tip.
+    /// The implementation can choose the number of past blocks to cache.
+    fn finalized_chain(&self) -> Arc<dyn ConsensusBlockChain>;
+}
+
+/// Snapshot of the block chain
+#[allow(clippy::len_without_is_empty)]
+pub trait ConsensusBlockChain: Send + Sync {
+    /// Returns the highest block in the chain.
+    fn tip(&self) -> Block;
+
+    /// Returns the block at the given height from the chain. The implementation
+    /// can choose the number of past blocks to cache.
+    fn block(&self, height: Height) -> Option<Block>;
+
+    /// Returns the length of the chain.
+    fn len(&self) -> usize;
 }
 
 /// An iterator for block ancestors.
@@ -306,7 +338,7 @@ pub struct ChainIterator<'a> {
 }
 
 impl<'a> ChainIterator<'a> {
-    /// Return an interator that iterates block acenstors, going backwards
+    /// Return an iterator that iterates block ancestors, going backwards
     /// from the `from_block` to the `to_block` (both inclusive), or until a
     /// parent is not found in the consensus pool if the `to_block` is not
     /// specified.

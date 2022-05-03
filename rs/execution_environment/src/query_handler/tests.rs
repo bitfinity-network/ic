@@ -1,13 +1,15 @@
 use crate::{
+    canister_manager::tests::InstallCodeContextBuilder,
     canister_manager::{CanisterManager, CanisterMgrConfig},
     canister_settings::CanisterSettings,
     hypervisor::Hypervisor,
     IngressHistoryWriterImpl, InternalHttpQueryHandler,
 };
 use ic_base_types::NumSeconds;
-use ic_config::execution_environment::Config;
+use ic_config::{execution_environment::Config, flag_status::FlagStatus};
+use ic_error_types::ErrorCode;
 use ic_interfaces::execution_environment::{
-    ExecutionParameters, QueryHandler, SubnetAvailableMemory,
+    AvailableMemory, ExecutionMode, ExecutionParameters, QueryHandler,
 };
 use ic_metrics::MetricsRegistry;
 use ic_registry_routing_table::{CanisterIdRange, RoutingTable};
@@ -15,19 +17,14 @@ use ic_registry_subnet_type::SubnetType;
 use ic_replicated_state::ReplicatedState;
 use ic_test_utilities::{
     cycles_account_manager::CyclesAccountManagerBuilder,
-    types::{
-        ids::{canister_test_id, subnet_test_id, user_test_id},
-        messages::InstallCodeContextBuilder,
-    },
+    types::ids::{canister_test_id, subnet_test_id, user_test_id},
     universal_canister::{call_args, wasm, UNIVERSAL_CANISTER_WASM},
     with_test_replica_logger,
 };
-use ic_types::{
-    ingress::WasmResult, messages::UserQuery, user_error::ErrorCode, ComputeAllocation,
-};
+use ic_types::{ingress::WasmResult, messages::UserQuery, ComputeAllocation};
 use ic_types::{CanisterId, Cycles, NumBytes, NumInstructions, SubnetId};
 use maplit::btreemap;
-use std::{path::Path, sync::Arc};
+use std::{convert::TryFrom, path::Path, sync::Arc};
 
 const CYCLE_BALANCE: Cycles = Cycles::new(100_000_000_000_000);
 const INSTRUCTION_LIMIT: NumInstructions = NumInstructions::new(1_000_000_000);
@@ -41,20 +38,20 @@ where
     fn canister_manager_config(subnet_id: SubnetId, subnet_type: SubnetType) -> CanisterMgrConfig {
         CanisterMgrConfig::new(
             MEMORY_CAPACITY,
-            Some(CYCLE_BALANCE),
             CYCLE_BALANCE,
             NumSeconds::from(100_000),
             subnet_id,
             subnet_type,
             1000,
             1,
+            FlagStatus::Enabled,
         )
     }
 
     fn initial_state(path: &Path, subnet_id: SubnetId, subnet_type: SubnetType) -> ReplicatedState {
-        let routing_table = Arc::new(RoutingTable::new(btreemap! {
+        let routing_table = Arc::new(RoutingTable::try_from(btreemap! {
             CanisterIdRange{ start: CanisterId::from(0), end: CanisterId::from(0xff) } => subnet_id,
-        }));
+        }).unwrap());
         let mut state = ReplicatedState::new_rooted_at(subnet_id, subnet_type, path.to_path_buf());
         state.metadata.network_topology.routing_table = routing_table;
         state.metadata.network_topology.nns_subnet_id = subnet_id;
@@ -67,7 +64,6 @@ where
         let cycles_account_manager = Arc::new(CyclesAccountManagerBuilder::new().build());
         let hypervisor = Hypervisor::new(
             Config::default(),
-            1,
             &metrics_registry,
             subnet_id,
             subnet_type,
@@ -76,6 +72,7 @@ where
         );
         let hypervisor = Arc::new(hypervisor);
         let ingress_history_writer = Arc::new(IngressHistoryWriterImpl::new(
+            Config::default(),
             log.clone(),
             &metrics_registry,
         ));
@@ -91,7 +88,6 @@ where
         let query_handler = InternalHttpQueryHandler::new(
             log,
             hypervisor,
-            subnet_id,
             subnet_type,
             Config::default(),
             &metrics_registry,
@@ -128,11 +124,17 @@ fn universal_canister(
                 .build(),
             state,
             ExecutionParameters {
-                instruction_limit: INSTRUCTION_LIMIT,
+                total_instruction_limit: INSTRUCTION_LIMIT,
+                slice_instruction_limit: INSTRUCTION_LIMIT,
                 canister_memory_limit: MEMORY_CAPACITY,
-                subnet_available_memory: SubnetAvailableMemory::new(MEMORY_CAPACITY.get() as i64),
+                subnet_available_memory: AvailableMemory::new(
+                    MEMORY_CAPACITY.get() as i64,
+                    MEMORY_CAPACITY.get() as i64,
+                )
+                .into(),
                 compute_allocation: ComputeAllocation::default(),
                 subnet_type: SubnetType::Application,
+                execution_mode: ExecutionMode::Replicated,
             },
         )
         .1
@@ -158,7 +160,7 @@ fn query_metrics_are_reported() {
                     method_payload: wasm()
                         .inter_query(
                             canister_b,
-                            call_args().other_side(wasm().reply_data(&b"pong".to_vec())),
+                            call_args().other_side(wasm().reply_data(b"pong".as_ref())),
                         )
                         .build(),
                     ingress_expiry: 0,
@@ -313,7 +315,7 @@ fn query_call_with_side_effects() {
                         .inter_query(
                             canister_b,
                             call_args()
-                                .other_side(wasm().reply_data(&b"ignore".to_vec()))
+                                .other_side(wasm().reply_data(b"ignore".as_ref()))
                                 .on_reply(wasm().stable_size().reply_int()),
                         )
                         .build(),
@@ -349,7 +351,7 @@ fn query_calls_disabled_for_application_subnet() {
                         .inter_query(
                             canister_b,
                             call_args()
-                                .other_side(wasm().reply_data(&b"ignore".to_vec()))
+                                .other_side(wasm().reply_data(b"ignore".as_ref()))
                                 .on_reply(wasm().stable_size().reply_int()),
                         )
                         .build(),

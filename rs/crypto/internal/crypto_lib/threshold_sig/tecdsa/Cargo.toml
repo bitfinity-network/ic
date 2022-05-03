@@ -1,20 +1,21 @@
 [package]
-name = "tecdsa"
+name = "ic-crypto-internal-threshold-sig-ecdsa"
 version = "0.1.0"
 edition = "2018"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+fe-derive = { path = "fe-derive" }
 ic-crypto-sha = { path = "../../../../sha" }
 ic-crypto-internal-types = { path = "../../types" }
+ic-crypto-internal-hmac = { path = "../../hmac" }
 ic-types = { path = "../../../../../types/types" }
-k256 = { version = "0.9.5", features = ["arithmetic"] }
-p256 = { version = "0.9.0", features = ["arithmetic"] }
-zeroize = { version = "1.1.1", features = ["zeroize_derive"] }
-rand_core = "0.5"
-rand_chacha = "0.2.2"
-sha2 = "0.9"
+k256 = { version = "0.10.3", default-features = false, features = ["arithmetic"] }
+p256 = { version = "0.10", default-features = false, features = ["arithmetic"] }
+zeroize = { version = "1.4.3", features = ["zeroize_derive"] }
+rand = "0.8"
+rand_chacha = "0.3"
 hex = "0.4"
 hex-literal = "0.3.3"
 paste = "1.0.0"
@@ -24,8 +25,9 @@ serde_cbor = "0.11.1"
 lazy_static = "1.4.0"
 
 [dev-dependencies]
-rand = "0.7"
 criterion = { version = "0.3", features = ["html_reports"] }
+k256 = { version = "0.10.3", features = ["ecdsa"] }
+bip32 = { version = "0.3", features = ["secp256k1"] }
 
 [[bench]]
 name = "field_ops"
@@ -41,4 +43,8 @@ harness = false
 
 [[bench]]
 name = "dealings"
+harness = false
+
+[[bench]]
+name = "zk"
 harness = false

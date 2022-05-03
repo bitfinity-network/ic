@@ -1,17 +1,18 @@
-use fondue::pot::execution::Config as ExecConfig;
-use fondue::pot::Config as PotConfig;
+use clap::Parser;
+use ic_base_types::NodeId;
 use ic_fondue::ic_manager::{IcEndpoint, IcManagerSettings, IcSubnet, RuntimeDescriptor};
+use ic_fondue::pot::execution::Config as ExecConfig;
+use ic_fondue::pot::Config as PotConfig;
 use ic_registry_subnet_type::SubnetType;
 use ic_types::{PrincipalId, SubnetId};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
-use structopt::StructOpt;
 use url::Url;
 
 impl Options {
-    /// Creates a [fondue::pot::Config] according to the command line options
-    /// captured in [Option] and a given default [fondue::pot::Config].
+    /// Creates a [ic_fondue::pot::Config] according to the command line options
+    /// captured in [Option] and a given default [ic_fondue::pot::Config].
     pub fn modify_fondue_pot_config(&self, cfg: PotConfig) -> PotConfig {
         PotConfig {
             rng_seed: self.fondue_seed.unwrap_or(cfg.rng_seed),
@@ -21,13 +22,10 @@ impl Options {
         }
     }
 
-    /// Creates a [fondue::pot::execution::Config] according to the command line
-    /// options captured in [Option] and a given default
-    /// [fondue::pot::execution::Config].
-    pub fn modify_fondue_exec_config(
-        &self,
-        cfg: ExecConfig<IcManagerSettings>,
-    ) -> ExecConfig<IcManagerSettings> {
+    /// Creates a [ic_fondue::pot::execution::Config] according to the command
+    /// line options captured in [Option] and a given default
+    /// [ic_fondue::pot::execution::Config].
+    pub fn modify_fondue_exec_config(&self, cfg: ExecConfig) -> ExecConfig {
         ExecConfig {
             pot_timeout: self.pot_timeout.unwrap_or(cfg.pot_timeout),
             filter: Some(self.get_fondue_filter()),
@@ -75,7 +73,8 @@ impl Options {
                         }),
                         metrics_url: None,
                         started_at: Instant::now(),
-                        ssh_key_pairs: vec![],
+                        // this interface is deprecated and that's why we use a fake id here
+                        node_id: NodeId::from(PrincipalId::new_node_test_id(0)),
                     })
                 }
                 Some(endpoints)
@@ -85,18 +84,18 @@ impl Options {
         }
     }
 
-    fn get_fondue_filter(&self) -> fondue::pot::Filter {
-        fondue::pot::Filter {
+    fn get_fondue_filter(&self) -> ic_fondue::pot::Filter {
+        ic_fondue::pot::Filter {
             select: self.filters.clone().unwrap_or_else(|| "".to_string()),
             skip_filter: self.skip.clone(),
         }
     }
 }
 
-#[derive(Debug, Clone, StructOpt)]
-#[structopt(name = "system-tests", about = "Runs the our system-tests")]
+#[derive(Debug, Clone, Parser)]
+#[clap(name = "system-tests", about = "Runs the our system-tests", version)]
 pub struct Options {
-    #[structopt(
+    #[clap(
         long = "seed",
         help = r#"
 Uses the specified seed for starting up the RNG;
@@ -104,15 +103,15 @@ This is important to pay attention to if you want to reproduce a run."#
     )]
     pub fondue_seed: Option<u64>,
 
-    #[structopt(
+    #[clap(
         long = "ready-timeout",
         parse(try_from_str = parse_duration),
         help = "How much time should we wait for the replicas to be ready for interaction"
     )]
     pub fondue_ready_timeout: Option<Duration>,
 
-    #[structopt(
-        short = "v",
+    #[clap(
+        short = 'v',
         parse(from_occurrences),
         help = r#"
 Verbosity control. Using -v makes the tests a little chatty while
@@ -120,56 +119,56 @@ Verbosity control. Using -v makes the tests a little chatty while
     )]
     pub fondue_log_level: u64,
 
-    #[structopt(
+    #[clap(
         long = "fondue-logs",
         parse(from_os_str),
         help = "Saves the framework logs to a file. See 'tee-replica-logs-base-dir' for saving the replica logs."
     )]
     pub fondue_log_target: Option<PathBuf>,
 
-    #[structopt(
+    #[clap(
         long = "tee-replica-logs-base-dir",
         parse(from_os_str),
         help = "Saves the logs of every replica to a dedicated file, unique for corresponding pot and channel."
     )]
     pub tee_replica_logs_base_dir: Option<PathBuf>,
 
-    #[structopt(
+    #[clap(
         long = "endpoint-urls",
         help = "If specified, execute eligible system tests against a running IC."
     )]
     pub endpoint_urls: Option<String>,
 
-    #[structopt(
+    #[clap(
         long = "timeout",
         parse(try_from_str = parse_duration),
         help = "How much time should each test take before being killed"
     )]
     pub pot_timeout: Option<Duration>,
 
-    #[structopt(long = "jobs", help = "How many fondue jobs should we run in parallel")]
+    #[clap(long = "jobs", help = "How many fondue jobs should we run in parallel")]
     pub jobs: Option<usize>,
 
-    #[structopt(
+    #[clap(
         long = "pots",
         help = "Run only pots containing the given string in their names"
     )]
     pub pot_filter: Option<String>,
 
-    #[structopt(long = "skip", help = "Skip any tests that match this filter")]
+    #[clap(long = "skip", help = "Skip any tests that match this filter")]
     pub skip: Option<String>,
 
-    #[structopt(long_help = "Run any tests that contain this filter in their name")]
+    #[clap(long_help = "Run any tests that contain this filter in their name")]
     pub filters: Option<String>,
 
-    #[structopt(
-        long = "runtime-stats",
+    #[clap(
+        long = "result-file",
         parse(from_os_str),
-        help = "If set, specifies where to write runtime statistics collected during tests execution"
+        help = "If set, specifies where to write results of executed tests"
     )]
-    pub runtime_stats_file: Option<PathBuf>,
+    pub result_file: Option<PathBuf>,
 
-    #[structopt(
+    #[clap(
         long = "experimental",
         help = "Include 'experimetnal' (vm-based) pots."
     )]

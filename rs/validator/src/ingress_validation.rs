@@ -1,10 +1,10 @@
 use crate::webauthn::validate_webauthn_sig;
+use ic_constants::{MAX_INGRESS_TTL, PERMITTED_DRIFT_AT_VALIDATOR};
 use ic_crypto::{user_public_key_from_bytes, KeyBytesContentType};
 use ic_interfaces::crypto::IngressSigVerifier;
 use ic_types::crypto::{CanisterSig, CanisterSigOf};
 use ic_types::{
     crypto::{AlgorithmId, BasicSig, BasicSigOf, CryptoError, UserPublicKey},
-    ingress::MAX_INGRESS_TTL,
     malicious_flags::MaliciousFlags,
     messages::{
         Authentication, Delegation, HasCanisterId, HttpRequest, HttpRequestContent, MessageId,
@@ -181,7 +181,9 @@ fn validate_ingress_expiry<C: HttpRequestContent>(
     let ingress_expiry = request.ingress_expiry();
     let provided_expiry = Time::from_nanos_since_unix_epoch(ingress_expiry);
     let min_allowed_expiry = current_time;
-    let max_allowed_expiry = min_allowed_expiry + MAX_INGRESS_TTL;
+    // We need to account for time drift and be more forgiving at rejecting ingress
+    // messages due to their expiry being too far in the future.
+    let max_allowed_expiry = min_allowed_expiry + MAX_INGRESS_TTL + PERMITTED_DRIFT_AT_VALIDATOR;
     if !(min_allowed_expiry <= provided_expiry && provided_expiry <= max_allowed_expiry) {
         let msg = format!(
             "Specified ingress_expiry not within expected range:\n\

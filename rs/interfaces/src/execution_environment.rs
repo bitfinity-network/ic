@@ -1,30 +1,31 @@
 //! The execution environment public interface.
 mod errors;
 
-use crate::state_manager::StateManagerError;
-pub use errors::{CanisterHeartbeatError, CanisterOutOfCyclesError, HypervisorError, TrapCode};
+pub use errors::{CanisterOutOfCyclesError, HypervisorError, TrapCode};
 use ic_base_types::NumBytes;
+use ic_error_types::UserError;
 use ic_registry_provisional_whitelist::ProvisionalWhitelist;
 use ic_registry_subnet_type::SubnetType;
 use ic_sys::{PageBytes, PageIndex};
 use ic_types::{
-    canonical_error::CanonicalError,
+    crypto::canister_threshold_sig::MasterEcdsaPublicKey,
     ingress::{IngressStatus, WasmResult},
     messages::{
-        CertificateDelegation, HttpQueryResponse, MessageId, SignedIngressContent, UserQuery,
+        CertificateDelegation, HttpQueryResponse, InternalQuery, InternalQueryResponse, MessageId,
+        Response, SignedIngressContent, UserQuery,
     },
-    user_error::UserError,
     ComputeAllocation, Cycles, ExecutionRound, Height, NumInstructions, Randomness, Time,
 };
 use serde::{Deserialize, Serialize};
-use std::convert::Infallible;
+use std::ops::Div;
 use std::sync::{Arc, RwLock};
+use std::{convert::Infallible, fmt};
 use tower::{buffer::Buffer, util::BoxService};
 
 /// Instance execution statistics. The stats are cumulative and
 /// contain measurements from the point in time when the instance was
 /// created up until the moment they are requested.
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct InstanceStats {
     /// Total number of (host) pages accessed (read or written) by the instance
     /// and loaded into the linear memory.
@@ -38,60 +39,184 @@ pub struct InstanceStats {
 
 /// Errors that can be returned when fetching the available memory on a subnet.
 pub enum SubnetAvailableMemoryError {
-    InsufficientMemory { requested: NumBytes, available: i64 },
+    InsufficientMemory {
+        requested_total: NumBytes,
+        message_requested: NumBytes,
+        available_total: i64,
+        available_messages: i64,
+    },
+}
+
+/// Tracks the available memory on a subnet. The main idea is to separately track
+/// the total available memory and the message available memory. When trying to
+/// allocate message memory one can do this as long as there is sufficient total
+/// memory as well as message memory available. When trying to allocate non-message
+/// memory only the total memory needs to suffice.
+///
+/// Note that there are situations where total available memory is smaller than
+/// the available message memory, i.e., when the memory is consumed by something
+/// other than messages.
+///
+/// This struct is designed that it can eventually replace `SubnetAvailableMemory`,
+/// which currently wraps `AvailableMemory` in an `Arc<RwLock>`. Based on how it is
+/// currently used this wrapping is not strictly necessary and one could alternatively
+/// pass a mutable reference to `AvailableMemory` in the respective places.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct AvailableMemory {
+    /// The total memory available on the subnet
+    total_memory: i64,
+    /// The memory available for messages
+    message_memory: i64,
+}
+
+impl AvailableMemory {
+    pub fn new(total_memory: i64, message_memory: i64) -> Self {
+        AvailableMemory {
+            total_memory,
+            message_memory,
+        }
+    }
+
+    /// Returns the total available memory.
+    pub fn get_total_memory(&self) -> i64 {
+        self.total_memory
+    }
+
+    /// Returns the memory available for messages, ignoring the totally available memory.
+    pub fn get_message_memory(&self) -> i64 {
+        self.message_memory
+    }
+
+    /// Returns the maximal amount of memory that is available for messages.
+    ///
+    /// This amount is computed as the minimum of total available memory and available
+    /// message memory. This is useful to decide whether it is still possible to allocate
+    /// memory for messages.
+    pub fn max_available_message_memory(&self) -> i64 {
+        self.total_memory.min(self.message_memory)
+    }
+}
+
+impl Div<i64> for AvailableMemory {
+    type Output = Self;
+
+    fn div(self, rhs: i64) -> Self::Output {
+        Self {
+            total_memory: self.total_memory / rhs,
+            message_memory: self.message_memory / rhs,
+        }
+    }
 }
 
 /// This struct is used to manage the current amount of memory available on the
 /// subnet.
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct SubnetAvailableMemory(
-    /// TODO(EXC-677): Make this just an `i64`.
+pub struct SubnetAvailableMemory {
+    /// TODO(EXC-677): Make this just a `AvailableMemory`.
     #[serde(serialize_with = "ic_utils::serde_arc::serialize_arc")]
     #[serde(deserialize_with = "ic_utils::serde_arc::deserialize_arc")]
-    Arc<RwLock<i64>>,
-);
+    available_memory: Arc<RwLock<AvailableMemory>>,
+}
+
+impl From<AvailableMemory> for SubnetAvailableMemory {
+    fn from(available: AvailableMemory) -> Self {
+        SubnetAvailableMemory {
+            available_memory: Arc::new(RwLock::new(available)),
+        }
+    }
+}
 
 impl SubnetAvailableMemory {
-    pub fn new(amount: i64) -> Self {
-        Self(Arc::new(RwLock::new(amount)))
-    }
-
     /// Try to use some memory capacity and fail if not enough is available
-    pub fn try_decrement(&self, requested: NumBytes) -> Result<(), SubnetAvailableMemoryError> {
-        let mut available = self.0.write().unwrap();
-        if requested.get() as i64 <= *available {
-            *available -= requested.get() as i64;
+    pub fn try_decrement(
+        &self,
+        requested: NumBytes,
+        message_requested: NumBytes,
+    ) -> Result<(), SubnetAvailableMemoryError> {
+        debug_assert!(requested >= message_requested);
+        let mut available = self.available_memory.write().unwrap();
+
+        let total_is_available =
+            requested.get() as i64 <= available.total_memory || requested.get() == 0;
+        let message_is_available = message_requested.get() as i64 <= available.message_memory
+            || message_requested.get() == 0;
+
+        if total_is_available && message_is_available {
+            (*available).total_memory -= requested.get() as i64;
+            (*available).message_memory -= message_requested.get() as i64;
             Ok(())
         } else {
             Err(SubnetAvailableMemoryError::InsufficientMemory {
-                requested,
-                available: *available,
+                requested_total: requested,
+                message_requested,
+                available_total: available.total_memory,
+                available_messages: available.message_memory,
             })
         }
     }
 
-    pub fn increment(&self, amount: NumBytes) {
-        let mut available = self.0.write().unwrap();
-        *available += amount.get() as i64;
+    pub fn increment(&self, total_amount: NumBytes, message_amount: NumBytes) {
+        debug_assert!(total_amount >= message_amount);
+
+        let mut available = self.available_memory.write().unwrap();
+        available.total_memory += total_amount.get() as i64;
+        available.message_memory += message_amount.get() as i64;
     }
 
-    pub fn get(&self) -> i64 {
-        *self.0.read().unwrap()
+    pub fn get_total_memory(&self) -> i64 {
+        self.available_memory.read().unwrap().total_memory
     }
 
-    pub fn set(&self, val: i64) {
-        *self.0.write().unwrap() = val
+    pub fn get_message_memory(&self) -> i64 {
+        self.available_memory.read().unwrap().message_memory
     }
+
+    pub fn get(&self) -> AvailableMemory {
+        *self.available_memory.read().unwrap()
+    }
+
+    pub fn set(&self, available: AvailableMemory) {
+        *self.available_memory.write().unwrap() = available;
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub enum ExecutionMode {
+    Replicated,
+    NonReplicated,
 }
 
 // Canister and subnet configuration parameters required for execution.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ExecutionParameters {
-    pub instruction_limit: NumInstructions,
+    /// The total instruction limit of message execution. With deterministic
+    /// time slicing this limit may exceed the per-round instruction limit.
+    /// The message fails with an out-of-instructions error if it executes
+    /// more instructions than this limit.
+    pub total_instruction_limit: NumInstructions,
+
+    /// Without deterministic time slicing, this limit must be equal to
+    /// `total_instruction_limit`. With deterministic time slicing this
+    /// limit specifies the number of instructions to execute before
+    /// pausing the execution.
+    pub slice_instruction_limit: NumInstructions,
+
     pub canister_memory_limit: NumBytes,
     pub subnet_available_memory: SubnetAvailableMemory,
     pub compute_allocation: ComputeAllocation,
     pub subnet_type: SubnetType,
+    pub execution_mode: ExecutionMode,
+}
+
+/// The response of the executed message created by the `ic0.msg_reply()`
+/// or `ic0.msg_reject()` System API functions.
+/// If the execution failed or did not call these System API functions,
+/// then the response is empty.
+#[derive(Debug)]
+pub enum ExecResult {
+    IngressResult((MessageId, IngressStatus)),
+    ResponseResult(Response),
+    Empty,
 }
 
 /// The data structure returned by
@@ -103,13 +228,23 @@ pub struct ExecuteMessageResult<CanisterState> {
     /// to the instructions_limit that `execute_canister_message()` was called
     /// with.
     pub num_instructions_left: NumInstructions,
-    /// Optional status for an Ingress message if available.
-    pub ingress_status: Option<(MessageId, IngressStatus)>,
+    /// The response of the executed message. The caller needs to either push it
+    /// to the output queue of the canister or update the ingress status.
+    pub result: ExecResult,
     /// The size of the heap delta the canister produced
     pub heap_delta: NumBytes,
 }
 
 pub type HypervisorResult<T> = Result<T, HypervisorError>;
+
+/// Interface for the component to execute internal queries triggered by IC.
+// Since this service will be shared across many connections we must
+// make it cloneable by introducing a bounded buffer infront of it.
+// https://docs.rs/tower/0.4.10/tower/buffer/index.html
+// The buffer also dampens usage by reducing the risk of
+// spiky traffic when users retry in case failed requests.
+pub type AnonymousQueryService =
+    Buffer<BoxService<InternalQuery, InternalQueryResponse, Infallible>, InternalQuery>;
 
 /// Interface for the component to filter out ingress messages that
 /// the canister is not willing to accept.
@@ -119,11 +254,7 @@ pub type HypervisorResult<T> = Result<T, HypervisorError>;
 // The buffer also dampens usage by reducing the risk of
 // spiky traffic when users retry in case failed requests.
 pub type IngressFilterService = Buffer<
-    BoxService<
-        (ProvisionalWhitelist, SignedIngressContent),
-        Result<(), CanonicalError>,
-        Infallible,
-    >,
+    BoxService<(ProvisionalWhitelist, SignedIngressContent), Result<(), UserError>, Infallible>,
     (ProvisionalWhitelist, SignedIngressContent),
 >;
 
@@ -162,15 +293,6 @@ pub enum IngressHistoryError {
     StateNotAvailableYet(Height),
 }
 
-impl From<StateManagerError> for IngressHistoryError {
-    fn from(source: StateManagerError) -> Self {
-        match source {
-            StateManagerError::StateRemoved(height) => Self::StateRemoved(height),
-            StateManagerError::StateNotCommittedYet(height) => Self::StateNotAvailableYet(height),
-        }
-    }
-}
-
 /// Interface for reading the history of ingress messages.
 pub trait IngressHistoryReader: Send + Sync {
     /// Returns a function that can be used to query the status for a given
@@ -204,6 +326,16 @@ pub trait IngressHistoryWriter: Send + Sync {
     fn set_status(&self, state: &mut Self::State, message_id: MessageId, status: IngressStatus);
 }
 
+/// A trait for handling `out_of_instructions()` calls from the Wasm module.
+pub trait OutOfInstructionsHandler {
+    /// Returns a new instruction limit if the execution should continue.
+    /// Otherwise, returns an error to trap the execution.
+    fn out_of_instructions(
+        &self,
+        num_instructions_left: NumInstructions,
+    ) -> HypervisorResult<NumInstructions>;
+}
+
 /// A trait for providing all necessary imports to a Wasm module.
 pub trait SystemApi {
     /// Stores the execution error, so that the user can evaluate it later.
@@ -220,6 +352,12 @@ pub trait SystemApi {
 
     /// Returns the current size of the stable memory in wasm pages.
     fn stable_memory_size(&self) -> usize;
+
+    /// Returns the subnet type the replica runs on.
+    fn subnet_type(&self) -> SubnetType;
+
+    /// Returns the instruction limit for the current execution slice.
+    fn slice_instruction_limit(&self) -> NumInstructions;
 
     /// Copies `size` bytes starting from `offset` inside the opaque caller blob
     /// and copies them to heap[dst..dst+size]. The caller is the canister
@@ -340,10 +478,10 @@ pub trait SystemApi {
     ) -> HypervisorResult<()>;
 
     /// Outputs the specified bytes on the heap as a string on STDOUT.
-    fn ic0_debug_print(&self, src: u32, size: u32, heap: &[u8]);
+    fn ic0_debug_print(&self, src: u32, size: u32, heap: &[u8]) -> HypervisorResult<()>;
 
     /// Traps, with a possibly helpful message
-    fn ic0_trap(&self, src: u32, size: u32, heap: &[u8]) -> HypervisorError;
+    fn ic0_trap(&self, src: u32, size: u32, heap: &[u8]) -> HypervisorResult<()>;
 
     /// Creates a pending inter-canister message that will be scheduled if the
     /// current message execution completes successfully.
@@ -516,7 +654,13 @@ pub trait SystemApi {
 
     /// This system call is not part of the public spec and used by the
     /// hypervisor, when execution runs out of instructions.
-    fn out_of_instructions(&self) -> HypervisorError;
+    ///
+    /// Returns a new instruction limit if the execution should continue.
+    /// Otherwise, returns an error to trap the execution.
+    fn out_of_instructions(
+        &self,
+        num_instructions_left: NumInstructions,
+    ) -> HypervisorResult<NumInstructions>;
 
     /// This system call is not part of the public spec. It's called after a
     /// native `memory.grow` has been called to check whether there's enough
@@ -713,8 +857,99 @@ pub trait Scheduler: Send {
         &self,
         state: Self::State,
         randomness: Randomness,
+        ecdsa_subnet_public_key: Option<MasterEcdsaPublicKey>,
         current_round: ExecutionRound,
         provisional_whitelist: ProvisionalWhitelist,
         max_number_of_canisters: u64,
     ) -> Self::State;
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct WasmExecutionOutput {
+    pub wasm_result: Result<Option<WasmResult>, HypervisorError>,
+    pub num_instructions_left: NumInstructions,
+    pub instance_stats: InstanceStats,
+}
+
+impl fmt::Display for WasmExecutionOutput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let wasm_result_str = match &self.wasm_result {
+            Ok(result) => match result {
+                None => "None".to_string(),
+                Some(wasm_result) => format!("{}", wasm_result),
+            },
+            Err(err) => format!("{}", err),
+        };
+        write!(f, "wasm_result => [{}], instructions left => {}, instace_stats => [ accessed pages => {}, dirty pages => {}]",
+               wasm_result_str,
+               self.num_instructions_left,
+               self.instance_stats.accessed_pages,
+               self.instance_stats.dirty_pages
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_available_memory() {
+        let available = AvailableMemory::new(20, 10);
+        assert_eq!(available.get_total_memory(), 20);
+        assert_eq!(available.get_message_memory(), 10);
+        assert_eq!(available.max_available_message_memory(), 10);
+
+        let available = available / 2;
+        assert_eq!(available.get_total_memory(), 10);
+        assert_eq!(available.get_message_memory(), 5);
+        assert_eq!(available.max_available_message_memory(), 5);
+    }
+
+    #[test]
+    fn test_subnet_available_memory() {
+        let available: SubnetAvailableMemory = AvailableMemory::new(1 << 30, (1 << 30) - 5).into();
+        assert!(available
+            .try_decrement(NumBytes::from(10), NumBytes::from(5))
+            .is_ok());
+        assert!(available
+            .try_decrement(
+                NumBytes::from((1 << 30) - 10),
+                NumBytes::from((1 << 30) - 10)
+            )
+            .is_ok());
+        assert!(available
+            .try_decrement(NumBytes::from(1), NumBytes::from(1))
+            .is_err());
+        assert!(available
+            .try_decrement(NumBytes::from(1), NumBytes::from(0))
+            .is_err());
+
+        let available: SubnetAvailableMemory = AvailableMemory::new(1 << 30, -1).into();
+        assert!(available
+            .try_decrement(NumBytes::from(1), NumBytes::from(1))
+            .is_err());
+        assert!(available
+            .try_decrement(NumBytes::from(10), NumBytes::from(0))
+            .is_ok());
+        assert!(available
+            .try_decrement(NumBytes::from((1 << 30) - 10), NumBytes::from(0))
+            .is_ok());
+        assert!(available
+            .try_decrement(NumBytes::from(1), NumBytes::from(0))
+            .is_err());
+
+        let available: SubnetAvailableMemory = AvailableMemory::new(42, 43).into();
+        assert_eq!(available.get_total_memory(), 42);
+        assert_eq!(available.get_message_memory(), 43);
+        available.set(AvailableMemory::new(44, 45));
+        assert_eq!(available.get_total_memory(), 44);
+        assert_eq!(available.get_message_memory(), 45);
+        available.increment(NumBytes::from(1), NumBytes::from(0));
+        assert_eq!(available.get_total_memory(), 45);
+        assert_eq!(available.get_message_memory(), 45);
+        available.increment(NumBytes::from(1), NumBytes::from(1));
+        assert_eq!(available.get_total_memory(), 46);
+        assert_eq!(available.get_message_memory(), 46);
+    }
 }

@@ -10,6 +10,8 @@
 
 use criterion::{criterion_group, criterion_main, Criterion};
 use ic_artifact_pool::ingress_pool::IngressPoolImpl;
+use ic_constants::MAX_INGRESS_TTL;
+use ic_ic00_types::IC_00;
 use ic_ingress_manager::IngressManager;
 use ic_interfaces::{
     artifact_pool::UnvalidatedArtifact,
@@ -20,40 +22,42 @@ use ic_interfaces::{
 };
 use ic_logger::replica_logger::no_op_logger;
 use ic_metrics::MetricsRegistry;
-use ic_registry_client::{client::RegistryClientImpl, helper::subnet::SubnetRegistry};
-use ic_registry_common::proto_registry_data_provider::ProtoRegistryDataProvider;
+use ic_registry_client::client::RegistryClientImpl;
+use ic_registry_client_helpers::subnet::SubnetRegistry;
 use ic_registry_keys::make_subnet_record_key;
+use ic_registry_proto_data_provider::ProtoRegistryDataProvider;
 use ic_test_utilities::{
     artifact_pool_config::with_test_pool_config,
     consensus::MockConsensusCache,
     crypto::temp_crypto_component_with_fake_registry,
     cycles_account_manager::CyclesAccountManagerBuilder,
     history::MockIngressHistory,
-    registry::test_subnet_record,
     state::ReplicatedStateBuilder,
     state_manager::MockStateManager,
     types::ids::{node_test_id, subnet_test_id},
     types::messages::SignedIngressBuilder,
     FastForwardTimeSource,
 };
+use ic_test_utilities_registry::test_subnet_record;
 use ic_types::{
     artifact::{IngressMessageAttribute, IngressMessageId},
     batch::ValidationContext,
-    ic00::IC_00,
-    ingress::{IngressStatus, MAX_INGRESS_TTL},
+    ingress::IngressStatus,
     malicious_flags::MaliciousFlags,
     Height, NumBytes, RegistryVersion, SubnetId, Time,
 };
 use rand::Rng;
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::{
+    collections::HashSet,
+    sync::{Arc, RwLock},
+};
 
 /// Helper to run a single test with dependency setup.
 fn run_test<T>(_test_name: &str, test: T)
 where
     T: FnOnce(
         Arc<FastForwardTimeSource>,
-        &mut IngressPoolImpl,
+        Arc<RwLock<IngressPoolImpl>>,
         &mut IngressManager,
         Arc<dyn RegistryClient>,
     ),
@@ -68,7 +72,7 @@ where
     let consensus_pool_cache = Arc::new(MockConsensusCache::new());
     let mut state_manager = MockStateManager::new();
     state_manager.expect_get_state_at().return_const(Ok(
-        ic_interfaces::state_manager::Labeled::new(
+        ic_interfaces_state_manager::Labeled::new(
             Height::new(0),
             Arc::new(ReplicatedStateBuilder::default().build()),
         ),
@@ -81,12 +85,19 @@ where
             node_test_id(VALIDATOR_NODE_ID),
         ));
         let cycles_account_manager = Arc::new(CyclesAccountManagerBuilder::new().build());
+        let ingress_pool = Arc::new(RwLock::new(IngressPoolImpl::new(
+            pool_config,
+            metrics_registry.clone(),
+            no_op_logger(),
+        )));
+
         test(
             FastForwardTimeSource::new(),
-            &mut IngressPoolImpl::new(pool_config, metrics_registry.clone(), no_op_logger()),
+            ingress_pool.clone(),
             &mut IngressManager::new(
                 consensus_pool_cache,
                 ingress_hist_reader,
+                ingress_pool,
                 registry.clone(),
                 ingress_signature_crypto,
                 metrics_registry,
@@ -108,13 +119,14 @@ where
 /// Return the mean of all expiry time.
 fn prepare(
     time_source: &dyn TimeSource,
-    pool: &mut IngressPoolImpl,
+    pool: Arc<RwLock<IngressPoolImpl>>,
     now: Time,
     num: usize,
 ) -> Time {
     let mut changeset = ChangeSet::new();
     let ingress_size = 1024;
     let mut rng = rand::thread_rng();
+    let mut pool = pool.write().unwrap();
     for i in 0..num {
         // Only 10% of them will be considered valid
         let expiry = std::time::Duration::from_millis(
@@ -151,19 +163,14 @@ fn prepare(
 }
 
 /// Build the actual ingress payload.
-fn get_ingress_payload(
-    now: Time,
-    pool: &IngressPoolImpl,
-    manager: &IngressManager,
-    byte_limit: NumBytes,
-) -> usize {
+fn get_ingress_payload(now: Time, manager: &IngressManager, byte_limit: NumBytes) -> usize {
     let validation_context = ValidationContext {
         time: now,
         registry_version: RegistryVersion::from(1),
         certified_height: Height::from(0),
     };
     let past_payload = HashSet::new();
-    let payload = manager.get_ingress_payload(pool, &past_payload, &validation_context, byte_limit);
+    let payload = manager.get_ingress_payload(&past_payload, &validation_context, byte_limit);
     payload.message_count()
 }
 
@@ -177,7 +184,7 @@ fn build_payload(criterion: &mut Criterion) {
         run_test(
             "get_ingress_payload",
             |time_source: Arc<FastForwardTimeSource>,
-             pool: &mut IngressPoolImpl,
+             pool,
              manager: &mut IngressManager,
              registry| {
                 let now = time_source.get_relative_time();
@@ -192,7 +199,7 @@ fn build_payload(criterion: &mut Criterion) {
 
                 group.bench_function(&name, |bench| {
                     bench.iter(|| {
-                        let n = get_ingress_payload(then, pool, manager, NumBytes::new(byte_limit));
+                        let n = get_ingress_payload(then, manager, NumBytes::new(byte_limit));
                         assert!(n > 800, "Insufficient number of ingress in payload: {}", n);
                         assert!(n < 1020, "Too many ingress in payload: {}", n);
                     })

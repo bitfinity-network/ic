@@ -1,14 +1,17 @@
 use async_trait::async_trait;
+use candid::Encode;
 use futures::future::FutureExt;
 use ic_base_types::PrincipalId;
+use ic_nervous_system_common::{ledger::Ledger, NervousSystemError};
 use ic_nns_common::pb::v1::{NeuronId, ProposalId};
+use ic_nns_common::types::UpdateIcpXdrConversionRatePayload;
 use ic_nns_constants::GOVERNANCE_CANISTER_ID;
 use ic_nns_governance::{
-    governance::{Environment, Governance, Ledger},
+    governance::{Environment, Governance},
     pb::v1::{
-        governance_error::ErrorType, manage_neuron, manage_neuron::NeuronIdOrSubaccount,
-        manage_neuron_response, proposal, ExecuteNnsFunction, GovernanceError, ManageNeuron,
-        Motion, Neuron, Proposal, Vote,
+        manage_neuron, manage_neuron::NeuronIdOrSubaccount, manage_neuron_response, proposal,
+        ExecuteNnsFunction, GovernanceError, ManageNeuron, Motion, NetworkEconomics, Neuron,
+        NnsFunction, Proposal, Vote,
     },
 };
 use ledger_canister::{AccountIdentifier, Tokens};
@@ -219,7 +222,7 @@ impl Ledger for FakeDriver {
         from_subaccount: Option<Subaccount>,
         to_account: AccountIdentifier,
         _: u64,
-    ) -> Result<u64, GovernanceError> {
+    ) -> Result<u64, NervousSystemError> {
         let from_account = AccountIdentifier::new(
             ic_base_types::PrincipalId::from(GOVERNANCE_CANISTER_ID),
             from_subaccount,
@@ -230,17 +233,17 @@ impl Ledger for FakeDriver {
         );
         let accounts = &mut self.state.try_lock().unwrap().accounts;
 
-        let from_e8s = accounts.get_mut(&from_account).ok_or_else(|| {
-            GovernanceError::new_with_message(ErrorType::External, "Source account doesn't exist")
-        })?;
+        let from_e8s = accounts
+            .get_mut(&from_account)
+            .ok_or_else(|| NervousSystemError::new_with_message("Source account doesn't exist"))?;
 
         let requested_e8s = amount_e8s + fee_e8s;
 
         if *from_e8s < requested_e8s {
-            return Err(GovernanceError::new_with_message(
-                ErrorType::InsufficientFunds,
-                format!("available {} requested {}", *from_e8s, requested_e8s),
-            ));
+            return Err(NervousSystemError::new_with_message(format!(
+                "Insufficient funds. Available {} requested {}",
+                *from_e8s, requested_e8s
+            )));
         }
 
         *from_e8s -= requested_e8s;
@@ -250,11 +253,14 @@ impl Ledger for FakeDriver {
         Ok(0)
     }
 
-    async fn total_supply(&self) -> Result<Tokens, GovernanceError> {
+    async fn total_supply(&self) -> Result<Tokens, NervousSystemError> {
         Ok(self.get_supply())
     }
 
-    async fn account_balance(&self, account: AccountIdentifier) -> Result<Tokens, GovernanceError> {
+    async fn account_balance(
+        &self,
+        account: AccountIdentifier,
+    ) -> Result<Tokens, NervousSystemError> {
         let accounts = &mut self.state.try_lock().unwrap().accounts;
         let account_e8s = accounts.get(&account).unwrap_or(&0);
         Ok(Tokens::from_e8s(*account_e8s))
@@ -273,7 +279,6 @@ impl Environment for FakeDriver {
     fn random_byte_array(&mut self) -> [u8; 32] {
         let mut bytes = [0u8; 32];
         self.state.try_lock().unwrap().rng.fill_bytes(&mut bytes);
-        //println!("random bytes {:?}\n", bytes);
         bytes
     }
 
@@ -341,6 +346,14 @@ pub fn register_vote_assert_success(
     );
 }
 
+/// When testing proposals, three different proposal topics available:
+/// Governance, NetworkEconomics, and ExchangeRate.
+enum ProposalTopicBehaviour {
+    Governance,
+    NetworkEconomics,
+    ExchangeRate,
+}
+
 /// A struct to help setting up tests concisely thanks to a concise format to
 /// specifies who proposes something and who votes on that proposal.
 pub struct ProposalNeuronBehavior {
@@ -348,6 +361,8 @@ pub struct ProposalNeuronBehavior {
     proposer: u64,
     /// Map neuron id of voters to their votes.
     votes: BTreeMap<u64, Vote>,
+    /// Keep track of proposal topic to use.
+    proposal_topic: ProposalTopicBehaviour,
 }
 
 impl ProposalNeuronBehavior {
@@ -358,15 +373,35 @@ impl ProposalNeuronBehavior {
     /// - neuron of id `i` has for controller `principal(i)`
     pub fn propose_and_vote(&self, gov: &mut Governance, summary: String) -> ProposalId {
         // Submit proposal
+        let action = match self.proposal_topic {
+            ProposalTopicBehaviour::Governance => proposal::Action::Motion(Motion {
+                motion_text: format!("summary: {}", summary),
+            }),
+            ProposalTopicBehaviour::NetworkEconomics => {
+                proposal::Action::ManageNetworkEconomics(NetworkEconomics {
+                    ..Default::default()
+                })
+            }
+            ProposalTopicBehaviour::ExchangeRate => {
+                proposal::Action::ExecuteNnsFunction(ExecuteNnsFunction {
+                    nns_function: NnsFunction::IcpXdrConversionRate as i32,
+                    payload: Encode!(&UpdateIcpXdrConversionRatePayload {
+                        xdr_permyriad_per_icp: 1000000,
+                        data_source: "".to_string(),
+                        timestamp_seconds: 0,
+                    })
+                    .unwrap(),
+                })
+            }
+        };
         let pid = gov
             .make_proposal(
                 &NeuronId { id: self.proposer },
                 &principal(self.proposer),
                 &Proposal {
+                    title: Some("A Reasonable Title".to_string()),
                     summary,
-                    action: Some(proposal::Action::Motion(Motion {
-                        motion_text: "me like proposals".to_string(),
-                    })),
+                    action: Some(action),
                     ..Default::default()
                 },
             )
@@ -386,20 +421,45 @@ impl ProposalNeuronBehavior {
 }
 
 impl From<&str> for ProposalNeuronBehavior {
-    /// Format:
+    /// Format: <neuron_behaviour>* <proposal_topic>?
     ///
-    /// Each character corresponds to the behavior of one neuron, in order.
+    /// neuron_behaviour: each subsequentcharacter corresponds to the
+    /// behavior of one neuron, in order.
     ///
     /// "-" means "does not vote"
     /// "y" means "votes yes"
     /// "n" means "votes no"
     /// "P" means "proposes"
     ///
+    /// proposal_type: if the first character is one of 'G', 'N'
+    /// (default), or 'E', the proposal type used is 'Motion',
+    /// 'NetworkEconomics', or 'IcpXdrConversionRate'.
+    ///
     /// Example:
-    /// "--yP-ny" means:
-    /// neuron 3 proposes, neurons 2 and 6 votes yes, neuron 5 votes no, neurons
-    /// 0, 1, and 4 do not vote.
+    /// "--yP-nyE" means:
+    ///
+    /// neuron 3 proposes, neurons 2 and 6 votes yes, neuron 5 votes
+    /// no, neurons 0, 1, and 4 do not vote; the proposal topic is
+    /// ExchangeRate.
     fn from(str: &str) -> ProposalNeuronBehavior {
+        // Look at the last letter to figure out if it specifies a proposal type.
+        let chr = if str.is_empty() {
+            ' '
+        } else {
+            str.chars().last().unwrap()
+        };
+        let (str, proposal_topic) = match "NEG".find(chr) {
+            None => (str, ProposalTopicBehaviour::NetworkEconomics),
+            Some(x) => (
+                &str[0..str.len() - 1],
+                match x {
+                    0 => ProposalTopicBehaviour::NetworkEconomics,
+                    1 => ProposalTopicBehaviour::ExchangeRate,
+                    // Must be 2, but using _ for a complete match.
+                    _ => ProposalTopicBehaviour::Governance,
+                },
+            ),
+        };
         ProposalNeuronBehavior {
             proposer: str.find('P').unwrap() as u64,
             votes: str
@@ -413,6 +473,7 @@ impl From<&str> for ProposalNeuronBehavior {
                 .filter(|(vote, _)| *vote != Vote::Unspecified)
                 .map(|(vote, id)| (id, vote))
                 .collect(),
+            proposal_topic,
         }
     }
 }

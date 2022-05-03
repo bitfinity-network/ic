@@ -1,32 +1,31 @@
-use crate::convert;
 use crate::errors::ApiError;
 use crate::models;
 use crate::models::{
-    AccountIdentifier, Amount, BlockIdentifier, Currency, Operation, OperationIdentifier, Timestamp,
+    AccountIdentifier, Amount, BlockIdentifier, Currency, Operation, OperationType, Timestamp,
 };
-use crate::request_types::DISBURSE;
 use crate::request_types::{
-    AddHotKey, Disburse, DisburseMetadata, KeyMetadata, NeuronIdentifierMetadata,
-    PublicKeyOrPrincipal, Request, SetDissolveTimestamp, SetDissolveTimestampMetadata, Stake,
-    StartDissolve, StopDissolve, ADD_HOT_KEY, BURN, FEE, MINT, SET_DISSOLVE_TIMESTAMP, STAKE,
-    START_DISSOLVE, STATUS_COMPLETED, STOP_DISSOLVE, TRANSACTION,
+    AddHotKey, Disburse, DisburseMetadata, Follow, FollowMetadata, KeyMetadata, MergeMaturity,
+    MergeMaturityMetadata, NeuronIdentifierMetadata, NeuronInfo, NeuronInfoMetadata,
+    PublicKeyOrPrincipal, RemoveHotKey, Request, RequestResult, RequestResultMetadata,
+    SetDissolveTimestamp, SetDissolveTimestampMetadata, Spawn, SpawnMetadata, Stake, StartDissolve,
+    Status, StopDissolve, TransactionOperationResults, TransactionResults, STATUS_COMPLETED,
 };
 use crate::store::HashedBlock;
 use crate::time::Seconds;
 use crate::transaction_id::TransactionIdentifier;
+use crate::{convert, errors};
 use dfn_protobuf::ProtoBuf;
 use ic_crypto_tree_hash::Path;
 use ic_types::messages::{HttpCanisterUpdate, HttpReadState};
 use ic_types::{CanisterId, PrincipalId};
 use ledger_canister::{
     BlockHeight, HashOf, Operation as LedgerOperation, SendArgs, Subaccount, Tokens,
-    DECIMAL_PLACES, TRANSACTION_FEE,
+    DECIMAL_PLACES, DEFAULT_TRANSFER_FEE,
 };
 use on_wire::{FromWire, IntoWire};
 use serde_json::map::Map;
 use serde_json::{from_value, Number, Value};
-use std::convert::TryFrom;
-use std::convert::TryInto;
+use std::convert::{TryFrom, TryInto};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// This module converts from ledger_canister data structures to Rosetta data
@@ -47,7 +46,7 @@ pub fn timestamp(timestamp: SystemTime) -> Result<Timestamp, ApiError> {
         })
 }
 
-pub fn transaction(hb: &HashedBlock) -> Result<models::Transaction, ApiError> {
+pub fn transaction(hb: &HashedBlock, token_name: &str) -> Result<models::Transaction, ApiError> {
     let block = hb
         .block
         .decode()
@@ -56,7 +55,7 @@ pub fn transaction(hb: &HashedBlock) -> Result<models::Transaction, ApiError> {
     let transaction_identifier = TransactionIdentifier::from(&transaction);
     let operation = transaction.operation;
     let operations = {
-        let mut ops = Request::requests_to_operations(&[Request::Transfer(operation)])?;
+        let mut ops = Request::requests_to_operations(&[Request::Transfer(operation)], token_name)?;
         for op in ops.iter_mut() {
             op.status = Some(STATUS_COMPLETED.to_string());
         }
@@ -78,215 +77,6 @@ pub fn transaction(hb: &HashedBlock) -> Result<models::Transaction, ApiError> {
     );
     t.metadata = Some(metadata);
     Ok(t)
-}
-
-/// Translates a sequence of internal requests into an array of Rosetta API
-/// operations.
-pub fn requests_to_operations(requests: &[Request]) -> Result<Vec<Operation>, ApiError> {
-    let mut ops = vec![];
-    let mut idx = 0;
-    let mut allocate_op_id = || {
-        let n = idx;
-        idx += 1;
-        OperationIdentifier::new(n)
-    };
-
-    for request in requests {
-        match request {
-            Request::Transfer(LedgerOperation::Transfer {
-                from,
-                to,
-                amount,
-                fee,
-            }) => {
-                let from_account = Some(to_model_account_identifier(from));
-                let amount = i128::from(amount.get_e8s());
-
-                ops.push(Operation {
-                    operation_identifier: allocate_op_id(),
-                    _type: TRANSACTION.to_string(),
-                    status: None,
-                    account: from_account.clone(),
-                    amount: Some(signed_amount(-amount)),
-                    related_operations: None,
-                    coin_change: None,
-                    metadata: None,
-                });
-                ops.push(Operation {
-                    operation_identifier: allocate_op_id(),
-                    _type: TRANSACTION.to_string(),
-                    status: None,
-                    account: Some(to_model_account_identifier(to)),
-                    amount: Some(signed_amount(amount)),
-                    related_operations: None,
-                    coin_change: None,
-                    metadata: None,
-                });
-                ops.push(Operation {
-                    operation_identifier: allocate_op_id(),
-                    _type: FEE.to_string(),
-                    status: None,
-                    account: from_account,
-                    amount: Some(signed_amount(-(fee.get_e8s() as i128))),
-                    related_operations: None,
-                    coin_change: None,
-                    metadata: None,
-                });
-            }
-            Request::Transfer(LedgerOperation::Mint { to, amount, .. }) => {
-                ops.push(Operation {
-                    operation_identifier: allocate_op_id(),
-                    _type: MINT.to_string(),
-                    status: None,
-                    account: Some(to_model_account_identifier(to)),
-                    amount: Some(amount_(*amount)?),
-                    related_operations: None,
-                    coin_change: None,
-                    metadata: None,
-                });
-            }
-            Request::Transfer(LedgerOperation::Burn { from, amount, .. }) => {
-                ops.push(Operation {
-                    operation_identifier: allocate_op_id(),
-                    _type: BURN.to_string(),
-                    status: None,
-                    account: Some(to_model_account_identifier(from)),
-                    amount: Some(signed_amount(-i128::from(amount.get_e8s()))),
-                    related_operations: None,
-                    coin_change: None,
-                    metadata: None,
-                });
-            }
-            Request::Stake(Stake {
-                account,
-                neuron_identifier,
-            }) => {
-                ops.push(Operation {
-                    operation_identifier: allocate_op_id(),
-                    _type: STAKE.to_string(),
-                    status: None,
-                    account: Some(to_model_account_identifier(account)),
-                    amount: None,
-                    related_operations: None,
-                    coin_change: None,
-                    metadata: Some(
-                        NeuronIdentifierMetadata {
-                            neuron_identifier: *neuron_identifier,
-                        }
-                        .into(),
-                    ),
-                });
-            }
-            Request::SetDissolveTimestamp(SetDissolveTimestamp {
-                account,
-                neuron_identifier,
-                timestamp,
-            }) => {
-                ops.push(Operation {
-                    operation_identifier: allocate_op_id(),
-                    _type: SET_DISSOLVE_TIMESTAMP.to_string(),
-                    status: None,
-                    account: Some(to_model_account_identifier(account)),
-                    amount: None,
-                    related_operations: None,
-                    coin_change: None,
-                    metadata: Some(
-                        SetDissolveTimestampMetadata {
-                            neuron_identifier: *neuron_identifier,
-                            timestamp: *timestamp,
-                        }
-                        .into(),
-                    ),
-                });
-            }
-            Request::StartDissolve(StartDissolve {
-                account,
-                neuron_identifier,
-            }) => {
-                ops.push(Operation {
-                    operation_identifier: allocate_op_id(),
-                    _type: START_DISSOLVE.to_string(),
-                    status: None,
-                    account: Some(to_model_account_identifier(account)),
-                    amount: None,
-                    related_operations: None,
-                    coin_change: None,
-                    metadata: Some(
-                        NeuronIdentifierMetadata {
-                            neuron_identifier: *neuron_identifier,
-                        }
-                        .into(),
-                    ),
-                });
-            }
-            Request::StopDissolve(StopDissolve {
-                account,
-                neuron_identifier,
-            }) => {
-                ops.push(Operation {
-                    operation_identifier: allocate_op_id(),
-                    _type: STOP_DISSOLVE.to_string(),
-                    status: None,
-                    account: Some(to_model_account_identifier(account)),
-                    amount: None,
-                    related_operations: None,
-                    coin_change: None,
-                    metadata: Some(
-                        NeuronIdentifierMetadata {
-                            neuron_identifier: *neuron_identifier,
-                        }
-                        .into(),
-                    ),
-                });
-            }
-            Request::Disburse(Disburse {
-                account,
-                amount,
-                recipient,
-                neuron_identifier,
-            }) => {
-                ops.push(Operation {
-                    operation_identifier: allocate_op_id(),
-                    _type: DISBURSE.to_string(),
-                    status: None,
-                    account: Some(to_model_account_identifier(account)),
-                    amount: amount.map(|a| amount_(a).expect("amount_ never fails")),
-                    related_operations: None,
-                    coin_change: None,
-                    metadata: Some(
-                        DisburseMetadata {
-                            recipient: *recipient,
-                            neuron_identifier: *neuron_identifier,
-                        }
-                        .into(),
-                    ),
-                });
-            }
-            Request::AddHotKey(AddHotKey {
-                account,
-                neuron_identifier,
-                key,
-            }) => {
-                ops.push(Operation {
-                    operation_identifier: allocate_op_id(),
-                    _type: ADD_HOT_KEY.to_string(),
-                    status: None,
-                    account: Some(to_model_account_identifier(account)),
-                    amount: None,
-                    related_operations: None,
-                    coin_change: None,
-                    metadata: Some(
-                        KeyMetadata {
-                            key: key.clone(),
-                            neuron_identifier: *neuron_identifier,
-                        }
-                        .into(),
-                    ),
-                });
-            }
-        }
-    }
-    Ok(ops)
 }
 
 /// Helper for `from_operations` that creates `Transfer`s from related
@@ -315,7 +105,7 @@ impl State {
 
         // If you're preprocessing just continue with the default fee
         if self.preprocessing && self.fee.is_none() && self.db.is_some() {
-            self.fee = Some((TRANSACTION_FEE, self.db.unwrap().1))
+            self.fee = Some((DEFAULT_TRANSFER_FEE, self.db.unwrap().1))
         }
 
         if self.cr.is_none() || self.db.is_none() || self.fee.is_none() {
@@ -384,12 +174,12 @@ impl State {
     fn stake(
         &mut self,
         account: ledger_canister::AccountIdentifier,
-        neuron_identifier: u64,
+        neuron_index: u64,
     ) -> Result<(), ApiError> {
         self.flush()?;
         self.actions.push(Request::Stake(Stake {
             account,
-            neuron_identifier,
+            neuron_index,
         }));
         Ok(())
     }
@@ -397,14 +187,14 @@ impl State {
     fn set_dissolve_timestamp(
         &mut self,
         account: ledger_canister::AccountIdentifier,
-        neuron_identifier: u64,
+        neuron_index: u64,
         timestamp: Seconds,
     ) -> Result<(), ApiError> {
         self.flush()?;
         self.actions
             .push(Request::SetDissolveTimestamp(SetDissolveTimestamp {
                 account,
-                neuron_identifier,
+                neuron_index,
                 timestamp,
             }));
         Ok(())
@@ -413,70 +203,166 @@ impl State {
     fn start_dissolve(
         &mut self,
         account: ledger_canister::AccountIdentifier,
-        neuron_identifier: u64,
+        neuron_index: u64,
     ) -> Result<(), ApiError> {
         self.flush()?;
-
         self.actions.push(Request::StartDissolve(StartDissolve {
             account,
-            neuron_identifier,
+            neuron_index,
         }));
-
         Ok(())
     }
 
     fn stop_dissolve(
         &mut self,
         account: ledger_canister::AccountIdentifier,
-        neuron_identifier: u64,
+        neuron_index: u64,
     ) -> Result<(), ApiError> {
         self.flush()?;
-
         self.actions.push(Request::StopDissolve(StopDissolve {
             account,
-            neuron_identifier,
+            neuron_index,
         }));
-
         Ok(())
     }
+
     fn add_hot_key(
         &mut self,
         account: ledger_canister::AccountIdentifier,
-        neuron_identifier: u64,
+        neuron_index: u64,
         key: PublicKeyOrPrincipal,
     ) -> Result<(), ApiError> {
         self.flush()?;
-
         self.actions.push(Request::AddHotKey(AddHotKey {
             account,
-            neuron_identifier,
+            neuron_index,
             key,
         }));
+        Ok(())
+    }
 
+    fn remove_hotkey(
+        &mut self,
+        account: ledger_canister::AccountIdentifier,
+        neuron_index: u64,
+        key: PublicKeyOrPrincipal,
+    ) -> Result<(), ApiError> {
+        self.flush()?;
+        self.actions.push(Request::RemoveHotKey(RemoveHotKey {
+            account,
+            neuron_index,
+            key,
+        }));
         Ok(())
     }
 
     fn disburse(
         &mut self,
         account: ledger_canister::AccountIdentifier,
-        neuron_identifier: u64,
+        neuron_index: u64,
         amount: Option<Tokens>,
         recipient: Option<ledger_canister::AccountIdentifier>,
     ) -> Result<(), ApiError> {
         self.flush()?;
-
         self.actions.push(Request::Disburse(Disburse {
             account,
             amount,
             recipient,
-            neuron_identifier,
+            neuron_index,
+        }));
+        Ok(())
+    }
+
+    fn spawn(
+        &mut self,
+        account: ledger_canister::AccountIdentifier,
+        neuron_index: u64,
+        spawned_neuron_index: u64,
+        percentage_to_spawn: Option<u32>,
+        controller: Option<PrincipalId>,
+    ) -> Result<(), ApiError> {
+        if let Some(pct) = percentage_to_spawn {
+            if !(1..=100).contains(&pct) {
+                let msg = format!("Invalid percentage to spawn: {}", pct);
+                let err = ApiError::InvalidTransaction(false, msg.into());
+                return Err(err);
+            }
+        }
+        self.flush()?;
+        self.actions.push(Request::Spawn(Spawn {
+            account,
+            spawned_neuron_index,
+            controller,
+            percentage_to_spawn,
+            neuron_index,
         }));
 
         Ok(())
     }
+
+    fn merge_maturity(
+        &mut self,
+        account: ledger_canister::AccountIdentifier,
+        neuron_index: u64,
+        percentage_to_merge: Option<u32>,
+    ) -> Result<(), ApiError> {
+        if let Some(pct) = percentage_to_merge {
+            if !(1..=100).contains(&pct) {
+                let msg = format!("Invalid percentage to merge: {}", pct);
+                let err = ApiError::InvalidTransaction(false, msg.into());
+                return Err(err);
+            }
+        }
+        self.flush()?;
+        self.actions.push(Request::MergeMaturity(MergeMaturity {
+            account,
+            neuron_index,
+            percentage_to_merge: percentage_to_merge.unwrap_or(100),
+        }));
+        Ok(())
+    }
+
+    fn neuron_info(
+        &mut self,
+        account: ledger_canister::AccountIdentifier,
+        controller: Option<PrincipalId>,
+        neuron_index: u64,
+    ) -> Result<(), ApiError> {
+        self.flush()?;
+        self.actions.push(Request::NeuronInfo(NeuronInfo {
+            account,
+            controller,
+            neuron_index,
+        }));
+        Ok(())
+    }
+
+    fn follow(
+        &mut self,
+        account: ledger_canister::AccountIdentifier,
+        controller: Option<PrincipalId>,
+        neuron_index: u64,
+        topic: i32,
+        followees: Vec<u64>,
+    ) -> Result<(), ApiError> {
+        self.flush()?;
+        self.actions.push(Request::Follow(Follow {
+            account,
+            topic,
+            followees,
+            controller,
+            neuron_index,
+        }));
+        Ok(())
+    }
 }
 
-pub fn from_operations(ops: &[Operation], preprocessing: bool) -> Result<Vec<Request>, ApiError> {
+/// Convert from operations to requests.
+pub fn from_operations(
+    ops: &[Operation],
+    preprocessing: bool,
+    token_name: &str,
+) -> Result<Vec<Request>, ApiError> {
     let op_error = |op: &Operation, e| {
         let msg = format!("In operation '{:?}': {}", op, e);
         ApiError::InvalidTransaction(false, msg.into())
@@ -501,7 +387,7 @@ pub fn from_operations(ops: &[Operation], preprocessing: bool) -> Result<Vec<Req
             .map_err(|e| op_error(o, e))?;
 
         let validate_neuron_management_op = || {
-            if o.amount.is_some() && o._type != DISBURSE {
+            if o.amount.is_some() && o._type != OperationType::Disburse {
                 Err(op_error(
                     o,
                     format!(
@@ -522,80 +408,130 @@ pub fn from_operations(ops: &[Operation], preprocessing: bool) -> Result<Vec<Req
             }
         };
 
-        match o._type.as_str() {
-            TRANSACTION => {
+        match o._type {
+            OperationType::Transaction => {
                 let amount = o
                     .amount
                     .as_ref()
                     .ok_or_else(|| op_error(o, "Amount must be populated".into()))?;
-                let amount = from_amount(amount).map_err(|e| op_error(o, e))?;
+                let amount = from_amount(amount, token_name).map_err(|e| op_error(o, e))?;
                 state.transaction(account, amount)?;
             }
-            FEE => {
+            OperationType::Fee => {
                 let amount = o
                     .amount
                     .as_ref()
                     .ok_or_else(|| op_error(o, "Amount must be populated".into()))?;
-                let amount = from_amount(amount).map_err(|e| op_error(o, e))?;
-                if -amount != TRANSACTION_FEE.get_e8s() as i128 {
-                    let msg = format!("Fee should be equal: {}", TRANSACTION_FEE.get_e8s());
-                    return Err(op_error(o, msg));
-                }
+                let amount = from_amount(amount, token_name).map_err(|e| op_error(o, e))?;
                 state.fee(account, Tokens::from_e8s((-amount) as u64))?;
             }
-            STAKE => {
+            OperationType::Stake => {
                 validate_neuron_management_op()?;
-                let NeuronIdentifierMetadata { neuron_identifier } =
-                    o.metadata.clone().try_into()?;
-                state.stake(account, neuron_identifier)?;
+                let NeuronIdentifierMetadata { neuron_index } = o.metadata.clone().try_into()?;
+                state.stake(account, neuron_index)?;
             }
-            SET_DISSOLVE_TIMESTAMP => {
+            OperationType::SetDissolveTimestamp => {
                 validate_neuron_management_op()?;
                 let SetDissolveTimestampMetadata {
-                    neuron_identifier,
+                    neuron_index,
                     timestamp,
                 } = o.metadata.clone().try_into()?;
 
-                state.set_dissolve_timestamp(account, neuron_identifier, timestamp)?;
+                state.set_dissolve_timestamp(account, neuron_index, timestamp)?;
             }
-            START_DISSOLVE => {
+            OperationType::StartDissolving => {
                 validate_neuron_management_op()?;
-                let NeuronIdentifierMetadata { neuron_identifier } =
-                    o.metadata.clone().try_into()?;
-                state.start_dissolve(account, neuron_identifier)?;
+                let NeuronIdentifierMetadata { neuron_index } = o.metadata.clone().try_into()?;
+                state.start_dissolve(account, neuron_index)?;
             }
-            STOP_DISSOLVE => {
+            OperationType::StopDissolving => {
                 validate_neuron_management_op()?;
-                let NeuronIdentifierMetadata { neuron_identifier } =
-                    o.metadata.clone().try_into()?;
-                state.stop_dissolve(account, neuron_identifier)?;
+                let NeuronIdentifierMetadata { neuron_index } = o.metadata.clone().try_into()?;
+                state.stop_dissolve(account, neuron_index)?;
             }
-            ADD_HOT_KEY => {
-                let KeyMetadata {
-                    key,
-                    neuron_identifier,
-                } = o.metadata.clone().try_into()?;
+            OperationType::AddHotkey => {
+                let KeyMetadata { key, neuron_index } = o.metadata.clone().try_into()?;
                 validate_neuron_management_op()?;
-                state.add_hot_key(account, neuron_identifier, key)?;
+                state.add_hot_key(account, neuron_index, key)?;
             }
-            DISBURSE => {
+            OperationType::RemoveHotkey => {
+                let KeyMetadata { key, neuron_index } = o.metadata.clone().try_into()?;
+                validate_neuron_management_op()?;
+                state.remove_hotkey(account, neuron_index, key)?;
+            }
+            OperationType::Disburse => {
                 let DisburseMetadata {
-                    neuron_identifier,
+                    neuron_index,
                     recipient,
                 } = o.metadata.clone().try_into()?;
                 validate_neuron_management_op()?;
                 let amount = if let Some(ref amount) = o.amount {
-                    Some(convert::ledgeramount_from_amount(amount).map_err(|e| {
-                        ApiError::internal_error(format!("Could not convert Amount {:?}", e))
-                    })?)
+                    Some(
+                        convert::ledgeramount_from_amount(amount, token_name).map_err(|e| {
+                            ApiError::internal_error(format!("Could not convert Amount {:?}", e))
+                        })?,
+                    )
                 } else {
                     None
                 };
-                state.disburse(account, neuron_identifier, amount, recipient)?;
+                state.disburse(account, neuron_index, amount, recipient)?;
             }
-            _ => {
+            OperationType::Spawn => {
+                let SpawnMetadata {
+                    neuron_index,
+                    controller,
+                    percentage_to_spawn,
+                    spawned_neuron_index,
+                } = o.metadata.clone().try_into()?;
+                validate_neuron_management_op()?;
+                state.spawn(
+                    account,
+                    neuron_index,
+                    spawned_neuron_index,
+                    percentage_to_spawn,
+                    controller,
+                )?;
+            }
+            OperationType::MergeMaturity => {
+                let MergeMaturityMetadata {
+                    neuron_index,
+                    percentage_to_merge,
+                } = o.metadata.clone().try_into()?;
+                validate_neuron_management_op()?;
+                state.merge_maturity(account, neuron_index, percentage_to_merge)?;
+            }
+            OperationType::NeuronInfo => {
+                let NeuronInfoMetadata {
+                    controller,
+                    neuron_index,
+                } = o.metadata.clone().try_into()?;
+                validate_neuron_management_op()?;
+                // The governance canister expects a principal. If the caller
+                // provided a public key, we compute the corresponding principal.
+                let principal = match controller {
+                    None => None,
+                    Some(p) => Some(principal_id_from_public_key_or_principal(p)?),
+                };
+                state.neuron_info(account, principal, neuron_index)?;
+            }
+            OperationType::Burn | OperationType::Mint => {
                 let msg = format!("Unsupported operation type: {}", o._type);
                 return Err(op_error(o, msg));
+            }
+            OperationType::Follow => {
+                let FollowMetadata {
+                    topic,
+                    followees,
+                    controller,
+                    neuron_index,
+                } = o.metadata.clone().try_into()?;
+                validate_neuron_management_op()?;
+                // convert from pkp in operation to principal in request.
+                let pid = match controller {
+                    None => None,
+                    Some(p) => Some(principal_id_from_public_key_or_principal(p)?),
+                };
+                state.follow(account, pid, neuron_index, topic, followees)?;
             }
         }
     }
@@ -612,30 +548,31 @@ pub fn from_operations(ops: &[Operation], preprocessing: bool) -> Result<Vec<Req
     Ok(state.actions)
 }
 
-pub fn amount_(amount: Tokens) -> Result<Amount, ApiError> {
+pub fn amount_(amount: Tokens, token_name: &str) -> Result<Amount, ApiError> {
     let amount = amount.get_e8s();
     Ok(Amount {
         value: format!("{}", amount),
-        currency: icp(),
+        currency: Currency::new(token_name.into(), DECIMAL_PLACES),
         metadata: None,
     })
 }
 
-pub fn signed_amount(amount: i128) -> Amount {
+pub fn signed_amount(amount: i128, token_name: &str) -> Amount {
     Amount {
         value: format!("{}", amount),
-        currency: icp(),
+        currency: Currency::new(token_name.into(), DECIMAL_PLACES),
         metadata: None,
     }
 }
 
-pub fn from_amount(amount: &Amount) -> Result<i128, String> {
+pub fn from_amount(amount: &Amount, token_name: &str) -> Result<i128, String> {
+    let cur = Currency::new(token_name.into(), DECIMAL_PLACES);
     match amount {
         Amount {
             value,
             currency,
             metadata: None,
-        } if currency == &icp() => {
+        } if currency == &cur => {
             let val: i128 = value
                 .parse()
                 .map_err(|e| format!("Parsing amount failed: {}", e))?;
@@ -643,16 +580,13 @@ pub fn from_amount(amount: &Amount) -> Result<i128, String> {
                 u64::try_from(val.abs()).map_err(|_| "Amount does not fit in u64".to_string())?;
             Ok(val)
         }
-        wrong => Err(format!("This value is not icp {:?}", wrong)),
+        wrong => Err(format!("This value is not {} {:?}", token_name, wrong)),
     }
 }
-pub fn ledgeramount_from_amount(amount: &Amount) -> Result<Tokens, String> {
-    let inner = from_amount(amount)?;
-    Ok(Tokens::from_e8s(inner as u64))
-}
 
-pub fn icp() -> Currency {
-    Currency::new("ICP".to_string(), DECIMAL_PLACES)
+pub fn ledgeramount_from_amount(amount: &Amount, token_name: &str) -> Result<Tokens, String> {
+    let inner = from_amount(amount, token_name)?;
+    Ok(Tokens::from_e8s(inner as u64))
 }
 
 pub fn block_id(block: &HashedBlock) -> Result<BlockIdentifier, ApiError> {
@@ -700,36 +634,54 @@ pub fn account_from_public_key(pk: &models::PublicKey) -> Result<AccountIdentifi
     Ok(to_model_account_identifier(&pid.into()))
 }
 
-/// `neuron_identifier` must also be the `nonce` of neuron management commands.
+/// `neuron_index` must also be the `nonce` of neuron management commands.
 pub fn neuron_subaccount_bytes_from_public_key(
     pk: &models::PublicKey,
-    neuron_identifier: u64,
+    neuron_index: u64,
 ) -> Result<[u8; 32], ApiError> {
     let controller = principal_id_from_public_key(pk)?;
+    Ok(neuron_subaccount_hash(&controller, neuron_index))
+}
 
-    // FIXME: cut&paste from compute_neuron_staking_subaccount() in
-    // rs/nns/governance/src/governance.rs.
+/// `neuron_index` must also be the `nonce` of neuron management commands.
+pub fn neuron_subaccount_bytes_from_principal(
+    controller: &PrincipalId,
+    neuron_index: u64,
+) -> [u8; 32] {
+    neuron_subaccount_hash(controller, neuron_index)
+}
+
+fn neuron_subaccount_hash(principal: &PrincipalId, nonce: u64) -> [u8; 32] {
     let mut state = ic_crypto_sha::Sha256::new();
     state.write(&[0x0c]);
     state.write(b"neuron-stake");
-    state.write(controller.as_slice());
-    state.write(&neuron_identifier.to_be_bytes());
-    Ok(state.finish())
+    state.write(principal.as_slice());
+    state.write(&nonce.to_be_bytes());
+    state.finish()
 }
 
-/// `neuron_identifier` must also be the `nonce` of neuron management commands.
+/// `neuron_index` must also be the `nonce` of neuron management commands.
 pub fn neuron_account_from_public_key(
     governance_canister_id: &CanisterId,
     pk: &models::PublicKey,
-    neuron_identifier: u64,
+    neuron_index: u64,
 ) -> Result<AccountIdentifier, ApiError> {
-    let subaccount_bytes = neuron_subaccount_bytes_from_public_key(pk, neuron_identifier)?;
+    let subaccount_bytes = neuron_subaccount_bytes_from_public_key(pk, neuron_index)?;
     Ok(to_model_account_identifier(
         &ledger_canister::AccountIdentifier::new(
             governance_canister_id.get(),
             Some(Subaccount(subaccount_bytes)),
         ),
     ))
+}
+
+pub fn principal_id_from_public_key_or_principal(
+    pkp: PublicKeyOrPrincipal,
+) -> Result<PrincipalId, ApiError> {
+    match pkp {
+        PublicKeyOrPrincipal::Principal(p) => Ok(p),
+        PublicKeyOrPrincipal::PublicKey(pk) => principal_id_from_public_key(&pk),
+    }
 }
 
 pub fn principal_id_from_public_key(pk: &models::PublicKey) -> Result<PrincipalId, ApiError> {
@@ -773,6 +725,77 @@ pub fn make_read_state_from_update(update: &HttpCanisterUpdate) -> HttpReadState
         nonce: None,
         ingress_expiry: update.ingress_expiry,
     }
+}
+
+/// Convert TransactionOperationResults to ApiError.
+pub fn transaction_operation_result_to_api_error(
+    e: TransactionOperationResults,
+    token_name: &str,
+) -> ApiError {
+    match from_transaction_operation_results(e, token_name) {
+        Ok(e) => ApiError::OperationsErrors(e, token_name.to_string()),
+        Err(e) => e,
+    }
+}
+
+/// Convert TransactionOperationResults to TransactionResults.
+pub fn from_transaction_operation_results(
+    t: TransactionOperationResults,
+    token_name: &str,
+) -> Result<TransactionResults, ApiError> {
+    let requests = convert::from_operations(&t.operations, false, token_name)?;
+
+    let mut operations = Vec::with_capacity(requests.len());
+    let mut op_idx = 0;
+    for _type in requests.into_iter() {
+        let o = match (&_type, &t.operations[op_idx..]) {
+            (Request::Transfer(LedgerOperation::Transfer { .. }), [withdraw, deposit, fee, ..])
+                if withdraw._type == OperationType::Transaction
+                    && deposit._type == OperationType::Transaction
+                    && fee._type == OperationType::Fee =>
+            {
+                op_idx += 3;
+                fee
+            }
+            (_, [o, ..]) => {
+                op_idx += 1;
+                o
+            }
+            (_, []) => {
+                return Err(ApiError::internal_error(
+                    "Too few Operations, could not match Operations with Requests",
+                ))
+            }
+        };
+
+        let status = o.status.clone().and_then(|n| Status::from_name(n.as_str()));
+
+        let RequestResultMetadata {
+            block_index,
+            neuron_id,
+            transaction_identifier,
+            response,
+        } = RequestResultMetadata::try_from(o.metadata.clone())?;
+        let status = response
+            .map(|e| Status::Failed(errors::convert_to_api_error(e, token_name)))
+            .or(status)
+            .ok_or_else(|| ApiError::internal_error("Could not decode Status from Operation"))?;
+
+        operations.push(RequestResult {
+            _type,
+            block_index,
+            neuron_id,
+            transaction_identifier,
+            status,
+            response: None,
+        });
+    }
+
+    Ok(TransactionResults { operations })
+}
+
+pub fn transaction_results_to_api_error(tr: TransactionResults, token_name: &str) -> ApiError {
+    ApiError::OperationsErrors(tr, token_name.to_string())
 }
 
 #[cfg(test)]

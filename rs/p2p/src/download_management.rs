@@ -64,19 +64,7 @@
 //! In theory, the above locking rules prevent "circular waits" and thus
 //! guarantee deadlock avoidance.
 
-use ic_interfaces::registry::RegistryClient;
-use ic_interfaces::{artifact_manager::ArtifactManager, transport::Transport};
-use ic_metrics::MetricsRegistry;
-use ic_protobuf::p2p::v1 as pb;
-use ic_protobuf::proxy::ProtoProxy;
-use ic_types::{
-    artifact::{Artifact, ArtifactId},
-    chunkable::{ArtifactErrorCode, ChunkId},
-    crypto::CryptoHash,
-    p2p::GossipAdvert,
-    transport::{FlowTag, TransportClientType, TransportPayload},
-    NodeId, SubnetId,
-};
+extern crate lru;
 
 use crate::{
     artifact_download_list::{ArtifactDownloadList, ArtifactDownloadListImpl},
@@ -84,7 +72,6 @@ use crate::{
         AdvertTracker, AdvertTrackerFinalAction, DownloadAttemptTracker, DownloadPrioritizer,
         DownloadPrioritizerImpl,
     },
-    event_handler::P2PEventHandlerControl,
     gossip_protocol::{
         GossipAdvertAction, GossipAdvertSendRequest, GossipChunk, GossipChunkRequest,
         GossipMessage, GossipRetransmissionRequest, Percentage,
@@ -93,30 +80,38 @@ use crate::{
     utils::FlowMapper,
     P2PError, P2PErrorCode, P2PResult,
 };
-
-extern crate lru;
-use ic_protobuf::registry::subnet::v1::GossipConfig;
-use ic_registry_client::helper::subnet::SubnetTransportRegistry;
+use ic_interfaces::{
+    artifact_pool::ArtifactPoolError::ArtifactReplicaVersionError,
+    consensus_pool::ConsensusPoolCache,
+    {
+        artifact_manager::{ArtifactManager, OnArtifactError::ArtifactPoolError},
+        registry::RegistryClient,
+    },
+};
+use ic_interfaces_transport::{FlowTag, Transport, TransportErrorCode, TransportPayload};
+use ic_logger::{info, trace, warn, ReplicaLogger};
+use ic_metrics::MetricsRegistry;
+use ic_protobuf::{
+    p2p::v1 as pb, proxy::ProtoProxy, registry::node::v1::NodeRecord,
+    registry::subnet::v1::GossipConfig,
+};
+use ic_registry_client_helpers::subnet::SubnetTransportRegistry;
+use ic_types::{
+    artifact::{Artifact, ArtifactId},
+    chunkable::{ArtifactErrorCode, ChunkId},
+    crypto::CryptoHash,
+    p2p::GossipAdvert,
+    NodeId, RegistryVersion, SubnetId,
+};
 use lru::LruCache;
-
+use rand::{seq::SliceRandom, thread_rng};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap, HashSet},
     error::Error,
+    ops::DerefMut,
     sync::{Arc, Mutex, RwLock},
     time::{Instant, SystemTime},
 };
-
-use ic_interfaces::artifact_manager::OnArtifactError::ArtifactPoolError;
-use ic_interfaces::artifact_pool::ArtifactPoolError::ArtifactReplicaVersionError;
-use ic_interfaces::consensus_pool::ConsensusPoolCache;
-use ic_logger::replica_logger::ReplicaLogger;
-use ic_logger::{info, trace, warn};
-use ic_protobuf::registry::node::v1::NodeRecord;
-use ic_types::{transport::TransportErrorCode, RegistryVersion};
-use rand::{seq::SliceRandom, thread_rng};
-use std::collections::BTreeMap;
-use std::collections::HashSet;
-use std::ops::DerefMut;
 
 /// The download manager maintains data structures on adverts and download state
 /// per peer.
@@ -170,7 +165,7 @@ pub(crate) trait DownloadManager {
     /// changes.</br>
     /// b) Check for chunk download timeouts.</br>
     /// c) Poll the registry for subnet membership changes.
-    fn on_timer(&self, event_handler: Arc<dyn P2PEventHandlerControl>);
+    fn on_timer(&self);
 }
 
 /// The peer manager manages the list of current peers.
@@ -190,11 +185,10 @@ pub(crate) trait PeerManager {
         peer: NodeId,
         node_record: &NodeRecord,
         registry_version: RegistryVersion,
-        event_handler: &Arc<dyn P2PEventHandlerControl>,
     ) -> P2PResult<()>;
 
     /// The method removes the given peer from the list of current peers.
-    fn remove_peer(&self, peer: NodeId, registry_version: RegistryVersion);
+    fn remove_peer(&self, peer: NodeId);
 }
 
 /// A node tracks the chunks it requested from each peer.
@@ -266,8 +260,6 @@ pub(crate) struct PeerManagerImpl {
     current_peers: Arc<Mutex<PeerContextDictionary>>,
     /// The underlying *Transport*.
     transport: Arc<dyn Transport>,
-    /// The transport client type.
-    transport_client_type: TransportClientType,
 }
 
 /// An implementation of the `DownloadManager` trait.
@@ -293,8 +285,6 @@ pub(crate) struct DownloadManagerImpl {
     transport: Arc<dyn Transport>,
     /// The flow mapper.
     flow_mapper: Arc<FlowMapper>,
-    /// The *Transport* client type.
-    transport_client_type: TransportClientType,
     /// The list of artifacts that is under construction.
     artifacts_under_construction: RwLock<ArtifactDownloadListImpl>,
     /// The logger.
@@ -440,6 +430,7 @@ impl DownloadManager for DownloadManagerImpl {
             }) {
                 let artifact_type = match &gossip_chunk.artifact_id {
                     ArtifactId::ConsensusMessage(_) => "consensus",
+                    ArtifactId::CanisterHttpMessage(_) => "canister_http",
                     ArtifactId::IngressMessage(_) => "ingress",
                     ArtifactId::CertificationMessage(_) => "certification",
                     ArtifactId::DkgMessage(_) => "dkg",
@@ -583,15 +574,15 @@ impl DownloadManager for DownloadManagerImpl {
         // This construction to compute the integrity hash over all variants of an enum
         // may be updated in the future.
         let expected_ih = match &completed_artifact {
-            Artifact::ConsensusMessage(msg) => ic_crypto::crypto_hash(msg).get(),
-            Artifact::IngressMessage(msg) => ic_crypto::crypto_hash(msg).get(),
-            Artifact::CertificationMessage(msg) => ic_crypto::crypto_hash(msg).get(),
-            Artifact::DkgMessage(msg) => ic_crypto::crypto_hash(msg).get(),
-            Artifact::EcdsaMessage(msg) => ic_crypto::crypto_hash(msg).get(),
+            Artifact::ConsensusMessage(msg) => ic_crypto_hash::crypto_hash(msg).get(),
+            Artifact::IngressMessage(msg) => ic_crypto_hash::crypto_hash(msg).get(),
+            Artifact::CertificationMessage(msg) => ic_crypto_hash::crypto_hash(msg).get(),
+            Artifact::DkgMessage(msg) => ic_crypto_hash::crypto_hash(msg).get(),
+            Artifact::EcdsaMessage(msg) => ic_crypto_hash::crypto_hash(msg).get(),
             // FileTreeSync is not of ArtifactKind kind, and it's used only for testing.
             // Thus, we make up the integrity_hash.
             Artifact::FileTreeSync(_msg) => CryptoHash(vec![]),
-            Artifact::StateSync(msg) => ic_crypto::crypto_hash(msg).get(),
+            Artifact::StateSync(msg) => ic_crypto_hash::crypto_hash(msg).get(),
         };
 
         if expected_ih != advert.integrity_hash {
@@ -708,8 +699,7 @@ impl DownloadManager for DownloadManagerImpl {
 
                         // Clear the send queues and send re-transmission request to the peer on
                         // connect.
-                        self.transport
-                            .clear_send_queues(self.transport_client_type, &peer_id);
+                        self.transport.clear_send_queues(&peer_id);
                     }
                     Err(e) => {
                         warn!(self.log, "Error in elapsed time calculation: {:?}", e);
@@ -763,8 +753,7 @@ impl DownloadManager for DownloadManagerImpl {
         // A retransmission request was received from a peer.
         // The send queues are cleared and a response is sent containing all the adverts
         // that satisfy the filter.
-        self.transport
-            .clear_send_queues(self.transport_client_type, &peer_id);
+        self.transport.clear_send_queues(&peer_id);
 
         let adverts = self
             .artifact_manager
@@ -800,7 +789,7 @@ impl DownloadManager for DownloadManagerImpl {
 
     /// The method is invoked periodically by the *Gossip* component to perform
     /// P2P book keeping tasks.
-    fn on_timer(&self, event_handler: Arc<dyn P2PEventHandlerControl>) {
+    fn on_timer(&self) {
         let (update_priority_fns, retransmission_request, refresh_registry) =
             self.get_timer_tasks();
         if update_priority_fns {
@@ -823,7 +812,7 @@ impl DownloadManager for DownloadManagerImpl {
         }
 
         if refresh_registry {
-            self.refresh_registry(&event_handler);
+            self.refresh_registry();
         }
 
         // Collect the peers with timed-out requests.
@@ -861,22 +850,17 @@ impl DownloadManagerImpl {
         registry_client: Arc<dyn RegistryClient>,
         artifact_manager: Arc<dyn ArtifactManager>,
         transport: Arc<dyn Transport>,
-        event_handler: Arc<dyn P2PEventHandlerControl>,
         flow_mapper: Arc<FlowMapper>,
         log: ReplicaLogger,
         metrics_registry: &MetricsRegistry,
     ) -> Self {
-        let transport_client_type = TransportClientType::P2P;
-        let gossip_config =
-            crate::event_handler::fetch_gossip_config(registry_client.clone(), subnet_id);
-
+        let gossip_config = crate::fetch_gossip_config(registry_client.clone(), subnet_id);
         let current_peers = Arc::new(Mutex::new(PeerContextDictionary::default()));
         let peer_manager = Arc::new(PeerManagerImpl::new(
             node_id,
             log.clone(),
             current_peers.clone(),
             transport.clone(),
-            transport_client_type,
         ));
 
         let prioritizer = Arc::new(DownloadPrioritizerImpl::new(
@@ -895,7 +879,6 @@ impl DownloadManagerImpl {
             current_peers,
             transport: transport.clone(),
             flow_mapper,
-            transport_client_type,
             artifacts_under_construction: RwLock::new(ArtifactDownloadListImpl::new(log.clone())),
             log,
             metrics: DownloadManagementMetrics::new(metrics_registry),
@@ -905,7 +888,7 @@ impl DownloadManagerImpl {
             registry_refresh_instant: Mutex::new(Instant::now()),
             retransmission_request_instant: Mutex::new(Instant::now()),
         };
-        download_manager.refresh_registry(&event_handler);
+        download_manager.refresh_registry();
         download_manager
     }
 
@@ -956,7 +939,7 @@ impl DownloadManagerImpl {
     }
 
     // Update the peer manager state based on the latest registry value.
-    pub fn refresh_registry(&self, event_handler: &Arc<dyn P2PEventHandlerControl>) {
+    pub fn refresh_registry(&self) {
         let latest_registry_version = self.registry_client.get_latest_version();
         self.metrics
             .registry_version_used
@@ -969,7 +952,7 @@ impl DownloadManagerImpl {
         // If self is not in the subnet, remove all peers.
         for peer in self.peer_manager.get_current_peer_ids().into_iter() {
             if !subnet_nodes.contains_key(&peer) || self_not_in_subnet {
-                self.remove_node(peer, latest_registry_version);
+                self.remove_node(peer);
                 self.metrics.nodes_removed.inc();
             }
         }
@@ -981,12 +964,7 @@ impl DownloadManagerImpl {
         for (node_id, node_record) in subnet_nodes.iter() {
             if self
                 .peer_manager
-                .add_peer(
-                    *node_id,
-                    node_record,
-                    latest_registry_version,
-                    event_handler,
-                )
+                .add_peer(*node_id, node_record, latest_registry_version)
                 .is_ok()
             {
                 self.receive_check_caches.write().unwrap().insert(
@@ -1003,7 +981,9 @@ impl DownloadManagerImpl {
         &self,
         latest_registry_version: RegistryVersion,
     ) -> BTreeMap<NodeId, NodeRecord> {
-        let subnet_membership_version = self.consensus_pool_cache.get_subnet_membership_version();
+        let subnet_membership_version = self
+            .consensus_pool_cache
+            .get_oldest_registry_version_in_use();
         let mut subnet_nodes = BTreeMap::new();
         // Iterate from subnet_membership_version to latest_registry_version + 1 (since
         // end is non-inclusive).
@@ -1013,7 +993,7 @@ impl DownloadManagerImpl {
                 .registry_client
                 .get_subnet_transport_infos(self.subnet_id, version)
                 .unwrap_or(None)
-                .unwrap_or_else(Vec::new);
+                .unwrap_or_default();
             for node in node_records {
                 subnet_nodes.insert(node.0, node.1);
             }
@@ -1022,8 +1002,8 @@ impl DownloadManagerImpl {
     }
 
     /// This method removes the given node from peer manager and clears adverts.
-    fn remove_node(&self, node: NodeId, registry_version: RegistryVersion) {
-        self.peer_manager.remove_peer(node, registry_version);
+    fn remove_node(&self, node: NodeId) {
+        self.peer_manager.remove_peer(node);
         self.receive_check_caches.write().unwrap().remove(&node);
         self.prioritizer
             .clear_peer_adverts(node, AdvertTrackerFinalAction::Abort)
@@ -1049,7 +1029,7 @@ impl DownloadManagerImpl {
             .start_timer();
         let message = TransportPayload(pb::GossipMessage::proxy_encode(message).unwrap());
         self.transport
-            .send(self.transport_client_type, &peer_id, flow_tag, message)
+            .send(&peer_id, flow_tag, message)
             .map_err(|e| {
                 trace!(
                     self.log,
@@ -1416,14 +1396,12 @@ impl PeerManagerImpl {
         log: ReplicaLogger,
         current_peers: Arc<Mutex<PeerContextDictionary>>,
         transport: Arc<dyn Transport>,
-        transport_client_type: TransportClientType,
     ) -> Self {
         Self {
             node_id,
             log,
             current_peers,
             transport,
-            transport_client_type,
         }
     }
 }
@@ -1478,7 +1456,6 @@ impl PeerManager for PeerManagerImpl {
         node_id: NodeId,
         node_record: &NodeRecord,
         registry_version: RegistryVersion,
-        event_handler: &Arc<dyn P2PEventHandlerControl>,
     ) -> P2PResult<()> {
         // Only add other peers to the peer list.
         if node_id == self.node_id {
@@ -1500,7 +1477,6 @@ impl PeerManager for PeerManagerImpl {
                 current_peers
                     .entry(node_id)
                     .or_insert_with(|| PeerContext::from(node_id.to_owned()));
-                event_handler.add_node(node_id);
                 info!(self.log, "Nodes {:0} added", node_id);
                 Ok(())
             }?;
@@ -1514,12 +1490,7 @@ impl PeerManager for PeerManagerImpl {
         // Instead, connection failures should be retried internally in
         // transport.
         self.transport
-            .start_connections(
-                self.transport_client_type,
-                &node_id,
-                node_record,
-                registry_version,
-            )
+            .start_connections(&node_id, node_record, registry_version)
             .map_err(|e| {
                 let mut current_peers = self.current_peers.lock().unwrap();
                 current_peers.remove(&node_id);
@@ -1531,12 +1502,9 @@ impl PeerManager for PeerManagerImpl {
     }
 
     /// The method removes the given peer from the list of current peers.
-    fn remove_peer(&self, node_id: NodeId, registry_version: RegistryVersion) {
+    fn remove_peer(&self, node_id: NodeId) {
         let mut current_peers = self.current_peers.lock().unwrap();
-        if let Err(e) =
-            self.transport
-                .stop_connections(self.transport_client_type, &node_id, registry_version)
-        {
+        if let Err(e) = self.transport.stop_connections(&node_id) {
             warn!(self.log, "stop connection failed {:?}: {:?}", node_id, e);
         }
         // Remove the peer irrespective of the result of the stop_connections() call.
@@ -1552,11 +1520,9 @@ pub mod tests {
     use ic_interfaces::artifact_manager::OnArtifactError;
     use ic_logger::LoggerImpl;
     use ic_metrics::MetricsRegistry;
-    use ic_registry_client::client::RegistryClientImpl;
-    use ic_registry_client::fake::FakeRegistryClient;
+    use ic_registry_client_fake::FakeRegistryClient;
     use ic_test_utilities::consensus::fake::FakeSigner;
     use ic_test_utilities::port_allocation::allocate_ports;
-    use ic_test_utilities::registry::{add_subnet_record, SubnetRecordBuilder};
     use ic_test_utilities::{
         consensus::MockConsensusCache,
         p2p::*,
@@ -1564,13 +1530,14 @@ pub mod tests {
         transport::MockTransport,
         types::ids::{node_id_to_u64, node_test_id, subnet_test_id},
     };
+    use ic_test_utilities_registry::{add_subnet_record, SubnetRecordBuilder};
     use ic_types::artifact::{DkgMessage, DkgMessageAttribute};
     use ic_types::consensus::dkg::DealingContent;
-    use ic_types::consensus::BasicSignature;
     use ic_types::crypto::threshold_sig::ni_dkg::{
         NiDkgDealing, NiDkgId, NiDkgTag, NiDkgTargetSubnet,
     };
     use ic_types::crypto::{CryptoHash, CryptoHashOf};
+    use ic_types::signature::BasicSignature;
     use ic_types::{
         artifact,
         artifact::{Artifact, ArtifactAttribute, ArtifactPriorityFn, Priority},
@@ -1730,9 +1697,10 @@ pub mod tests {
         instance_id: u32,
         hub: Arc<Mutex<Hub>>,
         logger: &LoggerImpl,
+        rt_handle: tokio::runtime::Handle,
     ) -> Arc<ThreadPort> {
         let log: ReplicaLogger = logger.root.clone().into();
-        ThreadPort::new(node_test_id(instance_id as u64), hub, log)
+        ThreadPort::new(node_test_id(instance_id as u64), hub, log, rt_handle)
     }
 
     fn new_test_download_manager_with_registry(
@@ -1740,6 +1708,7 @@ pub mod tests {
         logger: &LoggerImpl,
         registry_client: Arc<dyn RegistryClient>,
         consensus_pool_cache: Arc<dyn ConsensusPoolCache>,
+        rt_handle: tokio::runtime::Handle,
     ) -> DownloadManagerImpl {
         let log: ReplicaLogger = logger.root.clone().into();
         let artifact_manager = TestArtifactManager {
@@ -1750,7 +1719,8 @@ pub mod tests {
         // Set up transport.
         let hub_access: HubAccess = Arc::new(Mutex::new(Default::default()));
         for instance_id in 0..num_replicas {
-            let thread_port = get_transport(instance_id, hub_access.clone(), logger);
+            let thread_port =
+                get_transport(instance_id, hub_access.clone(), logger, rt_handle.clone());
             hub_access
                 .lock()
                 .unwrap()
@@ -1768,7 +1738,6 @@ pub mod tests {
 
         // Create fake peers.
         let artifact_manager = Arc::new(artifact_manager);
-        let event_handler = Arc::new(new_test_event_handler(MAX_ADVERT_BUFFER, node_test_id(0)));
         DownloadManagerImpl::new(
             node_test_id(0),
             subnet_test_id(0),
@@ -1776,14 +1745,17 @@ pub mod tests {
             registry_client,
             artifact_manager,
             tp,
-            event_handler,
             flow_mapper,
             log,
             &metrics_registry,
         )
     }
 
-    fn new_test_download_manager(num_replicas: u32, logger: &LoggerImpl) -> DownloadManagerImpl {
+    fn new_test_download_manager(
+        num_replicas: u32,
+        logger: &LoggerImpl,
+        rt_handle: tokio::runtime::Handle,
+    ) -> DownloadManagerImpl {
         let allocated_ports = allocate_ports("127.0.0.1", num_replicas as u16)
             .expect("Port allocation for test failed");
         let node_port_allocation: Vec<u16> = allocated_ports.iter().map(|np| np.port).collect();
@@ -1791,12 +1763,12 @@ pub mod tests {
         let node_port_allocation = Arc::new(node_port_allocation);
         let data_provider =
             test_group_set_registry(subnet_test_id(P2P_SUBNET_ID_DEFAULT), node_port_allocation);
-        let registry_client = Arc::new(RegistryClientImpl::new(data_provider, None));
-        registry_client.fetch_and_start_polling().unwrap();
+        let registry_client = Arc::new(FakeRegistryClient::new(data_provider));
+        registry_client.update_to_latest_version();
 
         let mut mock_consensus_cache = MockConsensusCache::new();
         mock_consensus_cache
-            .expect_get_subnet_membership_version()
+            .expect_get_oldest_registry_version_in_use()
             .returning(move || RegistryVersion::from(1));
         let consensus_pool_cache = Arc::new(mock_consensus_cache);
 
@@ -1805,6 +1777,7 @@ pub mod tests {
             logger,
             registry_client,
             consensus_pool_cache,
+            rt_handle,
         )
     }
 
@@ -1838,13 +1811,6 @@ pub mod tests {
         assert_eq!(peer_context.requested.len(), 0);
     }
 
-    /// This test function builds a new download manager.
-    #[tokio::test]
-    async fn build_new_download_manager() {
-        let logger = p2p_test_setup_logger();
-        let _download_manager = new_test_download_manager(1, &logger);
-    }
-
     /// This function tests the functionality to add adverts to the
     /// download manager.
     #[tokio::test]
@@ -1874,7 +1840,7 @@ pub mod tests {
         let mut mock_consensus_cache = MockConsensusCache::new();
         let consensus_registry_client = registry_client.clone();
         mock_consensus_cache
-            .expect_get_subnet_membership_version()
+            .expect_get_oldest_registry_version_in_use()
             .returning(move || consensus_registry_client.get_latest_version());
         let consensus_pool_cache = Arc::new(mock_consensus_cache);
 
@@ -1883,6 +1849,7 @@ pub mod tests {
             &logger,
             Arc::clone(&registry_client) as Arc<_>,
             Arc::clone(&consensus_pool_cache) as Arc<_>,
+            tokio::runtime::Handle::current(),
         );
         // Add new subnet record with one less replica and at version 2.
         let node_nums: Vec<u64> = (0..((node_port_allocation.len() - 1) as u64)).collect();
@@ -1901,7 +1868,7 @@ pub mod tests {
         let node_records = registry_client
             .get_subnet_transport_infos(subnet_test_id(P2P_SUBNET_ID_DEFAULT), registry_version)
             .unwrap_or(None)
-            .unwrap_or_else(Vec::new);
+            .unwrap_or_default();
         assert_eq!((num_replicas - 1) as usize, node_records.len());
 
         // Get removed node
@@ -1921,11 +1888,9 @@ pub mod tests {
 
         // Add adverts from the peer that is removed in the latest registry version
         test_add_adverts(&download_manager, 0..5, removed_peer);
-        let event_handler = new_test_event_handler(MAX_ADVERT_BUFFER, node_test_id(0));
-        let event_handler_arc = Arc::new(event_handler) as Arc<dyn P2PEventHandlerControl>;
 
         // Refresh registry to get latest version.
-        download_manager.refresh_registry(&event_handler_arc);
+        download_manager.refresh_registry();
         // Assert number of peers has been decreased by one.
         assert_eq!(
             (num_peers - 1) as usize,
@@ -1957,7 +1922,8 @@ pub mod tests {
     #[tokio::test]
     async fn download_manager_add_adverts() {
         let logger = p2p_test_setup_logger();
-        let download_manager = new_test_download_manager(2, &logger);
+        let download_manager =
+            new_test_download_manager(2, &logger, tokio::runtime::Handle::current());
         test_add_adverts(&download_manager, 0..1000, node_test_id(1));
     }
 
@@ -1968,7 +1934,8 @@ pub mod tests {
     async fn download_manager_compute_work_basic() {
         let logger = p2p_test_setup_logger();
         let num_replicas = 2;
-        let download_manager = new_test_download_manager(num_replicas, &logger);
+        let download_manager =
+            new_test_download_manager(num_replicas, &logger, tokio::runtime::Handle::current());
         test_add_adverts(
             &download_manager,
             0..1000,
@@ -2003,7 +1970,8 @@ pub mod tests {
         // The total number of replicas is 4 in this test.
         let num_replicas = 4;
         let logger = p2p_test_setup_logger();
-        let mut download_manager = new_test_download_manager(num_replicas, &logger);
+        let mut download_manager =
+            new_test_download_manager(num_replicas, &logger, tokio::runtime::Handle::current());
         download_manager.gossip_config.max_chunk_wait_ms = 1000;
 
         let test_assert_compute_work_len =
@@ -2081,14 +2049,16 @@ pub mod tests {
         // There are 3 nodes in total, Node 1 and 2 are actively used in the test.
         let num_replicas = 3;
         let logger = p2p_test_setup_logger();
-        let mut download_manager = new_test_download_manager(num_replicas, &logger);
+        let mut download_manager =
+            new_test_download_manager(num_replicas, &logger, tokio::runtime::Handle::current());
         download_manager.gossip_config.max_artifact_streams_per_peer = 1;
         download_manager.gossip_config.max_chunk_wait_ms = 1000;
+        let advert_range = 1..num_replicas as u32;
         // Node 1 and 2 both advertise advert 1 and 2.
         for i in 1..num_replicas {
             test_add_adverts(
                 &download_manager,
-                1..num_replicas as u32,
+                advert_range.clone(),
                 node_test_id(i as u64),
             )
         }
@@ -2123,11 +2093,16 @@ pub mod tests {
         // Test that artifacts also have timed out.
         download_manager.process_timed_out_artifacts();
         {
-            let artifacts_under_construction = download_manager
+            let mut artifacts_under_construction = download_manager
                 .artifacts_under_construction
-                .read()
+                .write()
                 .unwrap();
-            assert_eq!(artifacts_under_construction.len(), 0);
+
+            for i in advert_range {
+                assert!(artifacts_under_construction
+                    .get_tracker(&CryptoHash(Vec::from(i.to_be_bytes())))
+                    .is_none());
+            }
         }
 
         // After advert 1 and 2 have timed out, the download manager must start
@@ -2143,18 +2118,21 @@ pub mod tests {
         }
 
         {
-            let artifacts_under_construction = download_manager
+            let mut artifacts_under_construction = download_manager
                 .artifacts_under_construction
-                .read()
+                .write()
                 .unwrap();
-            // Advert 1 and 2 timed out, so we start from advert 3.
-            let mut counter: u32 = 3;
-            for (_, (id, _)) in artifacts_under_construction.iter().enumerate() {
-                assert_eq!(*id, CryptoHash(Vec::from(counter.to_be_bytes())));
-                counter += 1;
+            // Advert 1 and 2 timed out, so check adverts starting from 3 exists.
+            for counter in 1u32..3 {
+                assert!(artifacts_under_construction
+                    .get_tracker(&CryptoHash(Vec::from(counter.to_be_bytes())))
+                    .is_none());
             }
-            // Assert counter matches total number of adverts
-            assert_eq!(counter, 5)
+            for counter in 3u32..5 {
+                assert!(artifacts_under_construction
+                    .get_tracker(&CryptoHash(Vec::from(counter.to_be_bytes())))
+                    .is_some());
+            }
         }
     }
 
@@ -2166,7 +2144,8 @@ pub mod tests {
         // Each peer has 20 download slots available for transport.
         let num_peers = 3;
         let logger = p2p_test_setup_logger();
-        let mut download_manager = new_test_download_manager(num_peers, &logger);
+        let mut download_manager =
+            new_test_download_manager(num_peers, &logger, tokio::runtime::Handle::current());
         let request_queue_size = download_manager.gossip_config.max_artifact_streams_per_peer;
         download_manager.artifact_manager = Arc::new(TestArtifactManager {
             quota: 2 * 1024 * 1024 * 1024,
@@ -2268,7 +2247,7 @@ pub mod tests {
         let mut result = vec![];
         for advert_number in range {
             let msg = receive_check_test_create_message(advert_number);
-            let artifact_id = CryptoHashOf::from(ic_crypto::crypto_hash(&msg).get());
+            let artifact_id = CryptoHashOf::from(ic_crypto_hash::crypto_hash(&msg).get());
             let attribute = DkgMessageAttribute {
                 interval_start_height: Default::default(),
             };
@@ -2276,7 +2255,7 @@ pub mod tests {
                 artifact_id: ArtifactId::DkgMessage(artifact_id),
                 attribute: ArtifactAttribute::DkgMessage(attribute),
                 size: 0,
-                integrity_hash: ic_crypto::crypto_hash(&msg).get(),
+                integrity_hash: ic_crypto_hash::crypto_hash(&msg).get(),
             };
             result.push(gossip_advert);
         }
@@ -2296,13 +2275,14 @@ pub mod tests {
     async fn receive_check_test() {
         // Initialize the logger and download manager for the test.
         let logger = p2p_test_setup_logger();
-        let download_manager = new_test_download_manager(2, &logger);
+        let download_manager =
+            new_test_download_manager(2, &logger, tokio::runtime::Handle::current());
         let node_id = node_test_id(1);
         let max_adverts = download_manager.gossip_config.max_artifact_streams_per_peer;
         let mut adverts = receive_check_test_create_adverts(0..max_adverts);
         let msg = receive_check_test_create_message(0);
         let artifact_id =
-            ArtifactId::DkgMessage(CryptoHashOf::from(ic_crypto::crypto_hash(&msg).get()));
+            ArtifactId::DkgMessage(CryptoHashOf::from(ic_crypto_hash::crypto_hash(&msg).get()));
         for mut advert in &mut adverts {
             advert.artifact_id = artifact_id.clone();
         }
@@ -2320,7 +2300,7 @@ pub mod tests {
             assert_eq!(chunk_req.artifact_id, artifact_id);
             assert_eq!(
                 chunk_req.integrity_hash,
-                ic_crypto::crypto_hash(&receive_check_test_create_message(index as u32)).get(),
+                ic_crypto_hash::crypto_hash(&receive_check_test_create_message(index as u32)).get(),
             );
             assert_eq!(chunk_req.chunk_id, ChunkId::from(0));
 
@@ -2359,7 +2339,8 @@ pub mod tests {
     async fn integrity_hash_test() {
         // Initialize the logger and download manager for the test.
         let logger = p2p_test_setup_logger();
-        let download_manager = new_test_download_manager(2, &logger);
+        let download_manager =
+            new_test_download_manager(2, &logger, tokio::runtime::Handle::current());
         let node_id = node_test_id(1);
         let max_adverts = 20;
         let adverts = receive_check_test_create_adverts(0..max_adverts);
@@ -2407,7 +2388,8 @@ pub mod tests {
             peers in arb_peer_list(0)
         ) {
             // Tokio context is required here because some functions still assume it exists.
-            let _rt_guard = tokio::runtime::Runtime::new().unwrap().enter();
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let _rt_guard = rt.enter();
             let peers_dictionary: PeerContextDictionary = peers
                 .iter()
                 .map(|node_id| (*node_id, PeerContext::from(node_id.to_owned())))
@@ -2418,17 +2400,15 @@ pub mod tests {
 
             // Transport:
             let hub_access: HubAccess = Arc::new(Mutex::new(Default::default()));
-            let transport = get_transport(0, hub_access, &logger);
+            let transport = get_transport(0, hub_access, &logger, rt.handle().clone());
 
             // Context:
-            let transport_client_type = TransportClientType::P2P;
-            transport.register_client(transport_client_type, Arc::new(new_test_event_handler( MAX_ADVERT_BUFFER, node_test_id(0)))).unwrap();
+            transport.register_client(Arc::new(new_test_event_handler( MAX_ADVERT_BUFFER, node_test_id(0)).0)).unwrap();
             let peer_manager = PeerManagerImpl {
                 node_id: node_test_id(0),
                 log: p2p_test_setup_logger().root.clone().into(),
                 current_peers,
                 transport,
-                transport_client_type,
             };
 
             let current_peers = peer_manager.get_current_peer_ids();
@@ -2444,7 +2424,8 @@ pub mod tests {
             peer_list in arb_peer_list(3)
         ) {
             // Tokio context is required here because some functions still assume it exists.
-            let _rt_guard = tokio::runtime::Runtime::new().unwrap().enter();
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let _rt_guard = rt.enter();
             // Get the original peer list, split into three: a + b + c
             // then produce:
             // old = a + b
@@ -2468,17 +2449,15 @@ pub mod tests {
 
             let logger = p2p_test_setup_logger();
             let hub_access: HubAccess = Arc::new(Mutex::new(Default::default()));
-            let transport = get_transport(0, hub_access, &logger);
+            let transport = get_transport(0, hub_access, &logger, rt.handle().clone());
 
             // Context
-            let transport_client_type = TransportClientType::P2P;
-            transport.register_client(transport_client_type, Arc::new(new_test_event_handler(MAX_ADVERT_BUFFER, node_test_id(0)))).unwrap();
+            transport.register_client(Arc::new(new_test_event_handler(MAX_ADVERT_BUFFER, node_test_id(0)).0)).unwrap();
             let peer_manager = PeerManagerImpl {
                 node_id: node_test_id(0),
                 log: p2p_test_setup_logger().root.clone().into(),
                 current_peers,
                 transport,
-                transport_client_type,
             };
 
             // Set property on one node.
@@ -2522,7 +2501,6 @@ pub mod tests {
             p2p_test_setup_logger().root.clone().into(),
             current_peers.clone(),
             Arc::new(MockTransport::new()),
-            TransportClientType::P2P,
         );
 
         {
@@ -2561,7 +2539,6 @@ pub mod tests {
             p2p_test_setup_logger().root.clone().into(),
             Arc::new(Mutex::new(PeerContextDictionary::default())),
             Arc::new(MockTransport::new()),
-            TransportClientType::P2P,
         );
         let ret = peer_manager.get_random_subset(Percentage::from(10));
         assert!(ret.is_empty());

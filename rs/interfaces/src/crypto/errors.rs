@@ -1,6 +1,8 @@
 use crate::crypto::ErrorReplication;
 use ic_types::crypto::canister_threshold_sig::error::{
-    IDkgVerifyDealingPrivateError, IDkgVerifyDealingPublicError,
+    IDkgVerifyComplaintError, IDkgVerifyDealingPrivateError, IDkgVerifyDealingPublicError,
+    IDkgVerifyOpeningError, IDkgVerifyTranscriptError, ThresholdEcdsaVerifyCombinedSignatureError,
+    ThresholdEcdsaVerifySigShareError,
 };
 use ic_types::crypto::threshold_sig::ni_dkg::errors::create_transcript_error::DkgCreateTranscriptError;
 use ic_types::crypto::threshold_sig::ni_dkg::errors::verify_dealing_error::DkgVerifyDealingError;
@@ -45,19 +47,9 @@ impl ErrorReplication for CryptoError {
             CryptoError::AlgorithmNotSupported { .. } => true,
             // false, as the result may change if the DKG transcript is reloaded.
             CryptoError::ThresholdSigDataNotFound { .. } => false,
-            CryptoError::RegistryClient(registry_client_error) => match registry_client_error {
-                // false, as depends on the data available to the registry
-                RegistryClientError::VersionNotAvailable { .. } => false,
-                // false in both cases, these may be transient errors
-                RegistryClientError::DataProviderQueryFailed { source } => match source {
-                    ic_types::registry::RegistryDataProviderError::Timeout => false,
-                    ic_types::registry::RegistryDataProviderError::Transfer { .. } => false,
-                },
-                // may be a transient error
-                RegistryClientError::PollLockFailed { .. } => false,
-                // may be transient errors
-                RegistryClientError::PollingLatestVersionFailed { .. } => false,
-            },
+            CryptoError::RegistryClient(registry_client_error) => {
+                error_replication_of_registry_client_error(registry_client_error)
+            }
             // true, as the registry is guaranteed to be consistent across replicas
             CryptoError::DkgTranscriptNotFound { .. } => true,
             // true, as the registry is guaranteed to be consistent across replicas
@@ -81,19 +73,7 @@ impl ErrorReplication for DkgVerifyDealingError {
                 true
             }
             DkgVerifyDealingError::Registry(registry_client_error) => {
-                match registry_client_error {
-                    // false, as depends on the data available to the registry
-                    RegistryClientError::VersionNotAvailable { .. } => false,
-                    // false in both cases, these may be transient errors
-                    RegistryClientError::DataProviderQueryFailed { source } => match source {
-                        ic_types::registry::RegistryDataProviderError::Timeout => false,
-                        ic_types::registry::RegistryDataProviderError::Transfer { .. } => false,
-                    },
-                    // may be a transient error
-                    RegistryClientError::PollLockFailed { .. } => false,
-                    // may be transient errors
-                    RegistryClientError::PollingLatestVersionFailed { .. } => false,
-                }
+                error_replication_of_registry_client_error(registry_client_error)
             }
             DkgVerifyDealingError::MalformedFsEncryptionPublicKey(_) => {
                 // true, as the encryption public key is fetched from the registry and the
@@ -130,10 +110,76 @@ impl ErrorReplication for DkgCreateTranscriptError {
     }
 }
 
+impl ErrorReplication for IDkgVerifyTranscriptError {
+    fn is_replicated(&self) -> bool {
+        // The match below is intentionally explicit on all possible values,
+        // to avoid defaults, which might be error-prone.
+        // Upon addition of any new error this match has to be updated.
+        match self {
+            // rue, as validity checks of arguments are stable across replicas
+            IDkgVerifyTranscriptError::InvalidArgument(_) => true,
+            // Whether this is a replicated error depends on the underlying crypto error
+            IDkgVerifyTranscriptError::InvalidDealingMultiSignature { crypto_error, .. } => {
+                crypto_error.is_replicated()
+            }
+            // true, as (de)serialization is stable across replicas
+            IDkgVerifyTranscriptError::SerializationError(_) => true,
+            // true, as the transcript does not become valid through retrying
+            IDkgVerifyTranscriptError::InvalidTranscript => true,
+        }
+    }
+}
+
 impl ErrorReplication for IDkgVerifyDealingPublicError {
     fn is_replicated(&self) -> bool {
-        // TODO correctly implement this function
-        false
+        // The match below is intentionally explicit on all possible values,
+        // to avoid defaults, which might be error-prone.
+        // Upon addition of any new error this match has to be updated.
+
+        // Public dealing verification does not depend on any local or private
+        // state and so is inherently replicated.
+        match self {
+            // The dealer wasn't even in the transcript
+            Self::TranscriptIdMismatch => true,
+            // The dealing was publically invalid
+            Self::InvalidDealing { .. } => true,
+        }
+    }
+}
+
+impl ErrorReplication for IDkgVerifyComplaintError {
+    fn is_replicated(&self) -> bool {
+        // The match below is intentionally explicit on all possible values,
+        // to avoid defaults, which might be error-prone.
+        // Upon addition of any new error this match has to be updated.
+        match self {
+            // true, as the complaint does not become valid through retrying
+            IDkgVerifyComplaintError::InvalidComplaint => true,
+            // true, as validity checks of arguments are stable across replicas
+            IDkgVerifyComplaintError::InvalidArgument { .. } => true,
+            // true, as validity checks of arguments are stable across replicas
+            IDkgVerifyComplaintError::InvalidArgumentMismatchingTranscriptIDs => true,
+            // true, as validity checks of arguments are stable across replicas
+            IDkgVerifyComplaintError::InvalidArgumentMissingDealingInTranscript { .. } => true,
+            // true, as validity checks of arguments are stable across replicas
+            IDkgVerifyComplaintError::InvalidArgumentMissingComplainerInTranscript { .. } => true,
+            // true, as the registry is guaranteed to be consistent across replicas
+            IDkgVerifyComplaintError::ComplainerPublicKeyNotInRegistry { .. } => true,
+            // true, as the public key is fetched from the registry and the
+            // registry is guaranteed to be consistent across replicas
+            IDkgVerifyComplaintError::MalformedComplainerPublicKey { .. } => true,
+
+            // true, as the set of supported algorithms is stable (bound to code version)
+            IDkgVerifyComplaintError::UnsupportedComplainerPublicKeyAlgorithm { .. } => true,
+            // true, as (de)serialization is stable across replicas
+            IDkgVerifyComplaintError::SerializationError { .. } => true,
+            IDkgVerifyComplaintError::Registry(registry_client_error) => {
+                error_replication_of_registry_client_error(registry_client_error)
+            }
+            // true, as the types of internal errors that may occur during complaint
+            // verification are stable
+            IDkgVerifyComplaintError::InternalError { .. } => true,
+        }
     }
 }
 
@@ -143,10 +189,104 @@ impl ErrorReplication for IDkgVerifyDealingPrivateError {
         // to avoid defaults, which might be error-prone.
         // Upon addition of any new error this match has to be updated.
         match self {
-            IDkgVerifyDealingPrivateError::NotAReceiver => {
-                // Logic error. Everyone thinks a non-receiver is a receiver.
-                true
+            IDkgVerifyDealingPrivateError::RegistryError(registry_client_error) => {
+                error_replication_of_registry_client_error(registry_client_error)
             }
+            // false, as an RPC error may be transient
+            IDkgVerifyDealingPrivateError::CspVaultRpcError(_) => false,
+            // true, as the dealing does not become valid through retrying
+            IDkgVerifyDealingPrivateError::InvalidDealing(_) => true,
+            // true, as validity checks of arguments are stable across replicas
+            IDkgVerifyDealingPrivateError::InvalidArgument(_) => true,
+            // true, as the internal errors that may occur are stable
+            IDkgVerifyDealingPrivateError::InternalError(_) => true,
+            // true, as the private key remains missing despite retrying
+            IDkgVerifyDealingPrivateError::PrivateKeyNotFound => true,
+            // true, as the registry is guaranteed to be consistent across replicas
+            IDkgVerifyDealingPrivateError::PublicKeyNotInRegistry { .. } => true,
+            // true, as the public key is fetched from the registry and the
+            // registry is guaranteed to be consistent across replicas
+            IDkgVerifyDealingPrivateError::MalformedPublicKey { .. } => true,
+            // true, as the set of supported algorithms is stable (bound to code version)
+            IDkgVerifyDealingPrivateError::UnsupportedAlgorithm { .. } => true,
+            // true, as the node won't become a receiver through retrying
+            IDkgVerifyDealingPrivateError::NotAReceiver => true,
         }
+    }
+}
+
+impl ErrorReplication for ThresholdEcdsaVerifySigShareError {
+    fn is_replicated(&self) -> bool {
+        // The match below is intentionally explicit on all possible values,
+        // to avoid defaults, which might be error-prone.
+        // Upon addition of any new error this match has to be updated.
+
+        // Signature share verification does not depend on any local or private
+        // state and so is inherently replicated.
+        match self {
+            // The error returned if signature share commitments are invalid
+            Self::InvalidSignatureShare => true,
+            // The purported signer does exist in the transcript
+            Self::InvalidArgumentMissingSignerInTranscript { .. } => true,
+            // The signature share could not even be deserialized correctly
+            Self::SerializationError { .. } => true,
+            // The share included an invalid commitment type
+            Self::InternalError { .. } => true,
+        }
+    }
+}
+
+impl ErrorReplication for ThresholdEcdsaVerifyCombinedSignatureError {
+    fn is_replicated(&self) -> bool {
+        // The match below is intentionally explicit on all possible values,
+        // to avoid defaults, which might be error-prone.
+        // Upon addition of any new error this match has to be updated.
+
+        // Signature verification does not depend on any local or
+        // private state and so is inherently replicated.
+        match self {
+            // The ECDSA signature was invalid or did not match the
+            // presignature transcript
+            Self::InvalidSignature => true,
+            // The signature could not even be deserialized correctly
+            Self::SerializationError { .. } => true,
+            // Invalid commitment type or wrong algorithm ID
+            Self::InternalError { .. } => true,
+        }
+    }
+}
+
+impl ErrorReplication for IDkgVerifyOpeningError {
+    fn is_replicated(&self) -> bool {
+        match self {
+            // true, as this is a stable property of the arguments.
+            IDkgVerifyOpeningError::TranscriptIdMismatch => true,
+            // true, as this is a stable property of the arguments.
+            IDkgVerifyOpeningError::DealerIdMismatch => true,
+            // true, as this is a stable property of the arguments.
+            IDkgVerifyOpeningError::MissingDealingInTranscript { .. } => true,
+            // true, as this is a stable property of the arguments.
+            IDkgVerifyOpeningError::MissingOpenerInReceivers { .. } => true,
+            // true, as this is a stable property of the arguments.
+            IDkgVerifyOpeningError::InternalError { .. } => true,
+        }
+    }
+}
+
+fn error_replication_of_registry_client_error(registry_client_error: &RegistryClientError) -> bool {
+    match registry_client_error {
+        // false, as depends on the data available to the registry
+        RegistryClientError::VersionNotAvailable { .. } => false,
+        // false in both cases, these may be transient errors
+        RegistryClientError::DataProviderQueryFailed { source } => match source {
+            ic_types::registry::RegistryDataProviderError::Timeout => false,
+            ic_types::registry::RegistryDataProviderError::Transfer { .. } => false,
+        },
+        // may be a transient error
+        RegistryClientError::PollLockFailed { .. } => false,
+        // may be transient errors
+        RegistryClientError::PollingLatestVersionFailed { .. } => false,
+        // true, as the registry is guaranteed to be consistent accross replicas
+        RegistryClientError::DecodeError { .. } => true,
     }
 }

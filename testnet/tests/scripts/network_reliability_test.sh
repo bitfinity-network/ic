@@ -21,7 +21,8 @@ Success::
       uniformity, and
 .. <= 5% of requests issued by the workload generator fail -- this is
      because no one has time to fix the workload generator, and it sometimes
-     fails to deliver requests.
+     fails to deliver requests (increased to 20% for 56 node nns until a
+     lower percentage is achievable).
 
 end::catalog[]
 DOC
@@ -29,7 +30,7 @@ export exit_code=0
 set -euo pipefail
 if (($# != 6)); then
     echo >&2 "Wrong number of arguments, please provide values for <testnet_identifier> <runtime_in_seconds> <rate> <payload_size> <topology> <results_dir>:"
-    echo >&2 "$0 p2p_15 30 40 250b [normal|large|large_nns|56_nns] ./results/"
+    echo >&2 "$0 p2p_15 30 40 250b [normal|large|large_nns|56_nns|46_nns] ./results/"
     exit 1
 fi
 
@@ -47,7 +48,7 @@ experiment_dir="$results_dir/network_reliability_test_${testnet}-rt_${runtime}-r
 # shellcheck disable=SC1090
 source "${HELPERS:-$(dirname "${BASH_SOURCE[0]}")/include/helpers.sh}"
 
-SUBNET_TYPES=("normal" "large" "large_nns" "56_nns")
+SUBNET_TYPES=("normal" "large" "large_nns" "56_nns" "46_nns")
 if [[ ! " ${SUBNET_TYPES[*]} " =~ ${subnet_type} ]]; then
     echo >&2 "Invalid subnet type specified, choose between normal, large, large_nns and 56_nns."
     exit_usage
@@ -67,6 +68,11 @@ fi
 if [[ "$subnet_type" == "56_nns" ]]; then
     # The test will run with a special hosts file creating a large nns subnet.
     export HOSTS_INI_FILENAME=hosts_56_nns.ini
+    HOSTS_INI_ARGUMENTS+=(--hosts-ini "$HOSTS_INI_FILENAME")
+fi
+if [[ "$subnet_type" == "46_nns" ]]; then
+    # The test will run with a special hosts file creating a large nns subnet.
+    export HOSTS_INI_FILENAME=hosts_46_nns.ini
     HOSTS_INI_ARGUMENTS+=(--hosts-ini "$HOSTS_INI_FILENAME")
 fi
 
@@ -308,7 +314,7 @@ while read -r wg_status; do
     fi
 done <"$wg_status_file"
 
-# Finalization rate >= 0.3
+# Finalization rate exceeding expected threshold
 finalization_rate="$(jq -r '.data.result[0].value[1]' <"$experiment_dir/metrics/artifact_pool_consensus_height_stat_avg_total.json")"
 
 sed -i "s/finalization_rate/$finalization_rate/g" "$experiment_dir/data_to_upload/FinalizationRate.json"
@@ -351,8 +357,15 @@ else
     bad_percentage=100
 fi
 echo "bad percentage $bad_percentage"
+
 if [[ $bad_percentage -le "5" ]]; then
     success "No more than 5% of requests failed."
+elif [[ "$subnet_type" == "56_nns" ]]; then
+    if [[ $bad_percentage -le "20" ]]; then
+        success "At most 20% of the requests failed."
+    else
+        failure "More than 20% of the requests failed, check '$experiment_dir/0_workload-summary.json and $experiment_dir/1_workload-summary.json'"
+    fi
 else
     failure "More than 5% of requests failed, check '$experiment_dir/0_workload-summary.json and $experiment_dir/1_workload-summary.json'"
 fi

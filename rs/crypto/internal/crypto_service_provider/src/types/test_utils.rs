@@ -13,6 +13,10 @@ use ic_crypto_internal_threshold_sig_bls12381::dkg::secp256k1::types::{
 use ic_crypto_internal_threshold_sig_bls12381::ni_dkg::groth20_bls12_381::types as ni_dkg_types;
 use ic_crypto_internal_threshold_sig_bls12381::ni_dkg::groth20_bls12_381::types::FsEncryptionSecretKey;
 use ic_crypto_internal_threshold_sig_bls12381::types as threshold_sig_types;
+use ic_crypto_internal_threshold_sig_ecdsa::{
+    gen_keypair, CommitmentOpeningBytes, EccCurveType, EccScalarBytes, MEGaKeySetK256Bytes,
+    MEGaPrivateKeyK256Bytes, MEGaPublicKeyK256Bytes,
+};
 use ic_crypto_internal_tls::keygen::TlsEd25519SecretKeyDerBytes;
 use ic_crypto_internal_types::encrypt::forward_secure::groth20_bls12_381::{
     FsEncryptionPop, FsEncryptionPublicKey,
@@ -20,10 +24,6 @@ use ic_crypto_internal_types::encrypt::forward_secure::groth20_bls12_381::{
 use ic_crypto_secrets_containers::SecretArray;
 use rand::Rng;
 use std::convert::TryFrom;
-use tecdsa::{
-    CommitmentOpeningBytes, EccCurveType, EccScalarBytes, MEGaKeySetK256Bytes, MEGaPrivateKey,
-    MEGaPrivateKeyK256Bytes, MEGaPublicKeyK256Bytes,
-};
 
 impl CspSecretKey {
     /// This function is only used for tests
@@ -300,11 +300,10 @@ pub fn arbitrary_threshold_bls12381_individual_signature() -> ThresBls12_381_Sig
 /// This function is only used for tests
 #[allow(unused)]
 pub fn arbitrary_mega_k256_encryption_key_set() -> CspSecretKey {
-    let private_key = MEGaPrivateKey::generate(EccCurveType::K256, &mut rand::thread_rng())
-        .expect("failed to generate MEGa private key");
-    let public_key = private_key
-        .public_key()
-        .expect("private key should have public key");
+    let seed = ic_types::Randomness::from(rand::thread_rng().gen::<[u8; 32]>());
+
+    let (public_key, private_key) =
+        gen_keypair(EccCurveType::K256, seed).expect("failed to generate MEGa key pair");
     let public_key =
         MEGaPublicKeyK256Bytes::try_from(&public_key).expect("just-generated key should serialize");
     let private_key = MEGaPrivateKeyK256Bytes::try_from(&private_key)

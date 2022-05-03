@@ -4,7 +4,10 @@ use crate::api::{CspKeyGenerator, CspSecretKeyStoreChecker};
 use crate::secret_key_store::{SecretKeyStore, SecretKeyStoreError};
 use crate::types::{CspPop, CspPublicKey, CspSecretKey};
 use crate::Csp;
+use ic_crypto_internal_threshold_sig_ecdsa::{EccCurveType, MEGaPublicKey};
 use ic_crypto_internal_tls::keygen::generate_tls_key_pair_der;
+use ic_crypto_internal_types::encrypt::forward_secure::CspFsEncryptionPublicKey;
+use ic_crypto_sha::Sha256;
 use ic_crypto_sha::{Context, DomainSeparationContext};
 use ic_crypto_tls_interfaces::TlsPublicKeyCert;
 use ic_types::crypto::{AlgorithmId, CryptoError, KeyId};
@@ -12,19 +15,16 @@ use ic_types::NodeId;
 use openssl::asn1::Asn1Time;
 use rand::{CryptoRng, Rng};
 use std::convert::TryFrom;
-use tecdsa::{EccCurveType, MEGaPublicKey};
+pub use tls_keygen::tls_cert_hash_as_key_id;
 
 const KEY_ID_DOMAIN: &str = "ic-key-id";
-
-use crate::vault::api::{BasicSignatureCspVault, MultiSignatureCspVault, SecretKeyStoreCspVault};
-use ic_crypto_internal_types::encrypt::forward_secure::CspFsEncryptionPublicKey;
-use ic_crypto_sha::Sha256;
-pub use tls_keygen::tls_cert_hash_as_key_id;
 
 #[cfg(test)]
 mod tests;
 
-impl<R: Rng + CryptoRng, S: SecretKeyStore, C: SecretKeyStore> CspKeyGenerator for Csp<R, S, C> {
+impl<R: Rng + CryptoRng + Send + Sync, S: SecretKeyStore, C: SecretKeyStore> CspKeyGenerator
+    for Csp<R, S, C>
+{
     fn gen_key_pair(&self, alg_id: AlgorithmId) -> Result<(KeyId, CspPublicKey), CryptoError> {
         match alg_id {
             AlgorithmId::MultiBls12_381 => {
@@ -46,7 +46,8 @@ impl<R: Rng + CryptoRng, S: SecretKeyStore, C: SecretKeyStore> CspKeyGenerator f
         let common_name = &node.get().to_string()[..];
         let not_after = Asn1Time::from_str_x509(not_after)
             .expect("invalid X.509 certificate expiration date (not_after)");
-        let (cert, secret_key) = generate_tls_key_pair_der(common_name, serial, &not_after);
+        let (cert, secret_key) =
+            generate_tls_key_pair_der(&mut *self.rng_write_lock(), common_name, serial, &not_after);
 
         let x509_pk_cert = TlsPublicKeyCert::new_from_der(cert.bytes)
             .expect("generated X509 certificate has malformed DER encoding");
@@ -55,8 +56,8 @@ impl<R: Rng + CryptoRng, S: SecretKeyStore, C: SecretKeyStore> CspKeyGenerator f
     }
 }
 
-impl<R: Rng + CryptoRng, S: SecretKeyStore, C: SecretKeyStore> CspSecretKeyStoreChecker
-    for Csp<R, S, C>
+impl<R: Rng + CryptoRng + Send + Sync, S: SecretKeyStore, C: SecretKeyStore>
+    CspSecretKeyStoreChecker for Csp<R, S, C>
 {
     fn sks_contains(&self, key_id: &KeyId) -> bool {
         self.csp_vault.sks_contains(key_id)
@@ -69,9 +70,12 @@ impl<R: Rng + CryptoRng, S: SecretKeyStore, C: SecretKeyStore> CspSecretKeyStore
     }
 }
 
-impl<R: Rng + CryptoRng, S: SecretKeyStore, C: SecretKeyStore> Csp<R, S, C> {
+impl<R: Rng + CryptoRng + Send + Sync, S: SecretKeyStore, C: SecretKeyStore> Csp<R, S, C> {
     fn store_secret_key_or_panic(&self, csp_secret_key: CspSecretKey, key_id: KeyId) {
-        match &self.sks_write_lock().insert(key_id, csp_secret_key, None) {
+        match &self
+            .csp_vault
+            .insert_secret_key(key_id, csp_secret_key, None)
+        {
             Ok(()) => {}
             Err(SecretKeyStoreError::DuplicateKeyId(key_id)) => {
                 panic!("A key with ID {} has already been inserted", key_id);
@@ -135,7 +139,7 @@ mod tls_keygen {
         bytes_hash_as_key_id(AlgorithmId::Tls, cert.as_der())
     }
 
-    impl<R: Rng + CryptoRng, S: SecretKeyStore, C: SecretKeyStore> Csp<R, S, C> {
+    impl<R: Rng + CryptoRng + Send + Sync, S: SecretKeyStore, C: SecretKeyStore> Csp<R, S, C> {
         pub(super) fn store_tls_secret_key(
             &mut self,
             cert: &TlsPublicKeyCert,

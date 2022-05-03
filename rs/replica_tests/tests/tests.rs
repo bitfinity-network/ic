@@ -1,5 +1,7 @@
 use assert_matches::assert_matches;
 use candid::{Decode, Encode};
+use ic_error_types::ErrorCode;
+use ic_ic00_types::{self as ic00, EmptyBlob, Method};
 use ic_replica_tests as utils;
 use ic_replica_tests::assert_reply;
 use ic_replicated_state::{PageIndex, PageMap};
@@ -7,18 +9,12 @@ use ic_sys::PAGE_SIZE;
 use ic_test_utilities::types::ids::canister_test_id;
 use ic_test_utilities::universal_canister::{call_args, wasm};
 use ic_types::{
-    ic00,
-    ic00::{EmptyBlob, Method},
-    ingress::WasmResult,
-    messages::MAX_INTER_CANISTER_PAYLOAD_IN_BYTES,
-    time::current_time_and_expiry_time,
-    user_error::ErrorCode,
-    CanisterId, NumBytes, RegistryVersion,
+    ingress::WasmResult, messages::MAX_INTER_CANISTER_PAYLOAD_IN_BYTES,
+    time::current_time_and_expiry_time, CanisterId, NumBytes, RegistryVersion,
 };
-use ic_utils::ic_features::*;
 
 const WASM_PAGE_SIZE: usize = 65536;
-const CYCLES_BALANCE: u64 = 1 << 50;
+const CYCLES_BALANCE: u128 = 1 << 50;
 
 #[test]
 /// Tests a message can roundtrip through all layers
@@ -385,12 +381,6 @@ fn test_query_trap_recovery() {
 /// Tests that a canister correctly initializes itself
 fn test_memory_persistence() {
     utils::canister_test(|test| {
-        if cow_state_feature::is_enabled(cow_state_feature::cow_state) {
-            // This test is not applicable for cow memory and as it
-            // does not use pagemaps
-            return;
-        }
-
         let (canister_id, _) = test.create_and_install_canister(TEST_MEMORY, vec![]);
         // helper to make a query that writes some data to a given address
         let write_data_query = |addr: i32, data: Vec<u8>| {
@@ -572,12 +562,6 @@ fn test_heap_initialized_from_data_section_only_once() {
           (export "canister_query read" (func $read))
         )"#;
     utils::canister_test(move |test| {
-        if cow_state_feature::is_enabled(cow_state_feature::cow_state) {
-            // This test is not applicable for cow memory and as it
-            // does not use pagemaps
-            return;
-        }
-
         let (canister_id, _) = test.create_and_install_canister(wat, vec![]);
 
         let num_pages = (WASM_PAGE_SIZE / PAGE_SIZE) as u64;
@@ -848,12 +832,6 @@ fn test_update_available_memory_3() {
     // installs a canister that uses debug.log from canister_init
     // and check the received value
     utils::canister_test(move |test| {
-        if cow_state_feature::is_enabled(cow_state_feature::cow_state) {
-            // This test is not applicable for cow memory and as it
-            // does not use pagemaps
-            return;
-        }
-
         // 1. After install the memory size is equal to the declared memory minimum
         // size.
         let (canister_id, _) = test.create_and_install_canister(wat, vec![]);
@@ -1038,12 +1016,6 @@ fn test_update_available_memory_4() {
     // installs a canister that uses debug.log from canister_init
     // and check the received value
     utils::canister_test(move |test| {
-        if cow_state_feature::is_enabled(cow_state_feature::cow_state) {
-            // This test is not applicable for cow memory and as it
-            // does not use pagemaps
-            return;
-        }
-
         let (canister_id, _) = test.create_and_install_canister(wat, vec![]);
 
         let num_pages = |n| (n * WASM_PAGE_SIZE / PAGE_SIZE) as u64;

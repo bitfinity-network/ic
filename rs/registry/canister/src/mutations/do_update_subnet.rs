@@ -1,14 +1,22 @@
+use std::convert::TryFrom;
+
 use crate::{common::LOG_PREFIX, mutations::common::encode_or_panic, registry::Registry};
 
 use candid::{CandidType, Deserialize};
 use dfn_core::println;
+use ic_nns_common::registry::decode_or_panic;
+use serde::Serialize;
 
-use ic_base_types::SubnetId;
-use ic_protobuf::registry::subnet::v1::{EcdsaConfig, GossipAdvertConfig, SubnetRecord};
-use ic_registry_keys::make_subnet_record_key;
-use ic_registry_subnet_features::SubnetFeatures;
+use ic_base_types::{subnet_id_into_protobuf, SubnetId};
+use ic_ic00_types::EcdsaKeyId;
+use ic_protobuf::registry::{
+    crypto::v1::EcdsaSigningSubnetList,
+    subnet::v1::{GossipAdvertConfig, SubnetRecord},
+};
+use ic_registry_keys::{make_ecdsa_signing_subnet_list_key, make_subnet_record_key};
+use ic_registry_subnet_features::{EcdsaConfig, SubnetFeatures};
 use ic_registry_subnet_type::SubnetType;
-use ic_registry_transport::pb::v1::{registry_mutation, RegistryMutation};
+use ic_registry_transport::pb::v1::{registry_mutation, RegistryMutation, RegistryValue};
 use ic_types::p2p::build_default_gossip_config;
 
 /// Updates the subnet's configuration in the registry.
@@ -19,19 +27,105 @@ impl Registry {
     pub fn do_update_subnet(&mut self, payload: UpdateSubnetPayload) {
         println!("{}do_update_subnet: {:?}", LOG_PREFIX, payload);
 
-        let subnet_id = payload.subnet_id;
+        self.validate_update_payload_ecdsa_config(&payload);
 
+        let subnet_id = payload.subnet_id;
         let subnet_record = self.get_subnet_or_panic(subnet_id);
 
-        let new_subnet_record = merge_subnet_record(subnet_record, payload);
-        let mutations = vec![RegistryMutation {
+        let new_subnet_record = merge_subnet_record(subnet_record.clone(), payload.clone());
+        let subnet_record_mutation = RegistryMutation {
             mutation_type: registry_mutation::Type::Upsert as i32,
             key: make_subnet_record_key(subnet_id).as_bytes().to_vec(),
             value: encode_or_panic(&new_subnet_record),
-        }];
+        };
+
+        let mut mutations = vec![subnet_record_mutation];
+
+        if let Some(ecdsa_key_signing_enable) = payload.ecdsa_key_signing_enable {
+            for key_id in &ecdsa_key_signing_enable {
+                let ecdsa_signing_subnet_list_key_id = make_ecdsa_signing_subnet_list_key(key_id);
+                let mut ecdsa_signing_subnet_list_record = self
+                    .get_ecdsa_signing_subnet_list_or_default(&ecdsa_signing_subnet_list_key_id);
+
+                let ecdsa_signing_subnet_list_contains_subnet_id = ecdsa_signing_subnet_list_record
+                    .subnets
+                    .contains(&subnet_id_into_protobuf(subnet_id));
+
+                // Proposals cannote enable signing for a key unless the key was
+                // previously held by the subnet.
+                let current_keys = subnet_record
+                    .ecdsa_config
+                    .as_ref()
+                    .map(|ecdsa_config| ecdsa_config.key_ids.clone())
+                    .unwrap_or_default();
+
+                if !current_keys.contains(&key_id.into())
+                    && !ecdsa_signing_subnet_list_contains_subnet_id
+                {
+                    panic!("Proposal attempts to enable signing for ECDSA key {} on Subnet {},  but the subnet does not hold the given key. A proposal to add that key to the subnet must first be separately submitted.",
+                        key_id, subnet_id
+                    );
+                }
+
+                if !ecdsa_signing_subnet_list_contains_subnet_id {
+                    ecdsa_signing_subnet_list_record
+                        .subnets
+                        .push(subnet_id_into_protobuf(subnet_id));
+
+                    let ecdsa_signing_subnet_list_mutation = RegistryMutation {
+                        mutation_type: registry_mutation::Type::Upsert as i32,
+                        key: ecdsa_signing_subnet_list_key_id.as_bytes().to_vec(),
+                        value: encode_or_panic(&ecdsa_signing_subnet_list_record),
+                    };
+
+                    mutations.push(ecdsa_signing_subnet_list_mutation);
+                }
+            }
+        }
 
         // Check invariants before applying mutations
         self.maybe_apply_mutation_internal(mutations);
+    }
+
+    fn get_ecdsa_signing_subnet_list_or_default(
+        &self,
+        ecdsa_signing_subnet_list_key_id: &str,
+    ) -> EcdsaSigningSubnetList {
+        match self.get(
+            ecdsa_signing_subnet_list_key_id.as_bytes(),
+            self.latest_version(),
+        ) {
+            Some(RegistryValue {
+                value: ecdsa_signing_subnet_list_record_vec,
+                version: _,
+                deletion_marker: _,
+            }) => decode_or_panic::<EcdsaSigningSubnetList>(
+                ecdsa_signing_subnet_list_record_vec.to_vec(),
+            ),
+            None => EcdsaSigningSubnetList { subnets: vec![] },
+        }
+    }
+
+    /// Validates that EcdsaKeyId's are globally unique across all subnets
+    /// Panics if they are not
+    fn validate_update_payload_ecdsa_config(&self, payload: &UpdateSubnetPayload) {
+        if payload.ecdsa_config.is_none() {
+            return;
+        }
+
+        let ecdsa_config = payload.ecdsa_config.as_ref().unwrap();
+        let new_key_ids = ecdsa_config.key_ids.clone();
+
+        let ecdsa_subnet_map = self.get_ecdsa_keys_to_subnets_map();
+
+        new_key_ids.iter().for_each(|key_id| {
+            if ecdsa_subnet_map.contains_key(key_id) {
+                panic!(
+                    "{}ECDSA key with id '{}' already exists.  ID must be globally unique.",
+                    LOG_PREFIX, key_id
+                );
+            }
+        })
     }
 }
 
@@ -47,12 +141,12 @@ impl Registry {
 /// are intentionally left out as they are updated via other proposals and/or
 /// handlers because they are subject to invariants, e.g. the replica version
 /// must be "blessed".
-#[derive(CandidType, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct UpdateSubnetPayload {
     pub subnet_id: SubnetId,
 
-    pub ingress_bytes_per_block_soft_cap: Option<u64>,
     pub max_ingress_bytes_per_message: Option<u64>,
+    pub max_ingress_messages_per_block: Option<u64>,
     pub max_block_payload_size: Option<u64>,
     pub unit_delay_millis: Option<u64>,
     pub initial_notary_delay_millis: Option<u64>,
@@ -83,6 +177,7 @@ pub struct UpdateSubnetPayload {
     pub features: Option<SubnetFeatures>,
 
     pub ecdsa_config: Option<EcdsaConfig>,
+    pub ecdsa_key_signing_enable: Option<Vec<EcdsaKeyId>>,
 
     pub max_number_of_canisters: Option<u64>,
 
@@ -146,8 +241,8 @@ fn merge_subnet_record(
 
     let UpdateSubnetPayload {
         subnet_id: _subnet_id,
-        ingress_bytes_per_block_soft_cap,
         max_ingress_bytes_per_message,
+        max_ingress_messages_per_block,
         max_block_payload_size,
         unit_delay_millis,
         initial_notary_delay_millis,
@@ -171,13 +266,14 @@ fn merge_subnet_record(
         max_instructions_per_install_code,
         features,
         ecdsa_config,
+        ecdsa_key_signing_enable: _,
         max_number_of_canisters,
         ssh_readonly_access,
         ssh_backup_access,
     } = payload;
 
-    maybe_set!(subnet_record, ingress_bytes_per_block_soft_cap);
     maybe_set!(subnet_record, max_ingress_bytes_per_message);
+    maybe_set!(subnet_record, max_ingress_messages_per_block);
     maybe_set!(subnet_record, max_block_payload_size);
     maybe_set!(subnet_record, unit_delay_millis);
     maybe_set!(subnet_record, initial_notary_delay_millis);
@@ -202,7 +298,7 @@ fn merge_subnet_record(
     let advert_config = advert_best_effort_percentage.map(|val| GossipAdvertConfig {
         best_effort_percentage: val,
     });
-    gossip_config.advert_config = advert_config;
+    maybe_set!(gossip_config, advert_config);
     subnet_record.gossip_config = Some(gossip_config);
 
     maybe_set!(subnet_record, start_as_nns);
@@ -218,6 +314,17 @@ fn merge_subnet_record(
     maybe_set!(subnet_record, max_instructions_per_round);
     maybe_set!(subnet_record, max_instructions_per_install_code);
 
+    // TODO(NNS1-1129): Removal of a threshold ECDSA key from a subnet is not supported
+    if let Some(new_ecdsa_config) = ecdsa_config.as_ref() {
+        if let Some(existing_ecdsa_record) = subnet_record.ecdsa_config.as_ref() {
+            assert!(existing_ecdsa_record
+                .key_ids
+                .iter()
+                .all(|x| new_ecdsa_config
+                    .key_ids
+                    .contains(&EcdsaKeyId::try_from(x.clone()).unwrap())));
+        }
+    }
     maybe_set_option!(subnet_record, features);
     maybe_set_option!(subnet_record, ecdsa_config);
 
@@ -225,13 +332,20 @@ fn merge_subnet_record(
 
     maybe_set!(subnet_record, ssh_readonly_access);
     maybe_set!(subnet_record, ssh_backup_access);
+
     subnet_record
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ic_protobuf::registry::subnet::v1::{GossipAdvertConfig, GossipConfig};
+    use crate::common::test_helpers::{
+        add_fake_subnet, get_invariant_compliant_subnet_record, invariant_compliant_registry,
+        prepare_registry_with_nodes,
+    };
+    use ic_ic00_types::{EcdsaCurve, EcdsaKeyId};
+    use ic_nervous_system_common_test_keys::{TEST_USER1_PRINCIPAL, TEST_USER2_PRINCIPAL};
+    use ic_protobuf::registry::subnet::v1::{GossipAdvertConfig, GossipConfig, SubnetRecord};
     use ic_registry_subnet_type::SubnetType;
     use ic_types::p2p::{
         MAX_ARTIFACT_STREAMS_PER_PEER, MAX_CHUNK_WAIT_MS, MAX_DUPLICITY, PFN_EVALUATION_PERIOD_MS,
@@ -240,14 +354,103 @@ mod tests {
     use ic_types::{PrincipalId, SubnetId};
     use std::str::FromStr;
 
+    fn make_ecdsa_key(name: &str) -> EcdsaKeyId {
+        EcdsaKeyId {
+            curve: EcdsaCurve::Secp256k1,
+            name: name.to_string(),
+        }
+    }
+
+    fn make_default_update_subnet_payload_for_merge_subnet_tests() -> UpdateSubnetPayload {
+        UpdateSubnetPayload {
+            subnet_id: SubnetId::from(
+                PrincipalId::from_str(
+                    "bn3el-jdvcs-a3syn-gyqwo-umlu3-avgud-vq6yl-hunln-3jejb-226vq-mae",
+                )
+                .unwrap(),
+            ),
+            max_ingress_bytes_per_message: Some(256),
+            max_ingress_messages_per_block: Some(256),
+            max_block_payload_size: Some(200),
+            unit_delay_millis: Some(300),
+            initial_notary_delay_millis: Some(200),
+            dkg_interval_length: Some(8),
+            dkg_dealings_per_block: Some(1),
+            max_artifact_streams_per_peer: Some(0),
+            max_chunk_wait_ms: Some(200),
+            max_duplicity: Some(5),
+            max_chunk_size: Some(1024),
+            receive_check_cache_size: Some(500),
+            pfn_evaluation_period_ms: Some(5000),
+            registry_poll_period_ms: Some(4000),
+            retransmission_request_ms: Some(7000),
+            advert_best_effort_percentage: Some(50),
+            set_gossip_config_to_default: false,
+            start_as_nns: Some(true),
+            subnet_type: None,
+            is_halted: Some(true),
+            max_instructions_per_message: Some(6_000_000_000),
+            max_instructions_per_round: Some(8_000_000_000),
+            max_instructions_per_install_code: Some(300_000_000_000),
+            features: Some(SubnetFeatures {
+                ecdsa_signatures: false,
+                canister_sandboxing: false,
+                http_requests: false,
+                bitcoin_testnet_feature: None,
+            }),
+            ecdsa_config: Some(EcdsaConfig {
+                quadruples_to_create_in_advance: 10,
+                key_ids: vec![make_ecdsa_key("key_id_1")],
+            }),
+            ecdsa_key_signing_enable: Some(vec![make_ecdsa_key("key_id_2")]),
+            max_number_of_canisters: Some(10),
+            ssh_readonly_access: Some(vec!["pub_key_0".to_string()]),
+            ssh_backup_access: Some(vec!["pub_key_1".to_string()]),
+        }
+    }
+
+    fn make_empty_update_payload(subnet_id: SubnetId) -> UpdateSubnetPayload {
+        UpdateSubnetPayload {
+            subnet_id,
+            max_ingress_bytes_per_message: None,
+            max_ingress_messages_per_block: None,
+            max_block_payload_size: None,
+            unit_delay_millis: None,
+            initial_notary_delay_millis: None,
+            dkg_interval_length: None,
+            dkg_dealings_per_block: None,
+            max_artifact_streams_per_peer: None,
+            max_chunk_wait_ms: None,
+            max_duplicity: None,
+            max_chunk_size: None,
+            receive_check_cache_size: None,
+            pfn_evaluation_period_ms: None,
+            registry_poll_period_ms: None,
+            retransmission_request_ms: None,
+            advert_best_effort_percentage: None,
+            set_gossip_config_to_default: false,
+            start_as_nns: None,
+            subnet_type: None,
+            is_halted: None,
+            max_instructions_per_message: None,
+            max_instructions_per_round: None,
+            max_instructions_per_install_code: None,
+            features: None,
+            ecdsa_config: None,
+            ecdsa_key_signing_enable: None,
+            max_number_of_canisters: None,
+            ssh_readonly_access: None,
+            ssh_backup_access: None,
+        }
+    }
+
     #[test]
     fn can_override_all_fields() {
         let subnet_record = SubnetRecord {
             membership: vec![],
-            ingress_bytes_per_block_soft_cap: 2 * 1024 * 1024,
             max_ingress_bytes_per_message: 60 * 1024 * 1024,
-            max_block_payload_size: 4 * 1024 * 1024,
             max_ingress_messages_per_block: 1000,
+            max_block_payload_size: 4 * 1024 * 1024,
             unit_delay_millis: 500,
             initial_notary_delay_millis: 1500,
             replica_version_id: "version_42".to_string(),
@@ -284,8 +487,8 @@ mod tests {
                 )
                 .unwrap(),
             ),
-            ingress_bytes_per_block_soft_cap: Some(100),
             max_ingress_bytes_per_message: Some(256),
+            max_ingress_messages_per_block: Some(256),
             max_block_payload_size: Some(200),
             unit_delay_millis: Some(300),
             initial_notary_delay_millis: Some(200),
@@ -310,10 +513,14 @@ mod tests {
             features: Some(SubnetFeatures {
                 ecdsa_signatures: false,
                 canister_sandboxing: false,
+                http_requests: false,
+                bitcoin_testnet_feature: None,
             }),
             ecdsa_config: Some(EcdsaConfig {
                 quadruples_to_create_in_advance: 10,
+                key_ids: vec![make_ecdsa_key("key_id_1")],
             }),
+            ecdsa_key_signing_enable: Some(vec![make_ecdsa_key("key_id_2")]),
             max_number_of_canisters: Some(10),
             ssh_readonly_access: Some(vec!["pub_key_0".to_string()]),
             ssh_backup_access: Some(vec!["pub_key_1".to_string()]),
@@ -323,9 +530,8 @@ mod tests {
             merge_subnet_record(subnet_record, payload),
             SubnetRecord {
                 membership: vec![],
-                ingress_bytes_per_block_soft_cap: 100,
                 max_ingress_bytes_per_message: 256,
-                max_ingress_messages_per_block: 1000,
+                max_ingress_messages_per_block: 256,
                 max_block_payload_size: 200,
                 unit_delay_millis: 300,
                 initial_notary_delay_millis: 200,
@@ -355,12 +561,18 @@ mod tests {
                     SubnetFeatures {
                         ecdsa_signatures: false,
                         canister_sandboxing: false,
+                        http_requests: false,
+                        bitcoin_testnet_feature: None,
                     }
                     .into()
                 ),
-                ecdsa_config: Some(EcdsaConfig {
-                    quadruples_to_create_in_advance: 10,
-                }),
+                ecdsa_config: Some(
+                    EcdsaConfig {
+                        quadruples_to_create_in_advance: 10,
+                        key_ids: vec![make_ecdsa_key("key_id_1")]
+                    }
+                    .into()
+                ),
                 max_number_of_canisters: 10,
                 ssh_readonly_access: vec!["pub_key_0".to_string()],
                 ssh_backup_access: vec!["pub_key_1".to_string()],
@@ -372,10 +584,9 @@ mod tests {
     fn can_override_some_fields() {
         let subnet_record = SubnetRecord {
             membership: vec![],
-            ingress_bytes_per_block_soft_cap: 2 * 1024 * 1024,
             max_ingress_bytes_per_message: 60 * 1024 * 1024,
-            max_block_payload_size: 4 * 1024 * 1024,
             max_ingress_messages_per_block: 1000,
+            max_block_payload_size: 4 * 1024 * 1024,
             unit_delay_millis: 500,
             initial_notary_delay_millis: 1500,
             replica_version_id: "version_42".to_string(),
@@ -414,8 +625,8 @@ mod tests {
                 )
                 .unwrap(),
             ),
-            ingress_bytes_per_block_soft_cap: None,
             max_ingress_bytes_per_message: None,
+            max_ingress_messages_per_block: None,
             max_block_payload_size: None,
             unit_delay_millis: Some(100),
             initial_notary_delay_millis: None,
@@ -439,6 +650,7 @@ mod tests {
             max_instructions_per_install_code: None,
             features: None,
             ecdsa_config: None,
+            ecdsa_key_signing_enable: None,
             max_number_of_canisters: Some(50),
             ssh_readonly_access: None,
             ssh_backup_access: None,
@@ -448,10 +660,9 @@ mod tests {
             merge_subnet_record(subnet_record, payload),
             SubnetRecord {
                 membership: vec![],
-                ingress_bytes_per_block_soft_cap: 2 * 1024 * 1024,
                 max_ingress_bytes_per_message: 60 * 1024 * 1024,
-                max_block_payload_size: 4 * 1024 * 1024,
                 max_ingress_messages_per_block: 1000,
+                max_block_payload_size: 4 * 1024 * 1024,
                 unit_delay_millis: 100,
                 initial_notary_delay_millis: 1500,
                 replica_version_id: "version_42".to_string(),
@@ -466,7 +677,9 @@ mod tests {
                     pfn_evaluation_period_ms: 100,
                     registry_poll_period_ms: 100,
                     retransmission_request_ms: 100,
-                    advert_config: None,
+                    advert_config: Some(GossipAdvertConfig {
+                        best_effort_percentage: 10,
+                    }),
                 }),
                 start_as_nns: false,
                 subnet_type: SubnetType::Application.into(),
@@ -485,16 +698,99 @@ mod tests {
 
     #[test]
     #[should_panic]
+    fn merging_ecdsa_key_ids_works_correctly() {
+        let ecdsa_config = Some(EcdsaConfig {
+            key_ids: vec![make_ecdsa_key("key_id_1")],
+            quadruples_to_create_in_advance: 0,
+        });
+
+        let subnet_record = SubnetRecord {
+            ecdsa_config: Some(
+                EcdsaConfig {
+                    key_ids: vec![make_ecdsa_key("key_id_1")],
+                    ..Default::default()
+                }
+                .into(),
+            ),
+            ..Default::default()
+        };
+
+        let mut payload_1 = make_default_update_subnet_payload_for_merge_subnet_tests();
+        payload_1.ecdsa_config = ecdsa_config.clone();
+
+        assert_eq!(
+            merge_subnet_record(subnet_record.clone(), payload_1),
+            subnet_record
+        );
+
+        let mut new_subnet_record = subnet_record.clone();
+        new_subnet_record.ecdsa_config = ecdsa_config.map(|c| c.into());
+
+        let mut payload_2 = make_default_update_subnet_payload_for_merge_subnet_tests();
+        payload_2.ecdsa_config = Some(EcdsaConfig {
+            key_ids: vec![make_ecdsa_key("key_id_1"), make_ecdsa_key("key_id_2")],
+            ..Default::default()
+        });
+        assert_eq!(
+            &merge_subnet_record(subnet_record, payload_2),
+            &new_subnet_record
+        );
+    }
+
+    #[test]
+    #[should_panic]
+    fn panic_on_removing_ecdsa_key_ids() {
+        let subnet_record = SubnetRecord {
+            ecdsa_config: Some(
+                EcdsaConfig {
+                    key_ids: vec![make_ecdsa_key("key_id_1")],
+                    ..Default::default()
+                }
+                .into(),
+            ),
+            ..Default::default()
+        };
+
+        let mut payload = make_default_update_subnet_payload_for_merge_subnet_tests();
+        payload.ecdsa_config = Some(EcdsaConfig {
+            key_ids: vec![make_ecdsa_key("key_id_2")],
+            ..Default::default()
+        });
+
+        merge_subnet_record(subnet_record, payload);
+    }
+
+    #[test]
+    #[should_panic]
+    fn panic_on_removing_ecdsa_config_none_value() {
+        let subnet_record = SubnetRecord {
+            ecdsa_config: Some(
+                EcdsaConfig {
+                    key_ids: vec![make_ecdsa_key("key_id_1")],
+                    ..Default::default()
+                }
+                .into(),
+            ),
+            ..Default::default()
+        };
+
+        let mut payload = make_default_update_subnet_payload_for_merge_subnet_tests();
+        payload.ecdsa_config = None;
+
+        merge_subnet_record(subnet_record, payload);
+    }
+
+    #[test]
+    #[should_panic]
     // This test confirms that if `set_gossip_config_to_default` = false and the
     // existing subnet record does not have a gossip config and some gossip related
     // fields are set to override, `merge_subnet_record` panics as expected.
     fn can_handle_invalid_combination_of_set_gossip_config_to_default() {
         let subnet_record = SubnetRecord {
             membership: vec![],
-            ingress_bytes_per_block_soft_cap: 2 * 1024 * 1024,
             max_ingress_bytes_per_message: 60 * 1024 * 1024,
-            max_block_payload_size: 4 * 1024 * 1024,
             max_ingress_messages_per_block: 1000,
+            max_block_payload_size: 4 * 1024 * 1024,
             unit_delay_millis: 500,
             initial_notary_delay_millis: 1500,
             replica_version_id: "version_42".to_string(),
@@ -521,8 +817,8 @@ mod tests {
                 )
                 .unwrap(),
             ),
-            ingress_bytes_per_block_soft_cap: None,
             max_ingress_bytes_per_message: None,
+            max_ingress_messages_per_block: None,
             max_block_payload_size: None,
             unit_delay_millis: Some(100),
             initial_notary_delay_millis: None,
@@ -546,6 +842,7 @@ mod tests {
             max_instructions_per_install_code: None,
             features: None,
             ecdsa_config: None,
+            ecdsa_key_signing_enable: None,
             max_number_of_canisters: None,
             ssh_readonly_access: None,
             ssh_backup_access: None,
@@ -558,10 +855,9 @@ mod tests {
     fn can_set_default_gossip_config_and_override_fields() {
         let subnet_record = SubnetRecord {
             membership: vec![],
-            ingress_bytes_per_block_soft_cap: 2 * 1024 * 1024,
             max_ingress_bytes_per_message: 60 * 1024 * 1024,
-            max_block_payload_size: 4 * 1024 * 1024,
             max_ingress_messages_per_block: 1000,
+            max_block_payload_size: 4 * 1024 * 1024,
             unit_delay_millis: 500,
             initial_notary_delay_millis: 1500,
             replica_version_id: "version_42".to_string(),
@@ -588,8 +884,8 @@ mod tests {
                 )
                 .unwrap(),
             ),
-            ingress_bytes_per_block_soft_cap: None,
             max_ingress_bytes_per_message: None,
+            max_ingress_messages_per_block: None,
             max_block_payload_size: None,
             unit_delay_millis: None,
             initial_notary_delay_millis: None,
@@ -613,6 +909,7 @@ mod tests {
             max_instructions_per_install_code: None,
             features: None,
             ecdsa_config: None,
+            ecdsa_key_signing_enable: None,
             max_number_of_canisters: None,
             ssh_readonly_access: None,
             ssh_backup_access: None,
@@ -622,10 +919,9 @@ mod tests {
             merge_subnet_record(subnet_record, payload),
             SubnetRecord {
                 membership: vec![],
-                ingress_bytes_per_block_soft_cap: 2 * 1024 * 1024,
                 max_ingress_bytes_per_message: 60 * 1024 * 1024,
-                max_block_payload_size: 4 * 1024 * 1024,
                 max_ingress_messages_per_block: 1000,
+                max_block_payload_size: 4 * 1024 * 1024,
                 unit_delay_millis: 500,
                 initial_notary_delay_millis: 1500,
                 replica_version_id: "version_42".to_string(),
@@ -663,10 +959,9 @@ mod tests {
     fn update_advert_config() {
         let subnet_record = SubnetRecord {
             membership: vec![],
-            ingress_bytes_per_block_soft_cap: 2 * 1024 * 1024,
             max_ingress_bytes_per_message: 60 * 1024 * 1024,
-            max_block_payload_size: 4 * 1024 * 1024,
             max_ingress_messages_per_block: 1000,
+            max_block_payload_size: 4 * 1024 * 1024,
             unit_delay_millis: 500,
             initial_notary_delay_millis: 1500,
             replica_version_id: "version_42".to_string(),
@@ -705,8 +1000,8 @@ mod tests {
                 )
                 .unwrap(),
             ),
-            ingress_bytes_per_block_soft_cap: None,
             max_ingress_bytes_per_message: None,
+            max_ingress_messages_per_block: None,
             max_block_payload_size: None,
             unit_delay_millis: Some(100),
             initial_notary_delay_millis: None,
@@ -730,6 +1025,7 @@ mod tests {
             max_instructions_per_install_code: None,
             features: None,
             ecdsa_config: None,
+            ecdsa_key_signing_enable: None,
             max_number_of_canisters: None,
             ssh_readonly_access: None,
             ssh_backup_access: None,
@@ -739,10 +1035,9 @@ mod tests {
             merge_subnet_record(subnet_record, payload),
             SubnetRecord {
                 membership: vec![],
-                ingress_bytes_per_block_soft_cap: 2 * 1024 * 1024,
                 max_ingress_bytes_per_message: 60 * 1024 * 1024,
-                max_block_payload_size: 4 * 1024 * 1024,
                 max_ingress_messages_per_block: 1000,
+                max_block_payload_size: 4 * 1024 * 1024,
                 unit_delay_millis: 100,
                 initial_notary_delay_millis: 1500,
                 replica_version_id: "version_42".to_string(),
@@ -774,5 +1069,69 @@ mod tests {
                 ecdsa_config: None,
             }
         );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "ECDSA key with id 'Secp256k1:existing_key_id' already exists.  ID must be globally unique."
+    )]
+    fn test_ecdsa_key_ids_must_be_globally_unique() {
+        // We create 2 subnets. One has the key already, and the other tries to have that key id added
+        // in an update call, which is not allowed
+        let existing_key_id = EcdsaKeyId {
+            curve: EcdsaCurve::Secp256k1,
+            name: "existing_key_id".to_string(),
+        };
+        let subnet_holding_key_id = SubnetId::from(*TEST_USER1_PRINCIPAL);
+        let subnet_to_update_id = SubnetId::from(*TEST_USER2_PRINCIPAL);
+
+        let mut registry = invariant_compliant_registry();
+
+        let (mutate_request, mut node_ids) = prepare_registry_with_nodes(2);
+        registry.maybe_apply_mutation_internal(mutate_request.mutations);
+
+        let mut subnet_list_record = registry.get_subnet_list_record();
+
+        // Create first subnet that holds the ECDSA key
+        let mut subnet_holding_key_record =
+            get_invariant_compliant_subnet_record(vec![node_ids.pop().unwrap()]);
+        // This marks the subnet as having the key
+        subnet_holding_key_record.ecdsa_config = Some(
+            EcdsaConfig {
+                quadruples_to_create_in_advance: 1,
+                key_ids: vec![existing_key_id],
+            }
+            .into(),
+        );
+
+        registry.maybe_apply_mutation_internal(add_fake_subnet(
+            subnet_holding_key_id,
+            &mut subnet_list_record,
+            subnet_holding_key_record,
+        ));
+
+        // Create second subnet that does not hold the key
+        let subnet_to_update = get_invariant_compliant_subnet_record(vec![node_ids.pop().unwrap()]);
+
+        registry.maybe_apply_mutation_internal(add_fake_subnet(
+            subnet_to_update_id,
+            &mut subnet_list_record,
+            subnet_to_update,
+        ));
+
+        // Now that both subnets are added to the Registry, one with the existing_key_id,
+        // we try an update call with the same existing_key_id to the other subnet
+        // which should fail
+
+        let mut payload = make_empty_update_payload(subnet_to_update_id);
+        payload.ecdsa_config = Some(EcdsaConfig {
+            quadruples_to_create_in_advance: 1,
+            key_ids: vec![EcdsaKeyId {
+                curve: EcdsaCurve::Secp256k1,
+                name: "existing_key_id".to_string(),
+            }],
+        });
+
+        registry.do_update_subnet(payload);
     }
 }

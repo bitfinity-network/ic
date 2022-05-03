@@ -1,9 +1,11 @@
-use crate::{
-    chart::Chart, collector::RequestInfo, content_length::ContentLength, ChartSize, RequestType,
-};
+use crate::{chart::Chart, collector::RequestInfo, content_length::ContentLength, ChartSize};
+use std::time::Instant;
 use std::{cmp, collections::HashMap, fmt, time::Duration};
 
 use serde::Serialize;
+
+// Interval in seconds of rate end times that are grouped in the same bucket.
+const RATE_BUCKET_SIZE: usize = 5;
 
 trait ToMilliseconds {
     fn to_ms(&self) -> f64;
@@ -37,31 +39,31 @@ impl From<MS> for Duration {
 #[derive(Debug)]
 pub struct Fact {
     status: u16,
-    duration: Duration,
+    time_request_start: Instant,
+    time_request_end: Instant,
     content_length: ContentLength,
     success: bool,
-    request_type: RequestType,
 }
 
 impl Fact {
     pub fn record(
         content_length: ContentLength,
         status: u16,
-        duration: Duration,
+        time_request_start: Instant,
+        time_request_end: Instant,
         // For context: some status codes were considered success others not. If
         // we had a single failure the binary will return a non-zero code.
         // Returning a non-zero code is used to determine if the binary crashed
         // or got kill. If there is a problem with the returned requests we
         // should catch it by the metrics or the returned summary.
         success: bool,
-        request_type: RequestType,
     ) -> Fact {
         Fact {
             status,
-            duration,
+            time_request_start,
+            time_request_end,
             content_length,
             success,
-            request_type,
         }
     }
 }
@@ -77,7 +79,11 @@ struct DurationStats {
 
 impl DurationStats {
     fn from_facts(facts: &[Fact]) -> DurationStats {
-        let mut sorted: Vec<Duration> = facts.iter().map(|f| f.duration).collect();
+        let mut sorted: Vec<Duration> = facts
+            .iter()
+            .filter(|f| f.success)
+            .map(|f| f.time_request_end - f.time_request_start)
+            .collect();
         sorted.sort();
         Self { sorted }
     }
@@ -90,31 +96,42 @@ impl DurationStats {
         self.sorted.first().cloned()
     }
 
-    fn median(&self) -> Duration {
-        let mid = self.sorted.len() / 2;
-        if self.sorted.len() % 2 == 0 {
-            // even
-            (self.sorted[mid - 1] + self.sorted[mid]) / 2
+    fn median(&self) -> Option<Duration> {
+        if self.sorted.is_empty() {
+            None
         } else {
-            // odd
-            self.sorted[mid]
+            let mid = self.sorted.len() / 2;
+            if self.sorted.len() % 2 == 0 {
+                // even
+                Some((self.sorted[mid - 1] + self.sorted[mid]) / 2)
+            } else {
+                // odd
+                Some(self.sorted[mid])
+            }
         }
     }
 
-    fn average(&self) -> Duration {
-        self.total() / (self.sorted.len() as u32)
+    fn average(&self) -> Option<Duration> {
+        if self.sorted.is_empty() {
+            None
+        } else {
+            Some(self.total() / (self.sorted.len() as u32))
+        }
     }
 
-    fn stddev(&self) -> Duration {
-        let mean = self.average();
-        let MS(mean) = mean.into();
-        let summed_squares = self.sorted.iter().fold(0f64, |acc, duration| {
-            let MS(ms) = (*duration).into();
-            acc + (ms - mean).powi(2)
-        });
-        let ratio = summed_squares / (self.sorted.len() - 1) as f64;
-        let std_ms = ratio.sqrt();
-        MS(std_ms).into()
+    fn stddev(&self) -> Option<Duration> {
+        if let Some(mean) = self.average() {
+            let MS(mean) = mean.into();
+            let summed_squares = self.sorted.iter().fold(0f64, |acc, duration| {
+                let MS(ms) = (*duration).into();
+                acc + (ms - mean).powi(2)
+            });
+            let ratio = summed_squares / (self.sorted.len() - 1) as f64;
+            let std_ms = ratio.sqrt();
+            Some(MS(std_ms).into())
+        } else {
+            None
+        }
     }
 
     fn latency_histogram(&self) -> Vec<u32> {
@@ -132,6 +149,9 @@ impl DurationStats {
     }
 
     fn percentiles(&self) -> Vec<Duration> {
+        if self.sorted.is_empty() {
+            return vec![];
+        }
         (0..100)
             .map(|n| {
                 let mut index = ((f64::from(n) / 100.0) * (self.sorted.len() as f64)) as usize;
@@ -159,6 +179,7 @@ pub struct Summary {
     content_length: ContentLength,
     percentiles: Vec<Duration>,
     latency_histogram: Vec<u32>,
+    succ_rate_histogram: HashMap<usize, u32>,
     status_counts: HashMap<u16, u32>,
     #[serde(skip_serializing)]
     chart_size: ChartSize,
@@ -189,6 +210,7 @@ impl Summary {
             count,
             content_length,
             status_counts,
+            succ_rate_histogram: Summary::get_succ_rate_histogram(facts),
             ..Summary::from_durations(&DurationStats::from_facts(facts))
         }
     }
@@ -203,12 +225,54 @@ impl Summary {
         self
     }
 
+    fn get_succ_rate_histogram(facts: &[Fact]) -> HashMap<usize, u32> {
+        let end_times = facts.iter().map(|f| (f.time_request_end, f.is_succ()));
+
+        let start_times_min = facts.iter().map(|f| f.time_request_start).min();
+        let end_times_max = facts.iter().map(|f| f.time_request_end).max();
+
+        let mut buckets = HashMap::new();
+
+        if let Some(start_time_min) = start_times_min {
+            if let Some(end_time_max) = end_times_max {
+                let total_duration = (end_time_max - start_time_min).as_millis() as f64 / 1000.;
+                let num_buckets = (total_duration / RATE_BUCKET_SIZE as f64).ceil() as usize;
+
+                for i in 0..num_buckets {
+                    buckets.insert(i * RATE_BUCKET_SIZE, 0);
+                }
+
+                for (end_time, success) in end_times {
+                    if success {
+                        let end_time_secs_since_min =
+                            (end_time - start_time_min).as_millis() as f64 / 1000.;
+                        assert!(end_time_secs_since_min <= total_duration);
+
+                        let bucket_idx =
+                            (end_time_secs_since_min / RATE_BUCKET_SIZE as f64).floor() as usize;
+                        assert!(bucket_idx < num_buckets);
+
+                        let mut_entry = buckets
+                            .get_mut(&(bucket_idx * RATE_BUCKET_SIZE))
+                            .expect("Buckets should have been initialized to 0");
+
+                        *mut_entry += 1;
+                    }
+                }
+
+                return buckets;
+            }
+        }
+
+        buckets
+    }
+
     fn from_durations(stats: &DurationStats) -> Summary {
-        let average = stats.average();
-        let stddev = stats.stddev();
-        let median = stats.median();
-        let min = stats.min().expect("Returned early if empty");
-        let max = stats.max().expect("Returned early if empty");
+        let average = stats.average().unwrap_or(Duration::MAX);
+        let stddev = stats.stddev().unwrap_or(Duration::MAX);
+        let median = stats.median().unwrap_or(Duration::MAX);
+        let min = stats.min().unwrap_or(Duration::MAX);
+        let max = stats.max().unwrap_or(Duration::MAX);
         let latency_histogram = stats.latency_histogram();
         let percentiles = stats.percentiles();
 
@@ -235,6 +299,7 @@ impl Summary {
             content_length: ContentLength::zero(),
             percentiles: vec![Duration::new(0, 0); 100],
             latency_histogram: vec![0; 0],
+            succ_rate_histogram: HashMap::new(),
             status_counts: HashMap::new(),
             chart_size: ChartSize::Medium,
         }

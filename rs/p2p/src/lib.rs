@@ -94,19 +94,35 @@
 //! <img src="../../../../../docs/assets/p2p.png" height="960"
 //! width="540"/> </div> <hr/>
 
+use ic_config::transport::TransportConfig;
+use ic_interfaces::{
+    artifact_manager::ArtifactManager, consensus_pool::ConsensusPoolCache, registry::RegistryClient,
+};
+use ic_interfaces_p2p::IngressIngestionService;
+use ic_interfaces_transport::{FlowTag, Transport};
+use ic_logger::ReplicaLogger;
+use ic_metrics::MetricsRegistry;
+use ic_protobuf::registry::subnet::v1::GossipConfig;
+use ic_registry_client_helpers::subnet::SubnetRegistry;
+use ic_types::{malicious_flags::MaliciousFlags, NodeId, SubnetId};
 use serde::{Deserialize, Serialize};
 use std::{
     error,
     fmt::{Display, Formatter, Result as FmtResult},
+    sync::Arc,
+    time::Duration,
 };
+use tower::{util::BoxService, ServiceBuilder};
 
 mod artifact_download_list;
 mod download_management;
 mod download_prioritization;
-pub mod event_handler;
-pub mod gossip_protocol;
+mod event_handler;
+mod gossip_protocol;
 mod malicious_gossip;
 mod metrics;
+
+pub use event_handler::{AdvertSubscriber, P2PThreadJoiner};
 
 /// Custom P2P result type returning a P2P error in case of error.
 pub(crate) type P2PResult<T> = std::result::Result<T, P2PError>;
@@ -115,7 +131,7 @@ pub(crate) mod utils {
     //! The utils module provides a mapping from a gossip message to the
     //! corresponding flow tag.
     use crate::gossip_protocol::GossipMessage;
-    use ic_types::transport::FlowTag;
+    use ic_interfaces_transport::FlowTag;
 
     /// The FlowMapper struct holds a vector of flow tags.
     pub(crate) struct FlowMapper {
@@ -136,6 +152,89 @@ pub(crate) mod utils {
     }
 }
 
+/// Max number of ingress message we can buffer until the P2P layer is ready to
+/// accept them.
+// The latency SLO for 'call' requests is set for 2s. Given the rate limiter of
+// 100 per second this buffer should not be bigger than 200. We are conservite
+// setting it to 100.
+const MAX_BUFFERED_INGRESS_MESSAGES: usize = 100;
+/// Max number of inflight requests into P2P. Note each each requests requires a
+/// dedicated thread to execute on so this number should be relatively small.
+// Do not increase the number until we get to the root cause of NET-743.
+const MAX_INFLIGHT_INGRESS_MESSAGES: usize = 1;
+/// Max ingress messages per second that can go into P2P.
+// There is some internal contention inside P2P (NET-743). We achieve lower
+// throughput if we process messages one after the other.
+const MAX_INGRESS_MESSAGES_PER_SECOND: u64 = 100;
+
+/// Starts the P2P stack and returns the objects that interact with P2P.
+#[allow(clippy::too_many_arguments)]
+pub fn start_p2p(
+    metrics_registry: MetricsRegistry,
+    log: ReplicaLogger,
+    node_id: NodeId,
+    subnet_id: SubnetId,
+    transport_config: TransportConfig,
+    gossip_config: GossipConfig,
+    registry_client: Arc<dyn RegistryClient>,
+    transport: Arc<dyn Transport>,
+    consensus_pool_cache: Arc<dyn ConsensusPoolCache>,
+    artifact_manager: Arc<dyn ArtifactManager>,
+    ingress_throttler: event_handler::IngressThrottler,
+    malicious_flags: MaliciousFlags,
+    advert_subscriber: &AdvertSubscriber,
+) -> (IngressIngestionService, P2PThreadJoiner) {
+    let event_handler = Arc::new(event_handler::AsyncTransportEventHandlerImpl::new(
+        node_id,
+        log.clone(),
+        &metrics_registry,
+        event_handler::ChannelConfig::from(gossip_config),
+    ));
+    transport
+        .register_client(event_handler.clone())
+        .expect("transport registration failed");
+
+    let p2p_flow_tags = transport_config
+        .p2p_flows
+        .iter()
+        .map(|flow_config| FlowTag::from(flow_config.flow_tag))
+        .collect();
+    let gossip = Arc::new(gossip_protocol::GossipImpl::new(
+        node_id,
+        subnet_id,
+        consensus_pool_cache,
+        registry_client.clone(),
+        artifact_manager.clone(),
+        transport.clone(),
+        p2p_flow_tags,
+        log.clone(),
+        &metrics_registry,
+        malicious_flags,
+    ));
+    event_handler.start(gossip.clone());
+    advert_subscriber.start(gossip.clone());
+
+    let p2p_thread_joiner = P2PThreadJoiner::new(log.clone(), gossip);
+
+    let ingress_event_handler = BoxService::new(event_handler::IngressEventHandler::new(
+        log,
+        ingress_throttler,
+        artifact_manager.clone(),
+        node_id,
+    ));
+
+    let ingress_ingestion_service = BoxService::new(
+        ServiceBuilder::new()
+            .concurrency_limit(MAX_INFLIGHT_INGRESS_MESSAGES)
+            .rate_limit(MAX_INGRESS_MESSAGES_PER_SECOND, Duration::from_secs(1))
+            .service(ingress_event_handler),
+    );
+    let ingress_ingestion_service = ServiceBuilder::new()
+        .buffer(MAX_BUFFERED_INGRESS_MESSAGES)
+        .service(ingress_ingestion_service);
+    (ingress_ingestion_service, p2p_thread_joiner)
+}
+
 pub(crate) mod advert_utils {
     use crate::gossip_protocol::{GossipAdvertAction, GossipAdvertSendRequest, Percentage};
     use ic_logger::replica_logger::ReplicaLogger;
@@ -148,6 +247,7 @@ pub(crate) mod advert_utils {
 
     /// Maps the P2P client advert send requests to the internal format,
     /// based on the config
+    #[derive(Clone)]
     pub(crate) struct AdvertRequestBuilder {
         pub(crate) advert_config: Option<GossipAdvertConfig>,
         adverts_by_class: IntCounterVec,
@@ -226,13 +326,27 @@ pub(crate) mod advert_utils {
     }
 }
 
+/// Fetch the Gossip configuration from the registry.
+pub fn fetch_gossip_config(
+    registry_client: Arc<dyn RegistryClient>,
+    subnet_id: SubnetId,
+) -> GossipConfig {
+    if let Ok(Some(Some(gossip_config))) =
+        registry_client.get_gossip_config(subnet_id, registry_client.get_latest_version())
+    {
+        gossip_config
+    } else {
+        ic_types::p2p::build_default_gossip_config()
+    }
+}
+
 /// Generic P2P Error codes.
 ///
 /// Some error codes are serialized over the wire to convey
 /// protocol results. Some results are also used for internal
 /// operation, i.e., they are not represented in the on-wire protocol.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum P2PErrorCode {
+enum P2PErrorCode {
     /// The requested entity artifact/chunk/server/client was not found
     NotFound = 1,
     /// An artifact (chunk) was received that already exists.
@@ -249,7 +363,7 @@ pub enum P2PErrorCode {
 
 /// Wrapper over a P2P error code.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct P2PError {
+struct P2PError {
     /// The P2P error code.
     p2p_error_code: P2PErrorCode,
 }

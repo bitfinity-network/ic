@@ -4,7 +4,7 @@ use crate::cmd::{
 };
 use candid::Encode;
 use ic_canister_client::{Agent, Sender};
-use ic_crypto_sha::Sha256;
+use ic_nervous_system_common::ledger;
 use ic_nns_common::pb::v1::NeuronId;
 use ic_nns_constants::{GOVERNANCE_CANISTER_ID, LEDGER_CANISTER_ID, REGISTRY_CANISTER_ID};
 use ic_nns_governance::pb::v1::{
@@ -18,7 +18,7 @@ use ic_protobuf::registry::{
     replica_version::v1::ReplicaVersionRecord,
     subnet::v1::{CatchUpPackageContents, RegistryStoreUri, SubnetRecord, SubnetType},
 };
-use ic_registry_client::helper::subnet::get_node_ids_from_subnet_record;
+use ic_registry_client_helpers::subnet::get_node_ids_from_subnet_record;
 use ic_registry_keys::{
     make_blessed_replica_version_key, make_catch_up_package_contents_key, make_replica_version_key,
     make_subnet_record_key,
@@ -28,7 +28,7 @@ use ic_registry_transport::{
     serialize_atomic_mutate_request,
 };
 use ic_types::{messages::SignedIngress, CanisterId, PrincipalId, SubnetId, Time};
-use ledger_canister::{AccountIdentifier, Memo, SendArgs, Subaccount, Tokens};
+use ledger_canister::{AccountIdentifier, Memo, SendArgs, Tokens};
 use prost::Message;
 use std::convert::TryFrom;
 use std::str::FromStr;
@@ -90,15 +90,7 @@ pub fn cmd_add_neuron(time: Time, cmd: &WithNeuronCmd) -> Result<Vec<SignedIngre
 
     let controller = cmd.neuron_controller;
     let memo = 1234_u64;
-
-    let subaccount = Subaccount({
-        let mut sha = Sha256::new();
-        sha.write(&[0x0c]);
-        sha.write(b"neuron-stake");
-        sha.write(controller.as_slice());
-        sha.write(&memo.to_be_bytes());
-        sha.finish()
-    });
+    let subaccount = ledger::compute_neuron_staking_subaccount(controller, memo);
 
     let neuron_account = AccountIdentifier::new(GOVERNANCE_CANISTER_ID.get(), Some(subaccount));
 
@@ -219,7 +211,7 @@ pub fn cmd_add_ledger_account(
 /// the state hash.
 pub fn cmd_set_recovery_cup(
     agent: &Agent,
-    player: &crate::Player,
+    player: &crate::player::Player,
     cmd: &SetRecoveryCupCmd,
     context_time: Time,
 ) -> Result<SignedIngress, String> {
@@ -256,6 +248,7 @@ pub fn cmd_set_recovery_cup(
             hash: cmd.registry_store_sha256.clone().unwrap_or_default(),
             registry_version: player.get_latest_registry_version(context_time)?.get(),
         }),
+        ecdsa_initializations: vec![],
     };
 
     update_catch_up_package_contents(agent, player.subnet_id, cup_contents, context_time)
@@ -265,7 +258,7 @@ pub fn cmd_set_recovery_cup(
 /// potentially updates the subnet record with this replica version.
 pub fn cmd_add_and_bless_replica_version(
     agent: &Agent,
-    player: &crate::Player,
+    player: &crate::player::Player,
     cmd: &AddAndBlessReplicaVersionCmd,
     context_time: Time,
 ) -> Result<Vec<SignedIngress>, String> {
@@ -368,7 +361,7 @@ pub fn cmd_add_registry_content(
 /// Creates an ingress for removing of all nodes from a subnet.
 pub fn cmd_remove_subnet(
     agent: &Agent,
-    player: &crate::Player,
+    player: &crate::player::Player,
     context_time: Time,
 ) -> Result<Option<SignedIngress>, String> {
     let mut subnet_record = player.get_subnet_record(context_time)?;
@@ -441,7 +434,7 @@ pub fn update_catch_up_package_contents(
 /// Bless a new replica version by mutating the registry canister.
 pub fn bless_replica_version(
     agent: &Agent,
-    player: &crate::Player,
+    player: &crate::player::Player,
     replica_version_id: String,
     context_time: Time,
 ) -> Result<SignedIngress, String> {

@@ -3,20 +3,15 @@ use core::future::Future;
 use dfn_candid::{candid, candid_multi_arity};
 use ic_canister_client::{Agent, Sender};
 use ic_config::{subnet_config::SubnetConfig, Config};
+use ic_ic00_types::CanisterStatusType::Stopped;
+pub use ic_ic00_types::{
+    self as ic00, CanisterIdRecord, CanisterInstallMode, CanisterStatusResult, InstallCodeArgs,
+    ProvisionalCreateCanisterWithCyclesArgs, SetControllerArgs, IC_00,
+};
 use ic_registry_transport::pb::v1::RegistryMutation;
 use ic_replica_tests::*;
 pub use ic_test_utilities::assert_utils::assert_balance_equals;
-use ic_types::CanisterStatusType::Stopped;
-pub use ic_types::{
-    ic00,
-    ic00::{
-        CanisterIdRecord, CanisterStatusResult, InstallCodeArgs,
-        ProvisionalCreateCanisterWithCyclesArgs, SetControllerArgs, IC_00,
-    },
-    ingress::WasmResult,
-    messages::CanisterInstallMode,
-    CanisterId, Cycles, PrincipalId,
-};
+pub use ic_types::{ingress::WasmResult, CanisterId, Cycles, PrincipalId};
 use on_wire::{FromWire, IntoWire, NewType};
 
 use std::convert::TryFrom;
@@ -33,6 +28,7 @@ const MAX_BACKOFF_INTERVAL: Duration = Duration::from_secs(10);
 // The multiplier is chosen such that the sum of all intervals is about 100
 // seconds: `sum ~= (1.1^25 - 1) / (1.1 - 1) ~= 98`.
 const BACKOFF_INTERVAL_MULTIPLIER: f64 = 1.1;
+const MAX_ELAPSED_TIME: Duration = Duration::from_secs(60 * 5); // 5 minutes
 
 pub fn get_backoff_policy() -> backoff::ExponentialBackoff {
     backoff::ExponentialBackoff {
@@ -42,7 +38,7 @@ pub fn get_backoff_policy() -> backoff::ExponentialBackoff {
         multiplier: BACKOFF_INTERVAL_MULTIPLIER,
         start_time: std::time::Instant::now(),
         max_interval: MAX_BACKOFF_INTERVAL,
-        max_elapsed_time: None,
+        max_elapsed_time: Some(MAX_ELAPSED_TIME),
         clock: backoff::SystemClock::default(),
     }
 }
@@ -53,39 +49,44 @@ pub struct Wasm(Vec<u8>);
 impl Wasm {
     /// Constructs the name of the env variable that will be checked to see if a
     /// pre-compiled binary exists on the filesystem.
-    pub fn env_var_name(bin_name: &str) -> String {
-        format!("{}_WASM_PATH", bin_name)
-            .replace("-", "_")
+    pub fn env_var_name(bin_name: &str, features: &[&str]) -> String {
+        let features_part = if features.is_empty() {
+            "".into()
+        } else {
+            format!("_{}", features.join("_"))
+        };
+        format!("{}{}_WASM_PATH", bin_name, features_part)
+            .replace('-', "_")
             .to_uppercase()
     }
 
     /// If an environment variable with a specific name derived from the binary
     /// name exists, then assumes it is the location of a wasm file and
     /// reads it.
-    pub fn from_location_specified_by_env_var(bin_name: &str) -> Option<Wasm> {
-        let var_name = Wasm::env_var_name(bin_name);
+    pub fn from_location_specified_by_env_var(bin_name: &str, features: &[&str]) -> Option<Wasm> {
+        let var_name = Wasm::env_var_name(bin_name, features);
         match env::var(&var_name) {
             Ok(path) => {
                 eprintln!("Using pre-built binary for {}", bin_name);
                 Some(Wasm::from_file(path))
             }
             Err(env::VarError::NotPresent) => {
-                if env::var("IN_NIX_SHELL").is_err() && env::var("NIX_BUILD_TOP").is_ok() {
-                    match bin_name {
-                        "lifeline" => {
-                            // Nothing needed here. As opposed to other canisters which are
-                            // compiled in nix and then passed through env vars to the testing
-                            // system, the lifeline is compiled in a build.rs and available to
-                            // tests through an include_bytes! macro.
-                        },
-                        _ => eprintln!(
-                            "*** WARNING\n\
-                             *** this is a nix build, but I can't find an environment variable for the `{0}` canister in the `{1}` crate.\n\
-                             *** this will probably fail! please update the `canistersForTests` block in rs/check.nix. you can probably add something like:\n\n    {1} = [ \"{0}\" ];\n",
-                            bin_name,
-                            env::var("CARGO_PKG_NAME").unwrap_or_else(|_| "(CARGO_PKG_NAME not set)".to_string())
-                        ),
+                if env::var("CI").is_ok() {
+                    println!("Environment variables with name containing \"CANISTER\":");
+                    for (k, v) in env::vars() {
+                        if k.contains("CANISTER") {
+                            println!("  {}: {}", k, v);
+                        }
                     }
+
+                    panic!(
+                        "Running on CI and expected canister env var {0}\n\
+                         Please add {1} to the following locations:\n\
+                        \tgitlab-ci/tools/cargo-build-canisters\n\
+                        \tgitlab-ci/src/canisters/wasm-build-functions.sh\n\
+                        \trs/nns/constants/src/lib.rs\n",
+                        var_name, bin_name
+                    )
                 }
                 None
             }
@@ -120,7 +121,7 @@ impl Wasm {
     }
 
     pub fn from_bytes<B: Into<Vec<u8>>>(bytes: B) -> Self {
-        Self { 0: bytes.into() }
+        Self(bytes.into())
     }
 
     /// Strip the debug info out of the wasm binaries.
@@ -143,7 +144,7 @@ impl Wasm {
             memory_allocation: None,
             query_allocation: None,
             // By default, give the max amount of cycles to the created canister.
-            num_cycles: Some(std::u64::MAX),
+            num_cycles: Some(u128::MAX),
         }
     }
 
@@ -167,11 +168,11 @@ impl Wasm {
     /// Installs this wasm onto a pre-existing canister.
     pub async fn install_onto_canister(
         self,
-        mut canister: &mut Canister<'_>,
+        canister: &mut Canister<'_>,
         canister_init_payload: Option<Vec<u8>>,
     ) -> Result<(), String> {
         self.install(canister.runtime)
-            .install(&mut canister, canister_init_payload.unwrap_or_default())
+            .install(canister, canister_init_payload.unwrap_or_default())
             .await
     }
 
@@ -180,7 +181,7 @@ impl Wasm {
     /// for which transient errors may happen.
     pub async fn install_with_retries_onto_canister(
         self,
-        mut canister: &mut Canister<'_>,
+        canister: &mut Canister<'_>,
         canister_init_payload: Option<Vec<u8>>,
         memory_allocation: Option<u64>,
     ) -> Result<(), String> {
@@ -197,19 +198,36 @@ impl Wasm {
                 install = install.with_memory_allocation(memory_allocation);
             }
 
-            match install.install(&mut canister, init_payload.clone()).await {
-                Ok(()) => return Ok(()),
-                Err(e) => match backoff.next_backoff() {
-                    Some(interval) => {
-                        std::thread::sleep(interval);
+            let canister_id = canister.canister_id;
+            println!(
+                "Attempting to install wasm into canister with ID: {}",
+                canister_id
+            );
+            match install.install(canister, init_payload.clone()).await {
+                Ok(()) => {
+                    println!(
+                        "Successfully installed wasm into canister with ID: {}",
+                        canister_id
+                    );
+                    return Ok(());
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Installation of wasm into cansiter with ID: {} failed with: {}",
+                        canister_id, e
+                    );
+                    match backoff.next_backoff() {
+                        Some(interval) => {
+                            tokio::time::sleep(interval).await;
+                        }
+                        None => {
+                            return Err(format!(
+                                "Canister installation timed out. Last error was: {}",
+                                e
+                            ));
+                        }
                     }
-                    None => {
-                        return Err(format!(
-                            "Canister installation timed out. Last error was: {}",
-                            e
-                        ));
-                    }
-                },
+                }
             }
         }
     }
@@ -231,7 +249,7 @@ where
             Err(e) => match backoff.next_backoff() {
                 Some(interval) => {
                     eprintln!("Retrying due to: {}", &e);
-                    std::thread::sleep(interval);
+                    tokio::time::sleep(interval).await;
                 }
                 None => {
                     eprintln!("Failed due to: {}", &e);
@@ -275,7 +293,7 @@ impl<'a> Runtime {
     /// authorized.
     pub async fn create_canister(
         &'a self,
-        num_cycles: Option<u64>,
+        num_cycles: Option<u128>,
     ) -> Result<Canister<'a>, String> {
         let canister_id_record: Result<CanisterIdRecord, String> = self
             .get_management_canister()
@@ -714,7 +732,7 @@ pub struct Install<'a> {
     pub compute_allocation: Option<u64>,
     pub memory_allocation: Option<u64>,
     pub query_allocation: Option<u64>,
-    pub num_cycles: Option<u64>,
+    pub num_cycles: Option<u128>,
 }
 
 impl<'a> Query<'a> {
@@ -861,7 +879,8 @@ impl<'a> Install<'a> {
         eprintln!("Install args: {}", &install_args);
         match self.runtime {
             Runtime::Local(local_runtime) => local_runtime
-                .install_canister_helper(install_args)
+                .install_canister_helper_async(install_args)
+                .await
                 .map_err(|e| e.to_string())
                 .map(|_| {}),
             Runtime::Remote(c) => c.agent.install_canister(install_args).await,
@@ -885,7 +904,7 @@ impl<'a> Install<'a> {
         self
     }
 
-    pub fn with_cycles(mut self, num_cycles: Option<u64>) -> Install<'a> {
+    pub fn with_cycles(mut self, num_cycles: Option<u128>) -> Install<'a> {
         self.num_cycles = num_cycles;
         self
     }

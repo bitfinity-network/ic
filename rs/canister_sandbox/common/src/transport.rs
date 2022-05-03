@@ -217,6 +217,9 @@ impl<Message: 'static + Serialize + Send + EnumerateInnerFileDescriptors>
                     if guard.buf.is_empty() {
                         guard.sending = false;
                         guard = self.trigger_send.wait(guard).unwrap();
+                        if guard.quit {
+                            return;
+                        }
                     } else {
                         break (guard.buf.split(), std::mem::take(&mut guard.fds));
                     }
@@ -282,7 +285,7 @@ impl<
         let fds: Vec<RawFd> = fd_locs.iter().map(|fd| **fd).collect();
 
         // Serialize the message.
-        let serialized_msg = serde_cbor::to_vec(&msg).expect("Failed to serialize message");
+        let serialized_msg = bincode::serialize(&msg).expect("Failed to serialize message");
 
         // Send message data + file descriptors down.
         // There must be a field in the struct for every file descriptor
@@ -311,6 +314,10 @@ impl<Message: 'static + Serialize + Send + EnumerateInnerFileDescriptors>
         &self,
     ) -> Arc<dyn MessageSink<M> + Sync + Send> {
         self.repr.clone()
+    }
+
+    pub fn stop(&self) {
+        self.repr.stop();
     }
 }
 
@@ -343,16 +350,17 @@ pub fn socket_read_messages<
     handler: Handler,
     socket: Arc<UnixStream>,
 ) {
+    const MIN_READ_SIZE: usize = 16384;
+    const INITIAL_SIZE: usize = 65536;
     let fd = socket.as_raw_fd();
     let mut decoder = FrameDecoder::<Message>::new();
-    let mut buf = BytesMut::new();
+    let mut buf = BytesMut::with_capacity(INITIAL_SIZE);
     let mut fds = Vec::<RawFd>::new();
     loop {
         while let Some(mut frame) = decoder.decode(&mut buf) {
             install_file_descriptors(&mut frame, &mut fds);
             handler(frame);
         }
-        const MIN_READ_SIZE: usize = 16384;
         buf.reserve(MIN_READ_SIZE);
         let p = buf.as_mut_ptr();
         #[cfg(not(target_os = "linux"))]
@@ -367,7 +375,7 @@ pub fn socket_read_messages<
         let num_bytes_received = unsafe {
             let mut iov = libc::iovec {
                 iov_base: p.add(buf.len()) as *mut std::ffi::c_void,
-                iov_len: MIN_READ_SIZE,
+                iov_len: buf.capacity() - buf.len(),
             };
             let mut cmsgbuf: [u8; 4096] = [0; 4096];
             let mut hdr = libc::msghdr {

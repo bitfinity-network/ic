@@ -4,9 +4,10 @@ use assert_matches::assert_matches;
 use async_trait::async_trait;
 use futures::future::FutureExt;
 use ic_base_types::PrincipalId;
+use ic_nervous_system_common::{ledger::Ledger, NervousSystemError};
 use ic_nns_common::pb::v1::NeuronId;
 use ic_nns_governance::{
-    governance::{Environment, Governance, Ledger},
+    governance::{Environment, Governance},
     pb::v1::{
         governance_error::ErrorType,
         manage_neuron::{
@@ -58,15 +59,15 @@ impl Ledger for DegradedEnv {
         _: Option<Subaccount>,
         _: AccountIdentifier,
         _: u64,
-    ) -> Result<u64, GovernanceError> {
+    ) -> Result<u64, NervousSystemError> {
         unimplemented!()
     }
 
-    async fn total_supply(&self) -> Result<Tokens, GovernanceError> {
+    async fn total_supply(&self) -> Result<Tokens, NervousSystemError> {
         unimplemented!()
     }
 
-    async fn account_balance(&self, _: AccountIdentifier) -> Result<Tokens, GovernanceError> {
+    async fn account_balance(&self, _: AccountIdentifier) -> Result<Tokens, NervousSystemError> {
         unimplemented!()
     }
 }
@@ -93,9 +94,9 @@ fn fixture_two_neurons_second_is_bigger() -> GovernanceProto {
                 ..Default::default()
             },
             2 => Neuron {
-                id: Some(NeuronId {id: 1}),
+                id: Some(NeuronId {id: 2}),
                 controller: Some(principal(2)),
-                cached_neuron_stake_e8s: 51,
+                cached_neuron_stake_e8s: 5100,
                 account:  b"b__4___8__12__16__20__24__28__32".to_vec(),
                 // One year
                 dissolve_state: Some(neuron::DissolveState::DissolveDelaySeconds(31557600)),
@@ -133,6 +134,7 @@ fn test_cannot_submit_motion_in_degraded_mode() {
         // Must match neuron 1's serialized_id.
         &principal(1),
         &Proposal {
+            title: Some("A Reasonable Title".to_string()),
             summary: "proposal 1".to_string(),
             action: Some(proposal::Action::Motion(Motion {
                 motion_text: "Rabbits are cute".to_string(),
@@ -155,6 +157,7 @@ fn test_can_submit_nns_canister_upgrade_in_degraded_mode() {
             // Must match neuron 1's serialized_id.
             &principal(1),
             &Proposal {
+                title: Some("A Reasonable Title".to_string()),
                 summary: "proposal 1".to_string(),
                 action: Some(proposal::Action::ExecuteNnsFunction(ExecuteNnsFunction {
                     nns_function: NnsFunction::NnsCanisterUpgrade as i32,

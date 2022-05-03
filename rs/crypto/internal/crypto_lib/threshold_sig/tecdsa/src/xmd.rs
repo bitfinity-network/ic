@@ -1,12 +1,24 @@
+use crate::{ThresholdEcdsaError, ThresholdEcdsaResult};
 use ic_crypto_sha::Sha256;
 
-// Section 5.4.1 of https://www.ietf.org/archive/id/draft-irtf-cfrg-hash-to-curve-12.html
+// Section 5.4.1 of https://www.ietf.org/archive/id/draft-irtf-cfrg-hash-to-curve-14.html
 // Produces a uniformly random byte string of a given length using SHA-256
 // from a message and domain separator.
 // The desired length `len` must not exceed 255*32 = 8160 bytes.
-pub fn expand_message_xmd(msg: &[u8], domain_separator: &[u8], len: usize) -> Vec<u8> {
+pub fn expand_message_xmd(
+    msg: &[u8],
+    domain_separator: &[u8],
+    len: usize,
+) -> ThresholdEcdsaResult<Vec<u8>> {
+    if len > 255 * 32 {
+        return Err(ThresholdEcdsaError::InvalidArguments(
+            "Requested XMD output too large".to_string(),
+        ));
+    }
+
+    // len ≤ 8160 ⭢ ell ≤ 255
+    // thus values ≤ ell can be safely cast to u8
     let ell = (len - 1) / 32 + 1;
-    assert!(ell <= 255, "L must not exceed 255");
 
     let xmd = |dst| {
         let mut out = Vec::with_capacity(ell * 32);
@@ -53,5 +65,5 @@ pub fn expand_message_xmd(msg: &[u8], domain_separator: &[u8], len: usize) -> Ve
     };
 
     out.truncate(len);
-    out
+    Ok(out)
 }

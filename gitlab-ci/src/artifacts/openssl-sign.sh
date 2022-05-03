@@ -15,14 +15,15 @@ cd "$folder"
 
 # Ensure there is no leftover SHA256SUMS file, having it in the file list will
 # break the signing process
-rm -f SHA256SUMS
+rm -f SHA256SUMS sign-input.txt sign.sig sign.sig.bin
 (
     GLOBIGNORE="SHA256SUMS"
     sha256sum -b * | tee SHA256SUMS
 )
 
 cp SHA256SUMS sign-input.txt
-git rev-parse --verify HEAD >>sign-input.txt
+VERSION="${VERSION:-$(git rev-parse --verify HEAD)}"
+echo "$VERSION" >>sign-input.txt
 
 openssl dgst -sha256 -hex -sign /openssl/private.pem -out "sign.sig" sign-input.txt
 

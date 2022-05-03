@@ -1,3 +1,4 @@
+<!DOCTYPE html>
 <html>
   <head>
     <meta http-equiv="Content-Type" content="text/html;charset=UTF-8">
@@ -5,36 +6,62 @@
     <script src="https://cdn.plot.ly/plotly-2.4.2.min.js"></script>
     <link rel="stylesheet" href="https://www.w3schools.com/w3css/4/w3.css">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/4.7.0/css/font-awesome.min.css">
+    <style>
+      plot {
+          width: 100%;
+      }
+
+      .exp_value {
+          min-width: 1em;
+          min-height: 1em;
+      }
+
+      .date {
+          margin: 2em;
+          padding: 0.2em;
+          background-color: #969696;
+      }
+    </style>
+    <script>
+      function display_times() {
+          let timestamps = document.getElementsByClassName("timestamp");
+          for (var i=0; i < timestamps.length; i++) {
+              let ts = timestamps[i].innerHTML;
+              let date = new Date(parseInt(ts * 1000));
+              timestamps[i].innerHTML += "<span class=\"date\">" + date + "</span>"
+          }
+      }
+    </script>
   </head>
-<body>
+<body onload="display_times()">
   <div class="w3-container">
     Experiment timestamp: {{timestamp}}<br>
-    Git hash: <a href="https://gitlab.com/dfinity-lab/core/ic/-/commit/{{githash}}">
+    Git hash: <a href="https://gitlab.com/dfinity-lab/public/ic/-/commit/{{githash}}">
       <i class="fa fa-brands fa-gitlab"></i> {{githash}}</a><br>
     Artifacts git hash:
-    <a href="https://gitlab.com/dfinity-lab/core/ic/-/commit/{{experiment.artifacts_githash}}">
+    <a href="https://gitlab.com/dfinity-lab/public/ic/-/commit/{{experiment.artifacts_githash}}">
       <i class="fa fa-brands fa-gitlab"></i> {{experiment.artifacts_githash}}</a><br>
-    Testnet: <a href="https://gitlab.com/dfinity-lab/core/ic/-/blob/master/testnet/env/{{experiment.testnet}}/hosts.ini">
+    Testnet: <a href="https://gitlab.com/dfinity-lab/public/ic/-/blob/master/testnet/env/{{experiment.testnet}}/hosts.ini">
       {{experiment.testnet}}</a><br>
-    Workload generator testnet: <a href="https://gitlab.com/dfinity-lab/core/ic/-/blob/master/testnet/env/{{experiment.wg_testnet}}/hosts.ini">
+    Workload generator testnet: <a href="https://gitlab.com/dfinity-lab/public/ic/-/blob/master/testnet/env/{{experiment.wg_testnet}}/hosts.ini">
       {{experiment.wg_testnet}}</a><br>
     Canister Id: {{experiment.canister_id}}<br>
     Subnet ID: {{experiment.subnet_id}}<br>
     Target Machine: <br>
     <ul>
       {{#each experiment.target_machines}}
-      <li>{{this}}
+      <li>{{this.name}} ({{this.host}} {{this.country}})
       {{/each}}
     </ul>
     
     Load Generator Machines: <br>
     <ul>
       {{#each experiment.load_generator_machines}}
-      <li>{{this}}
+      <li>{{this.name}} ({{this.host}} {{this.country}})
       {{/each}}
     </ul>
-    Time experiment start: {{experiment.t_experiment_start}}<br>
-    Time experiment end: {{experiment.t_experiment_end}}<br>
+    Time experiment start: <span class="timestamp">{{experiment.t_experiment_start}}</span><br>
+    Time experiment end: <span class="timestamp">{{experiment.t_experiment_end}}</span><br>
 
     <button onclick="showAccordion('lscpu')" class="w3-btn w3-green">📂 Show lscpu</button><br />
     <div id="lscpu" class="w3-container w3-hide">
@@ -86,17 +113,17 @@
     {{{experiment-details}}}
 
     
-    <!-- <h2>HTTP request latency</h2> -->
+    <h2>HTTP request latency</h2>
 
-    <!-- This is measured by the replica -->
+    This is measured by the replica
 
-    <!-- <div id="plot-http-latency" style="width:600px;height:250px;"></div> -->
-    <!-- <script> -->
-    <!--   plot = document.getElementById('plot-http-latency'); -->
-    <!--   Plotly.newPlot( plot, {{{plot-http-latency}}}, {{{layout-http-latency}}} ); -->
-    <!-- </script> -->
+    <div id="plot-http-latency" style="max-height:500px;"></div>
+    <script>
+      plot = document.getElementById('plot-http-latency');
+      Plotly.newPlot( plot, {{{plot-http-latency}}}, {{{layout-http-latency}}} );
+    </script>
     
-    <h2>Average workload generator request latency</h2>
+    <h2>Median workload generator request latency</h2>
     
     This is measured by the workload generator (client side).
     It's the median latency over all requests, including failed ones.
@@ -110,51 +137,62 @@
     Check the maximum latency in each of the iterations below to get more details.
     </div>
     
-    <div id="plot-wg-http-latency" style="width:600px;height:250px;"></div>
+    <div id="plot-wg-http-latency" style="max-height:500px;"></div>
     <script>
       plot = document.getElementById('plot-wg-http-latency');
       Plotly.newPlot( plot, {{{plot-wg-http-latency}}}, {{{layout-wg-http-latency}}} );
     </script>
-    
+
     <h2>Workload generator failure rate</h2>
 
     This is measured by the workload generator (client side).
 
-    <div id="plot-wg-failure-rate" style="width:600px;height:250px;"></div>
+    <div id="plot-wg-failure-rate" style="max-height:500px;"></div>
     <script>
       plot = document.getElementById('plot-wg-failure-rate');
       Plotly.newPlot( plot, {{{plot-wg-failure-rate}}}, {{{layout-wg-failure-rate}}} );
     </script>
 
+    <h2>Finalization rate per iteration</h2>
+
+    Each datapoint represents the average finalization rate for the duration of a single iteration.
+
+    <div id="plot-finalization-rate" style="max-height:500px;"></div>
+    <script>
+      plot = document.getElementById('plot-finalization-rate');
+      Plotly.newPlot( plot, {{{plot-finalization-rate}}}, {{{layout-finalization-rate}}} );
+    </script>
+
     <h2>Iterations</h2>
 
     Experiments run in iteration.
-    Each iteration of the experiment runs for a certain amount of time.
-    In each experiment iteration, we increase the workload in requests per second that we send to the Internet Computer.
+    In each experiment iteration, we increase stress on the system.
     
     We collect metrics for those iterations individually.
     
     {{#each iterations}} 
 
-    <h3>Iteration {{this.header}} with total load: {{this.configuration.configuration.load_total}}</h3>
-    <button onclick="showAccordion('iteration-{{this.header}}')" class="w3-btn w3-green">📂 Show details for iteration {{this.header}}</button><br />
-    <div id="iteration-{{this.header}}" class="w3-container w3-hide">
-
-    Failure rate:
-    <span class="w3-tag w3-round w3-{{this.failure_rate_color}}">
+    <h3>Iteration {{this.header}} ({{../experiment.xtitle}}: {{this.configuration.configuration.load_total}})</h3>
+    99th percentile latency: {{this.t_99}}ms (mean from all workload generators)<br>
+    Median latency: {{this.t_median}}ms (maximum from all workload generators)<br>
+    Failure rate: <span class="w3-tag w3-round w3-{{this.failure_rate_color}}">
       {{this.failure_rate}}%</span><br>
-    Latency median: {{this.t_median}}ms<br>
+    <button onclick="showAccordion('iteration-{{this.header}}')" class="w3-btn w3-green">📂 Show details for iteration {{this.header}}</button><br />
+    <div id="iteration-{{this.header}}" class="w3-container w3-hide" style="width: 100%;">
+
     Latency average: {{this.t_average}}ms<br>
     Latency max: {{this.t_max}}ms<br>
     Latency min: {{this.t_min}}ms<br>
+    95th percentile latency: {{this.t_95}}ms<br>
+    90th percentile latency: {{this.t_90}}ms<br>
     Total number of requests executed: {{this.total_requests}}<br>
     <br>
-    Median finalization rate: {{this.prometheus.finalization_rate.1}}<br>
+    Average finalization rate: {{this.prometheus.finalization_rate.1}}<br>
     Total load: {{this.configuration.configuration.load_total}}<br>
     <!-- HTTP request duration: {{this.prometheus.http_request_duration}} -->
     
 {{#if this.prometheus.http_request_rate_plot }}
-    <div id="plot-{{this.header}}-http-request-rate" style="width:600px;height:250px;"></div>
+    <div id="plot-{{this.header}}-http-request-rate" style="max-height:500px; width: 100%;"></div>
     <script>
       window.addEventListener("load", function(event) {
           plot = document.getElementById('plot-{{this.header}}-http-request-rate');

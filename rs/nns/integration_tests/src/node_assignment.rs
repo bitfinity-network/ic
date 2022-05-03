@@ -1,8 +1,10 @@
 use dfn_candid::candid_one;
 use ic_base_types::NodeId;
 use ic_canister_client::Sender;
+use ic_nervous_system_common_test_keys::{
+    TEST_NEURON_1_OWNER_KEYPAIR, TEST_NEURON_1_OWNER_PRINCIPAL,
+};
 use ic_nns_common::{types::NeuronId, types::ProposalId};
-use ic_nns_constants::ids::{TEST_NEURON_1_OWNER_KEYPAIR, TEST_NEURON_1_OWNER_PRINCIPAL};
 use ic_nns_governance::pb::v1::{
     add_or_remove_node_provider::Change,
     manage_neuron::{Command, NeuronIdOrSubaccount},
@@ -19,9 +21,8 @@ use ic_nns_test_utils::{
 };
 use ic_protobuf::registry::node::v1::NodeRecord;
 use ic_registry_keys::make_node_record_key;
-use registry_canister::mutations::{
-    do_add_node_operator::AddNodeOperatorPayload, do_remove_nodes::RemoveNodesPayload,
-};
+use registry_canister::mutations::do_add_node_operator::AddNodeOperatorPayload;
+use registry_canister::mutations::node_management::do_remove_nodes::RemoveNodesPayload;
 use std::collections::BTreeMap;
 
 /// Test that nodes can be added and removed from the Registry correctly via

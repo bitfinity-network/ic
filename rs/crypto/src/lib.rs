@@ -11,20 +11,20 @@
 
 pub mod cli;
 mod common;
-mod hash;
 mod keygen;
 pub mod prng;
 mod sign;
 mod tls_stub;
 
 pub use common::utils;
-pub use hash::crypto_hash;
+pub use ic_crypto_hash::crypto_hash;
 pub use sign::utils::{
     combined_threshold_signature_and_public_key, ecdsa_p256_signature_from_der_bytes,
     ed25519_public_key_to_der, rsa_signature_from_bytes, threshold_sig_public_key_from_der,
     threshold_sig_public_key_to_der, user_public_key_from_bytes, verify_combined_threshold_sig,
     KeyBytesContentType,
 };
+pub use sign::{derive_tecdsa_public_key, get_tecdsa_master_public_key};
 
 use crate::common::utils::{derive_node_id, TempCryptoComponent};
 use crate::sign::ThresholdSigDataStoreImpl;
@@ -37,7 +37,7 @@ use ic_crypto_internal_csp::{CryptoServiceProvider, Csp};
 use ic_crypto_internal_logmon::metrics::CryptoMetrics;
 use ic_crypto_tls_interfaces::TlsHandshake;
 use ic_interfaces::crypto::{
-    BasicSigVerifier, BasicSigVerifierByPublicKey, KeyManager, MultiSigVerifier,
+    BasicSigVerifier, BasicSigVerifierByPublicKey, BasicSigner, KeyManager, MultiSigVerifier,
     ThresholdSigVerifier, ThresholdSigVerifierByPublicKey,
 };
 use ic_interfaces::registry::RegistryClient;
@@ -73,7 +73,7 @@ pub type CryptoComponent =
 ///
 /// This should be used whenever crypto is required on a node, but a
 /// full-fledged `CryptoComponent` is not available. Example use cases are in
-/// separate process such as ic-fe or the node manager.
+/// separate process such as ic-fe or the orchestrator.
 ///
 /// Do not instantiate a CryptoComponent outside of the replica process, since
 /// that may lead to problems with concurrent access to the secret key store.
@@ -82,6 +82,7 @@ pub type CryptoComponent =
 /// modify the secret key store.
 pub trait CryptoComponentForNonReplicaProcess:
     KeyManager
+    + BasicSigner<MessageId>
     + ThresholdSigVerifierByPublicKey<CatchUpContentProtobufBytes>
     + TlsHandshake
     + Send
@@ -93,6 +94,7 @@ pub trait CryptoComponentForNonReplicaProcess:
 // that fulfill the requirements.
 impl<T> CryptoComponentForNonReplicaProcess for T where
     T: KeyManager
+        + BasicSigner<MessageId>
         + ThresholdSigVerifierByPublicKey<CatchUpContentProtobufBytes>
         + TlsHandshake
         + Send
@@ -241,8 +243,8 @@ impl CryptoComponentFatClient<Csp<OsRng, ProtoSecretKeyStore, ProtoSecretKeyStor
     /// use ic_crypto::CryptoComponent;
     /// use ic_logger::replica_logger::no_op_logger;
     /// use std::sync::Arc;
-    /// use ic_registry_client::fake::FakeRegistryClient;
-    /// use ic_registry_common::proto_registry_data_provider::ProtoRegistryDataProvider;
+    /// use ic_registry_client_fake::FakeRegistryClient;
+    /// use ic_registry_proto_data_provider::ProtoRegistryDataProvider;
     /// use ic_crypto::utils::get_node_keys_or_generate_if_missing;
     /// use ic_metrics::MetricsRegistry;
     ///
@@ -312,7 +314,7 @@ impl CryptoComponentFatClient<Csp<OsRng, ProtoSecretKeyStore, ProtoSecretKeyStor
         registry_client: Arc<dyn RegistryClient>,
         logger: ReplicaLogger,
     ) -> impl CryptoComponentForNonReplicaProcess {
-        // disable metrics for crypto in node manager:
+        // disable metrics for crypto in orchestrator:
         CryptoComponentFatClient::new(config, registry_client, logger, None)
     }
 
@@ -340,7 +342,7 @@ fn key_from_registry(
     key_purpose: KeyPurpose,
     registry_version: RegistryVersion,
 ) -> CryptoResult<PublicKeyProto> {
-    use ic_registry_client::helper::crypto::CryptoRegistry;
+    use ic_registry_client_helpers::crypto::CryptoRegistry;
     let maybe_pk_proto =
         registry.get_crypto_key_for_node(node_id, key_purpose, registry_version)?;
     match maybe_pk_proto {

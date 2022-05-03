@@ -1,58 +1,69 @@
 use ic_config::execution_environment::Config;
 use ic_execution_environment::{Hypervisor, QueryExecutionType};
+use ic_interfaces::execution_environment::AvailableMemory;
 use ic_interfaces::{
-    execution_environment::{ExecutionParameters, SubnetAvailableMemory},
+    execution_environment::{ExecutionMode, ExecutionParameters},
     messages::RequestOrIngress,
 };
 use ic_logger::ReplicaLogger;
 use ic_metrics::MetricsRegistry;
 use ic_registry_routing_table::{CanisterIdRange, RoutingTable};
 use ic_registry_subnet_type::SubnetType;
-use ic_replicated_state::{CallContextAction, CanisterState};
+use ic_replicated_state::{CallContextAction, CanisterState, NetworkTopology, SubnetTopology};
 use ic_test_utilities::{
-    cycles_account_manager::CyclesAccountManagerBuilder, execution_state::ExecutionStateBuilder,
-    mock_time, state::SystemStateBuilder, types::ids::subnet_test_id, types::ids::user_test_id,
-    types::messages::IngressBuilder, with_test_replica_logger,
+    cycles_account_manager::CyclesAccountManagerBuilder, mock_time, state::SystemStateBuilder,
+    types::ids::subnet_test_id, types::ids::user_test_id, types::messages::IngressBuilder,
+    with_test_replica_logger,
 };
 use ic_types::{
-    ingress::WasmResult, CanisterId, ComputeAllocation, Cycles, NumBytes, NumInstructions, SubnetId,
+    ingress::WasmResult, CanisterId, ComputeAllocation, Cycles, NumBytes, NumInstructions,
 };
 use maplit::btreemap;
-use proptest::prelude::*;
-use std::{collections::BTreeMap, sync::Arc};
+use proptest::{
+    prelude::*,
+    test_runner::{TestRng, TestRunner},
+};
+use std::{convert::TryFrom, sync::Arc};
 
 fn execution_parameters() -> ExecutionParameters {
     ExecutionParameters {
-        instruction_limit: NumInstructions::new(1_000_000_000),
+        total_instruction_limit: NumInstructions::new(1_000_000_000),
+        slice_instruction_limit: NumInstructions::new(1_000_000_000),
         canister_memory_limit: NumBytes::new(u64::MAX / 2),
-        subnet_available_memory: SubnetAvailableMemory::new(i64::MAX / 2),
+        subnet_available_memory: AvailableMemory::new(i64::MAX / 2, i64::MAX / 2).into(),
         compute_allocation: ComputeAllocation::default(),
         subnet_type: SubnetType::Application,
+        execution_mode: ExecutionMode::Replicated,
     }
 }
 
 struct HypervisorTest {
     hypervisor: Hypervisor,
     canister: CanisterState,
-    routing_table: Arc<RoutingTable>,
-    subnet_records: Arc<BTreeMap<SubnetId, SubnetType>>,
+    network_topology: Arc<NetworkTopology>,
 }
 
 impl HypervisorTest {
     fn init(wast: &str, log: ReplicaLogger) -> Self {
         let subnet_id = subnet_test_id(1);
         let subnet_type = SubnetType::Application;
-        let routing_table = Arc::new(RoutingTable::new(btreemap! {
+        let routing_table = Arc::new(RoutingTable::try_from(btreemap! {
             CanisterIdRange{ start: CanisterId::from(0), end: CanisterId::from(0xff) } => subnet_id,
-        }));
-        let subnet_records = Arc::new(btreemap! {
-            subnet_id => subnet_type,
+        }).unwrap());
+        let network_topology = Arc::new(NetworkTopology {
+            routing_table,
+            subnets: btreemap!(
+                subnet_id => SubnetTopology {
+                    subnet_type,
+                    ..SubnetTopology::default()
+                }
+            ),
+            ..NetworkTopology::default()
         });
         let registry = MetricsRegistry::new();
         let cycles_account_manager = Arc::new(CyclesAccountManagerBuilder::new().build());
         let hypervisor = Hypervisor::new(
             Config::default(),
-            1,
             &registry,
             subnet_id,
             subnet_type,
@@ -61,12 +72,19 @@ impl HypervisorTest {
         );
         let wasm_binary = wabt::wat2wasm(wast).unwrap();
         let tmpdir = tempfile::Builder::new().prefix("test").tempdir().unwrap();
-        let execution_state = ExecutionStateBuilder::new(wasm_binary, tmpdir.path().into()).build();
+        let system_state = SystemStateBuilder::default()
+            .memory_allocation(NumBytes::new(8 * 1024 * 1024 * 1024)) // 8GiB
+            .build();
+        let execution_state = hypervisor
+            .create_execution_state(
+                wasm_binary,
+                tmpdir.path().to_path_buf(),
+                system_state.canister_id(),
+            )
+            .unwrap();
 
         let canister = CanisterState {
-            system_state: SystemStateBuilder::default()
-                .memory_allocation(NumBytes::new(8 * 1024 * 1024 * 1024)) // 8GiB
-                .build(),
+            system_state,
             execution_state: Some(execution_state),
             scheduler_state: Default::default(),
         };
@@ -74,8 +92,7 @@ impl HypervisorTest {
         Self {
             hypervisor,
             canister,
-            routing_table,
-            subnet_records,
+            network_topology,
         }
     }
 
@@ -90,10 +107,8 @@ impl HypervisorTest {
             self.canister.clone(),
             RequestOrIngress::Ingress(ingress),
             mock_time(),
-            Arc::clone(&self.routing_table),
-            self.subnet_records.clone(),
+            self.network_topology.clone(),
             execution_parameters(),
-            subnet_test_id(0x101), // NNS subnet
         );
         self.canister = canister;
         action
@@ -214,7 +229,7 @@ fn dump_heap(t: &mut HypervisorTest) -> Vec<u8> {
     }
 }
 
-fn buf_apply_write(heap: &mut Vec<u8>, write: &Write) {
+fn buf_apply_write(heap: &mut [u8], write: &Write) {
     // match the behavior of write_bytes: copy the i32 `addr` to heap[0;4]
     heap[0..4].copy_from_slice(&write.dst.to_le_bytes());
     heap[write.dst as usize..(write.dst as usize + write.bytes.len() as usize)]
@@ -233,24 +248,36 @@ const TEST_NUM_PAGES: usize = 32;
 const TEST_NUM_WRITES: usize = 20;
 const WASM_PAGE_SIZE_BYTES: usize = 65536;
 
-proptest! {
-    #![proptest_config(ProptestConfig { cases: 20, .. ProptestConfig::default() })]
-    #[test]
-    // generate multiple writes of varying size to random memory locations, apply them both to a
-    // canister and a simple Vec buffer and compare the results.
-    fn test_orthogonal_persistence(writes in random_writes(TEST_HEAP_SIZE_BYTES, TEST_NUM_WRITES)) {
-        with_test_replica_logger(|log| {
-            let mut heap = vec![0;TEST_HEAP_SIZE_BYTES];
-            let wat = make_module_wat(TEST_NUM_PAGES);
-            let mut t = HypervisorTest::init(&wat, log);
+#[test]
+// generate multiple writes of varying size to random memory locations, apply them both to a
+// canister and a simple Vec buffer and compare the results.
+fn test_orthogonal_persistence() {
+    let config = ProptestConfig {
+        cases: 20,
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    };
+    let algorithm = config.rng_algorithm;
+    let mut runner = TestRunner::new_with_rng(config, TestRng::deterministic_rng(algorithm));
+    runner
+        .run(
+            &random_writes(TEST_HEAP_SIZE_BYTES, TEST_NUM_WRITES),
+            |writes| {
+                with_test_replica_logger(|log| {
+                    let mut heap = vec![0; TEST_HEAP_SIZE_BYTES];
+                    let wat = make_module_wat(TEST_NUM_PAGES);
+                    let mut t = HypervisorTest::init(&wat, log);
 
-            for w in &writes {
-                buf_apply_write(&mut heap, w);
-                write_bytes(&mut t, w.dst, &w.bytes);
-                // verify the heap
-                let canister_heap = dump_heap(&mut t);
-                assert_eq!(heap[..], canister_heap[..])
-            }
-        });
-    }
+                    for w in &writes {
+                        buf_apply_write(&mut heap, w);
+                        write_bytes(&mut t, w.dst, &w.bytes);
+                        // verify the heap
+                        let canister_heap = dump_heap(&mut t);
+                        prop_assert_eq!(&heap[..], &canister_heap[..]);
+                    }
+                    Ok(())
+                })
+            },
+        )
+        .unwrap();
 }

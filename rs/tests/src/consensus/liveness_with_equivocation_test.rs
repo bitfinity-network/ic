@@ -22,15 +22,15 @@ Coverage::
 end::catalog[] */
 
 use crate::util::*;
-use fondue::log::{debug, info, Logger};
 use ic_agent::export::Principal;
 use ic_fondue::{
+    ic_instance::{LegacyInternetComputer as InternetComputer, Subnet},
     ic_manager::IcHandle,
-    internet_computer::{InternetComputer, Subnet},
 };
 use ic_registry_subnet_type::SubnetType;
 use ic_types::malicious_behaviour::MaliciousBehaviour;
 use rand::Rng;
+use slog::{debug, info, Logger};
 use url::Url;
 
 pub fn config() -> InternetComputer {
@@ -43,7 +43,7 @@ pub fn config() -> InternetComputer {
     )
 }
 
-pub fn test(mut handle: IcHandle, ctx: &fondue::pot::Context) {
+pub fn test(mut handle: IcHandle, ctx: &ic_fondue::pot::Context) {
     // Choose two different nodes to use in our test. Note the handle
     // does _not_ contain handle for malicious nodes, so we are guaranteed
     // to take two honest ones.

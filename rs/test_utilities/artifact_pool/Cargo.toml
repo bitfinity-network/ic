@@ -10,10 +10,10 @@ ic-consensus = { path = "../../consensus" }
 ic-consensus-message = { path = "../../consensus/message" }
 ic-crypto = { path = "../../crypto" }
 ic-interfaces = { path = "../../interfaces" }
+ic-interfaces-state-manager = { path = "../../interfaces/state_manager" }
 ic-logger = { path = "../../monitoring/logger" }
 ic-metrics = { path = "../../monitoring/metrics" }
 ic-replicated-state = { path = "../../replicated_state" }
 ic-test-utilities = { path = "../" }
 ic-types = { path = "../../types/types" }
-slog-scope = "4.1.2"
 tempfile = "3.1.0"

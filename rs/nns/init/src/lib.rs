@@ -9,7 +9,7 @@ use ic_nns_constants::NNS_CANISTER_WASMS;
 use ic_registry_common::local_store::{
     ChangelogEntry, KeyMutation, LocalStoreImpl, LocalStoreReader,
 };
-use ic_registry_common::proto_registry_data_provider::ProtoRegistryDataProvider;
+use ic_registry_proto_data_provider::ProtoRegistryDataProvider;
 use ic_registry_transport::pb::v1::RegistryAtomicMutateRequest;
 use ic_registry_transport::pb::v1::{registry_mutation, RegistryMutation};
 use ic_registry_transport::{delete, upsert};
@@ -229,6 +229,6 @@ pub fn set_up_env_vars_for_all_canisters<P: AsRef<Path>>(wasm_dir: P) {
 
         // Sets up the env var following the pattern expected by
         // WASM::from_location_specified_by_env_var
-        std::env::set_var(Wasm::env_var_name(canister), path.to_str().unwrap());
+        std::env::set_var(Wasm::env_var_name(canister, &[]), path.to_str().unwrap());
     }
 }

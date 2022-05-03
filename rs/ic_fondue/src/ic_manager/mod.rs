@@ -12,16 +12,17 @@ use url::Url;
 use ic_prep_lib::prep_state_directory::IcPrepStateDir;
 use ic_protobuf::log::log_entry::v1::LogEntry;
 
-use fondue::log::{debug, o, Logger};
-use fondue::manager::{process_pool, HasHandle, Manager, MaybeHasHandle};
+use slog::{debug, o, Logger};
 mod inner;
 
-use crate::internet_computer::InternetComputer;
-pub use inner::*;
+use crate::ic_instance::LegacyInternetComputer as InternetComputer;
+pub mod buffered_reader;
 pub mod handle;
+pub mod process_pool;
+use crate::mio::InputSource;
 use crossbeam_channel::unbounded;
-use fondue::mio::InputSource;
-pub use handle::{FarmInfo, IcControl, IcEndpoint, IcHandle, IcSubnet, RuntimeDescriptor};
+pub use handle::{FarmInfo, IcEndpoint, IcHandle, IcSubnet, RuntimeDescriptor};
+pub use inner::*;
 use std::collections::BTreeSet;
 use std::fs::{create_dir_all, File};
 use std::io::Write;
@@ -31,6 +32,7 @@ use std::time::Instant;
 /// fed into the passive pipeline are either events from a replica or
 /// a fondue's [Event].
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum Event {
     FromPid(Pid, NodeEvent),
     Stop(i32),
@@ -42,13 +44,14 @@ pub enum Event {
 /// it needs two injections implemented by the means of `From`
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "type", content = "event")]
+#[allow(clippy::large_enum_variant)]
 pub enum NodeEvent {
     Log {
-        src: fondue::mio::InputSource,
+        src: InputSource,
         log_entry: LogEntry,
     },
     OutputLine {
-        src: fondue::mio::InputSource,
+        src: InputSource,
         line: String,
     },
     Exited {
@@ -93,46 +96,33 @@ impl From<process_pool::Event> for Event {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Default, Clone)]
 pub struct IcManagerSettings {
     pub tee_replica_logs_base_dir: Option<PathBuf>,
     pub existing_endpoints: Option<Vec<IcEndpoint>>,
 }
 
-impl Default for IcManagerSettings {
-    fn default() -> Self {
-        IcManagerSettings {
-            tee_replica_logs_base_dir: None,
-            existing_endpoints: None,
-        }
-    }
-}
-
-impl MaybeHasHandle<IcHandle> for IcManagerSettings {
-    fn request_handle(&self) -> Option<Box<dyn HasHandle<Handle = IcHandle>>> {
+impl IcManagerSettings {
+    pub fn request_handle(&self) -> Option<IcHandle> {
         // false positive: Option::map can't return a trait object
         #[allow(clippy::manual_map)]
         match &self.existing_endpoints {
-            Some(public_api_endpoints) => Some(Box::new(IcHandle {
+            Some(public_api_endpoints) => Some(IcHandle {
                 public_api_endpoints: public_api_endpoints.clone(),
                 malicious_public_api_endpoints: vec![],
                 ic_prep_working_dir: None,
-            })),
+            }),
             None => None,
         }
     }
 }
 
 /// Finally, the [IcManager] is a valid [Manager]
-impl Manager for IcManager {
-    type Event = Event;
-    type EnvConfig = InternetComputer;
-    type ManConfig = IcManagerSettings;
-
-    fn start(
+impl IcManager {
+    pub fn start(
         pot_name: String,
-        settings: Self::ManConfig,
-        cfg: Self::EnvConfig,
+        settings: IcManagerSettings,
+        cfg: InternetComputer,
         parent_logger: &Logger,
     ) -> Self {
         let logger = parent_logger.new(o!("where" => "ic_manager"));
@@ -203,11 +193,56 @@ impl Manager for IcManager {
         }
     }
 
-    fn wait_for_signal(&self) -> Option<i32> {
+    pub fn wait_for_signal(&self) -> Option<i32> {
         let receiver = self.signal_receiver.read().unwrap();
         match receiver.recv() {
             Ok(sig) => sig,
             Err(_) => None,
+        }
+    }
+
+    pub fn handle(&self) -> IcHandle {
+        let guard = self.inner.read().unwrap();
+        let endpoints = guard.procman.configs.iter();
+
+        let to_ic_endpoint = |(pid, nc): (&Pid, &NodeCommand)| {
+            let addr = if nc.http_addr.ip().is_ipv4() {
+                format!("{}", nc.http_addr.ip())
+            } else {
+                format!("[{}]", nc.http_addr.ip())
+            };
+            let port = nc.http_addr.port();
+            let url = Url::parse(&format!("http://{}:{}/", addr, port)).expect("Can't fail");
+            let metrics_url = Some(
+                Url::parse(&format!("http://{}:{}/", addr, nc.metrics_port)).expect("Can't fail"),
+            );
+            IcEndpoint {
+                runtime_descriptor: RuntimeDescriptor::Process(*pid),
+                url,
+                metrics_url,
+                is_root_subnet: nc.is_root_subnet,
+                subnet: Some(IcSubnet {
+                    id: nc.subnet_id,
+                    type_of: nc.initial_subnet_type,
+                }),
+                started_at: Instant::now(),
+                node_id: nc.node_id,
+            }
+        };
+
+        IcHandle {
+            public_api_endpoints: endpoints
+                .clone()
+                .filter(|(_, nc)| !nc.is_malicious)
+                .map(to_ic_endpoint)
+                .collect(),
+            malicious_public_api_endpoints: endpoints
+                .filter(|(_, nc)| nc.is_malicious)
+                .map(to_ic_endpoint)
+                .collect(),
+            ic_prep_working_dir: Some(IcPrepStateDir::new(PathBuf::from(
+                self.prep_working_dir.deref().path(),
+            ))),
         }
     }
 }
@@ -261,62 +296,6 @@ impl LogsWriter {
         filepath.push(format!("{}:{}.log", id.0, id.1));
         filepath.set_extension("log");
         filepath
-    }
-}
-
-impl HasHandle for IcHandle {
-    type Handle = Self;
-    fn handle(&self) -> Self::Handle {
-        self.clone()
-    }
-}
-
-impl HasHandle for IcManager {
-    type Handle = IcHandle;
-
-    fn handle(&self) -> Self::Handle {
-        let guard = self.inner.read().unwrap();
-        let endpoints = guard.procman.configs.iter();
-
-        let to_ic_endpoint = |(pid, nc): (&Pid, &NodeCommand)| {
-            let addr = if nc.http_addr.ip().is_ipv4() {
-                format!("{}", nc.http_addr.ip())
-            } else {
-                format!("[{}]", nc.http_addr.ip())
-            };
-            let port = nc.http_addr.port();
-            let url = Url::parse(&format!("http://{}:{}/", addr, port)).expect("Can't fail");
-            let metrics_url = Some(
-                Url::parse(&format!("http://{}:{}/", addr, nc.metrics_port)).expect("Can't fail"),
-            );
-            IcEndpoint {
-                runtime_descriptor: RuntimeDescriptor::Process(*pid),
-                url,
-                metrics_url,
-                is_root_subnet: nc.is_root_subnet,
-                subnet: Some(IcSubnet {
-                    id: nc.subnet_id,
-                    type_of: nc.initial_subnet_type,
-                }),
-                started_at: Instant::now(),
-                ssh_key_pairs: vec![],
-            }
-        };
-
-        IcHandle {
-            public_api_endpoints: endpoints
-                .clone()
-                .filter(|(_, nc)| !nc.is_malicious)
-                .map(to_ic_endpoint)
-                .collect(),
-            malicious_public_api_endpoints: endpoints
-                .filter(|(_, nc)| nc.is_malicious)
-                .map(to_ic_endpoint)
-                .collect(),
-            ic_prep_working_dir: Some(IcPrepStateDir::new(PathBuf::from(
-                self.prep_working_dir.deref().path(),
-            ))),
-        }
     }
 }
 

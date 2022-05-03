@@ -25,7 +25,13 @@ mod cycles_minting_canister;
 mod fuzz;
 
 #[cfg(test)]
+mod node_provider_remuneration;
+
+#[cfg(test)]
 mod governance_mem_test;
+
+#[cfg(test)]
+mod governance_get_build_metadata_test;
 
 #[cfg(test)]
 mod gtc;
@@ -83,3 +89,21 @@ mod update_unassigned_nodes_config;
 
 #[cfg(test)]
 mod wait_for_quiet;
+
+#[cfg(test)]
+mod governance_neurons;
+
+#[cfg(test)]
+mod governance_time_warp;
+
+#[cfg(test)]
+mod known_neurons;
+
+#[cfg(test)]
+mod update_node_provider;
+
+#[cfg(test)]
+mod list_node_providers;
+
+#[cfg(test)]
+mod network_economics;

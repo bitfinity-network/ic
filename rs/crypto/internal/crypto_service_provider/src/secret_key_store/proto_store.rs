@@ -3,6 +3,7 @@
 use crate::secret_key_store::{Scope, SecretKeyStore, SecretKeyStoreError};
 use crate::threshold::ni_dkg::{NIDKG_FS_SCOPE, NIDKG_THRESHOLD_SCOPE};
 use crate::types::CspSecretKey;
+use ic_config::crypto::CryptoConfig;
 use ic_crypto_internal_threshold_sig_bls12381::ni_dkg::groth20_bls12_381::types::convert_keyset_to_keyset_with_pop;
 use ic_crypto_internal_threshold_sig_bls12381::ni_dkg::types::CspFsEncryptionKeySet;
 use ic_logger::{info, replica_logger::no_op_logger, ReplicaLogger};
@@ -14,7 +15,6 @@ use std::collections::HashMap;
 use std::convert::TryInto;
 use std::fs;
 use std::io::ErrorKind;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -50,9 +50,10 @@ fn key_id_from_hex(key_id_hex: &str) -> KeyId {
 
 /// The secret key store protobuf definitions
 // Include the prost-build generated registry protos.
-#[path = "../../gen/ic.crypto.v1.rs"]
 #[rustfmt::skip]
-pub mod pb;
+pub mod pb {
+    include!(concat!(env!("OUT_DIR"), "/ic.crypto.v1.rs"));
+}
 
 type SecretKeys = HashMap<KeyId, (CspSecretKey, Option<Scope>)>;
 
@@ -67,7 +68,8 @@ pub struct ProtoSecretKeyStore {
 impl ProtoSecretKeyStore {
     /// Creates a database instance.
     pub fn open(dir: &Path, file_name: &str, logger: Option<ReplicaLogger>) -> Self {
-        Self::check_path(dir);
+        CryptoConfig::check_dir_has_required_permissions(dir)
+            .expect("wrong crypto root permissions");
         let proto_file = dir.join(file_name);
         let secret_keys = match Self::read_sks_data_from_disk(&proto_file) {
             Some(sks_proto) => sks_proto,
@@ -117,9 +119,9 @@ impl ProtoSecretKeyStore {
                         });
                     if let CspSecretKey::FsEncryption(CspFsEncryptionKeySet::Groth20_Bls12_381(
                         key_set,
-                    )) = csp_key
+                    )) = &csp_key
                     {
-                        let key_set_with_pop = convert_keyset_to_keyset_with_pop(key_set);
+                        let key_set_with_pop = convert_keyset_to_keyset_with_pop(key_set.clone());
                         csp_key = CspSecretKey::FsEncryption(
                             CspFsEncryptionKeySet::Groth20WithPop_Bls12_381(key_set_with_pop),
                         );
@@ -145,9 +147,9 @@ impl ProtoSecretKeyStore {
 
                     if let CspSecretKey::FsEncryption(CspFsEncryptionKeySet::Groth20_Bls12_381(
                         key_set,
-                    )) = csp_key
+                    )) = &csp_key
                     {
-                        let key_set_with_pop = convert_keyset_to_keyset_with_pop(key_set);
+                        let key_set_with_pop = convert_keyset_to_keyset_with_pop(key_set.clone());
                         csp_key = CspSecretKey::FsEncryption(
                             CspFsEncryptionKeySet::Groth20WithPop_Bls12_381(key_set_with_pop),
                         );
@@ -223,40 +225,6 @@ impl ProtoSecretKeyStore {
     fn write_secret_keys_to_disk(sks_data_file: &Path, secret_keys: &SecretKeys) {
         let sks_proto = ProtoSecretKeyStore::secret_keys_to_sks_proto(secret_keys);
         ic_utils::fs::write_protobuf_using_tmp_file(sks_data_file, &sks_proto).unwrap();
-    }
-
-    fn check_path(path: &Path) {
-        if path.is_file() {
-            panic!(
-                "Path {} should specify a directory, not a file",
-                &path.display()
-            );
-        }
-        let metadata = Self::check_path_exists(path);
-        Self::check_not_readable_by_others(path, metadata);
-    }
-
-    fn check_path_exists(path: &Path) -> fs::Metadata {
-        fs::metadata(path).unwrap_or_else(|e| {
-            panic!(
-                "Path {} does not exist or its metadata cannot be retrieved: {}",
-                &path.display(),
-                e
-            )
-        })
-    }
-
-    fn check_not_readable_by_others(path: &Path, metadata: fs::Metadata) {
-        let permissions = metadata.permissions();
-        let unix_permission_bits = permissions.mode();
-        let non_user_permissions = unix_permission_bits & 0o77;
-        if non_user_permissions != 0 {
-            panic!(
-                "crypto keystore path {} has permissions {:#o}, allowing reading by others",
-                &path.display(),
-                unix_permission_bits
-            );
-        }
     }
 }
 
@@ -356,19 +324,19 @@ pub mod tests {
     // TODO(CRP-351): add tests that SKS updates hit the disk.
     #[test]
     #[should_panic]
-    fn path_check_should_panic_for_paths_that_do_not_exist() {
+    fn open_should_panic_for_paths_that_do_not_exist() {
         let dir_path = {
             let dir = tempdir_deleted_at_end_of_scope().unwrap();
             format!("{}", dir.path().display())
         };
-        ProtoSecretKeyStore::check_path(Path::new(&dir_path));
+        ProtoSecretKeyStore::open(Path::new(&dir_path), "dummy_file", None);
     }
 
     #[test]
     #[should_panic]
-    fn path_check_should_panic_for_paths_that_are_widely_readable() {
+    fn open_should_panic_for_paths_that_are_widely_readable() {
         let dir = mk_temp_dir_with_permissions(0o744);
-        ProtoSecretKeyStore::check_path(dir.path());
+        ProtoSecretKeyStore::open(dir.as_ref(), "dummy_file", None);
     }
 
     proptest! {

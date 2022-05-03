@@ -6,7 +6,7 @@
 
     # Destroy (stop) all existing VMs from this deployment running on this node
     VMS=$(virsh list --name)
-    for vm in {{ hostvars[inventory_hostname].ic_guests | join(' ') }}; do
+    for vm in {{ hostvars[inventory_hostname].ic_guests | default([]) | join(' ') }}; do
       # Destroy/stop all known guests for this deployment, if running
       if ! grep -E -q "^${vm}$" <(echo "$VMS"); then continue; fi
       echo "Destroying VM $vm"
@@ -25,7 +25,7 @@
 
     # Undefine all existing VMs from this deployment running on this node
     VMS=$(virsh list --name --all)
-    for vm in {{ hostvars[inventory_hostname].ic_guests | join(' ') }}; do
+    for vm in {{ hostvars[inventory_hostname].ic_guests | default([]) | join(' ') }}; do
       # Undefine/delete all known guests for this deployment
       if ! grep -E -q "^${vm}$" <(echo "$VMS"); then continue; fi
       echo "Un-defining VM $vm"
@@ -51,5 +51,5 @@
   args:
     executable: /bin/bash
   register: script_res
-  changed_when: "'Destroying VM ' in (script_res.stddout | default('')) or 'Un-defining VM ' in (script_res.stddout | default(''))"
+  changed_when: "'Destroying VM ' in (script_res.stdout | default('')) or 'Un-defining VM ' in (script_res.stdout | default(''))"
   tags: [ "ic_guest" ]

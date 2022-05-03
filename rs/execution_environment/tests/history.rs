@@ -1,8 +1,8 @@
+use ic_config::execution_environment::Config;
+use ic_error_types::{ErrorCode::CanisterNotFound, UserError};
 use ic_execution_environment::{IngressHistoryReaderImpl, IngressHistoryWriterImpl};
-use ic_interfaces::{
-    execution_environment::{IngressHistoryReader, IngressHistoryWriter},
-    state_manager::Labeled,
-};
+use ic_interfaces::execution_environment::{IngressHistoryReader, IngressHistoryWriter};
+use ic_interfaces_state_manager::Labeled;
 use ic_metrics::MetricsRegistry;
 use ic_registry_subnet_type::SubnetType;
 use ic_replicated_state::ReplicatedState;
@@ -14,7 +14,6 @@ use ic_test_utilities::{
 };
 use ic_types::{
     ingress::{IngressStatus, WasmResult},
-    user_error::{ErrorCode::CanisterNotFound, UserError},
     Height,
 };
 use IngressStatus::*;
@@ -97,7 +96,8 @@ fn test_valid_transitions() {
             SubnetType::Application,
             "NOT_USED".into(),
         );
-        let ingress_history_writer = IngressHistoryWriterImpl::new(log, &MetricsRegistry::new());
+        let ingress_history_writer =
+            IngressHistoryWriterImpl::new(Config::default(), log, &MetricsRegistry::new());
         let message_id = message_test_id(1);
 
         for (origin_state, next_states) in valid_transitions().into_iter() {
@@ -120,7 +120,8 @@ fn test_valid_transitions() {
 #[test]
 fn test_invalid_transitions() {
     with_test_replica_logger(|log| {
-        let ingress_history_writer = IngressHistoryWriterImpl::new(log, &MetricsRegistry::new());
+        let ingress_history_writer =
+            IngressHistoryWriterImpl::new(Config::default(), log, &MetricsRegistry::new());
         let message_id = message_test_id(1);
 
         // creates a set of valid transitions

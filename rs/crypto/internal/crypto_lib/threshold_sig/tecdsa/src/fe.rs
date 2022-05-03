@@ -1,14 +1,42 @@
-use crate::{EccCurve, EccCurveType, ThresholdEcdsaError, ThresholdEcdsaResult};
+use crate::{EccCurveType, ThresholdEcdsaError, ThresholdEcdsaResult};
+use std::convert::TryInto;
 use std::fmt;
+use zeroize::Zeroize;
 
-mod secp256k1;
-mod secp256r1;
-mod utils;
+// The secp256k1 parameters are defined in FIPS 186-4, section D.1.2
+// [https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.186-4.pdf]
+//
+// The SSWU parameters are defined in
+// https://www.ietf.org/archive/id/draft-irtf-cfrg-hash-to-curve-14.html#name-suites-for-nist-p-256
+fe_derive::derive_field_element!(
+    Secp256r1FieldElement,
+    Modulus = "0xFFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFF",
+    A = "-3",
+    B = "0x5AC635D8AA3A93E7B3EBBD55769886BC651D06B0CC53B0F63BCE3C3E27D2604B",
+    SSWU_A = "A",
+    SSWU_B = "B",
+    SSWU_Z = "-10",
+);
+
+// The secp256k1 parameters are defined in SEC2
+// [https://www.secg.org/sec2-v2.pdf] section 2.4.1
+//
+// The SSWU parameters are defined in
+// https://www.ietf.org/archive/id/draft-irtf-cfrg-hash-to-curve-14.html#name-suites-for-secp256k1
+fe_derive::derive_field_element!(
+    Secp256k1FieldElement,
+    Modulus = "0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F",
+    A = "0",
+    B = "7",
+    SSWU_A = "0x3F8731ABDD661ADCA08A5558F0F5D272E953D363CB6F0E5D405447C01A444533",
+    SSWU_B = "1771",
+    SSWU_Z = "-11",
+);
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum EccFieldElement {
-    K256(secp256k1::FieldElement),
-    P256(secp256r1::FieldElement),
+    K256(Secp256k1FieldElement),
+    P256(Secp256r1FieldElement),
 }
 
 impl fmt::Display for EccFieldElement {
@@ -16,7 +44,7 @@ impl fmt::Display for EccFieldElement {
         write!(
             f,
             "FieldElem({}, 0x{})",
-            self.curve(),
+            self.curve_type(),
             hex::encode(self.as_bytes())
         )
     }
@@ -24,46 +52,42 @@ impl fmt::Display for EccFieldElement {
 
 impl EccFieldElement {
     /// Return the curve this field element is from
-    pub fn curve(&self) -> EccCurve {
-        match self {
-            Self::K256(_) => EccCurve::new(EccCurveType::K256),
-            Self::P256(_) => EccCurve::new(EccCurveType::P256),
-        }
-    }
-
     pub fn curve_type(&self) -> EccCurveType {
-        self.curve().curve_type()
+        match self {
+            Self::K256(_) => EccCurveType::K256,
+            Self::P256(_) => EccCurveType::P256,
+        }
     }
 
     /// Return the zero field element
     pub fn zero(curve: EccCurveType) -> Self {
         match curve {
-            EccCurveType::K256 => Self::K256(secp256k1::FieldElement::zero()),
-            EccCurveType::P256 => Self::P256(secp256r1::FieldElement::zero()),
+            EccCurveType::K256 => Self::K256(Secp256k1FieldElement::zero()),
+            EccCurveType::P256 => Self::P256(Secp256r1FieldElement::zero()),
         }
     }
 
     /// Return the one field element
     pub fn one(curve: EccCurveType) -> Self {
         match curve {
-            EccCurveType::K256 => Self::K256(secp256k1::FieldElement::one()),
-            EccCurveType::P256 => Self::P256(secp256r1::FieldElement::one()),
+            EccCurveType::K256 => Self::K256(Secp256k1FieldElement::one()),
+            EccCurveType::P256 => Self::P256(Secp256r1FieldElement::one()),
         }
     }
 
     /// Return the field element "A" cooresponding to the curve equation
     pub fn a(curve: EccCurveType) -> Self {
         match curve {
-            EccCurveType::K256 => Self::K256(secp256k1::FieldElement::a()),
-            EccCurveType::P256 => Self::P256(secp256r1::FieldElement::a()),
+            EccCurveType::K256 => Self::K256(Secp256k1FieldElement::a()),
+            EccCurveType::P256 => Self::P256(Secp256r1FieldElement::a()),
         }
     }
 
     /// Return the field element "B" cooresponding to the curve equation
     pub fn b(curve: EccCurveType) -> Self {
         match curve {
-            EccCurveType::K256 => Self::K256(secp256k1::FieldElement::b()),
-            EccCurveType::P256 => Self::P256(secp256r1::FieldElement::b()),
+            EccCurveType::K256 => Self::K256(Secp256k1FieldElement::b()),
+            EccCurveType::P256 => Self::P256(Secp256r1FieldElement::b()),
         }
     }
 
@@ -72,8 +96,8 @@ impl EccFieldElement {
     /// may not match the normal "A"
     pub fn sswu_a(curve: EccCurveType) -> Self {
         match curve {
-            EccCurveType::K256 => Self::K256(secp256k1::FieldElement::sswu_a()),
-            EccCurveType::P256 => Self::P256(secp256r1::FieldElement::sswu_a()),
+            EccCurveType::K256 => Self::K256(Secp256k1FieldElement::sswu_a()),
+            EccCurveType::P256 => Self::P256(Secp256r1FieldElement::sswu_a()),
         }
     }
 
@@ -82,27 +106,27 @@ impl EccFieldElement {
     /// may not match the normal "B"
     pub fn sswu_b(curve: EccCurveType) -> Self {
         match curve {
-            EccCurveType::K256 => Self::K256(secp256k1::FieldElement::sswu_b()),
-            EccCurveType::P256 => Self::P256(secp256r1::FieldElement::sswu_b()),
+            EccCurveType::K256 => Self::K256(Secp256k1FieldElement::sswu_b()),
+            EccCurveType::P256 => Self::P256(Secp256r1FieldElement::sswu_b()),
         }
     }
 
     /// Return the field element "Z" as specified for the simplified
-    /// SWU map in draft-irtf-cfrg-hash-to-curve-12
+    /// SWU map in draft-irtf-cfrg-hash-to-curve-14
     pub fn sswu_z(curve: EccCurveType) -> Self {
         match curve {
-            EccCurveType::K256 => Self::K256(secp256k1::FieldElement::sswu_z()),
-            EccCurveType::P256 => Self::P256(secp256r1::FieldElement::sswu_z()),
+            EccCurveType::K256 => Self::K256(Secp256k1FieldElement::sswu_z()),
+            EccCurveType::P256 => Self::P256(Secp256r1FieldElement::sswu_z()),
         }
     }
 
     /// Return the field element "C2" as specified for the simplified
-    /// SWU map in draft-irtf-cfrg-hash-to-curve-12
+    /// SWU map in draft-irtf-cfrg-hash-to-curve-14
     /// See section F.2.1.2
     pub fn sswu_c2(curve: EccCurveType) -> Self {
         match curve {
-            EccCurveType::K256 => Self::K256(secp256k1::FieldElement::sswu_c2()),
-            EccCurveType::P256 => Self::P256(secp256r1::FieldElement::sswu_c2()),
+            EccCurveType::K256 => Self::K256(Secp256k1FieldElement::sswu_c2()),
+            EccCurveType::P256 => Self::P256(Secp256r1FieldElement::sswu_c2()),
         }
     }
 
@@ -114,11 +138,13 @@ impl EccFieldElement {
     pub fn from_bytes(curve: EccCurveType, bytes: &[u8]) -> ThresholdEcdsaResult<Self> {
         match curve {
             EccCurveType::K256 => {
-                let x = secp256k1::FieldElement::from_bytes(bytes)?;
+                let x = Secp256k1FieldElement::from_bytes(bytes)
+                    .ok_or(ThresholdEcdsaError::InvalidFieldElement)?;
                 Ok(Self::K256(x))
             }
             EccCurveType::P256 => {
-                let x = secp256r1::FieldElement::from_bytes(bytes)?;
+                let x = Secp256r1FieldElement::from_bytes(bytes)
+                    .ok_or(ThresholdEcdsaError::InvalidFieldElement)?;
                 Ok(Self::P256(x))
             }
         }
@@ -132,18 +158,20 @@ impl EccFieldElement {
     pub fn from_bytes_wide(curve: EccCurveType, bytes: &[u8]) -> ThresholdEcdsaResult<Self> {
         match curve {
             EccCurveType::K256 => {
-                let x = secp256k1::FieldElement::from_bytes_wide(bytes)?;
+                let x = Secp256k1FieldElement::from_bytes_wide(bytes)
+                    .ok_or(ThresholdEcdsaError::InvalidFieldElement)?;
                 Ok(Self::K256(x))
             }
             EccCurveType::P256 => {
-                let x = secp256r1::FieldElement::from_bytes_wide(bytes)?;
+                let x = Secp256r1FieldElement::from_bytes_wide(bytes)
+                    .ok_or(ThresholdEcdsaError::InvalidFieldElement)?;
                 Ok(Self::P256(x))
             }
         }
     }
 
     /// Return true if and only if self is equal to zero
-    pub fn is_zero(&self) -> bool {
+    pub fn is_zero(&self) -> subtle::Choice {
         match self {
             Self::K256(x) => x.is_zero(),
             Self::P256(x) => x.is_zero(),
@@ -156,8 +184,8 @@ impl EccFieldElement {
     /// with leading zero padding as required.
     pub fn as_bytes(&self) -> Vec<u8> {
         match self {
-            Self::K256(x) => x.as_bytes(),
-            Self::P256(x) => x.as_bytes(),
+            Self::K256(x) => x.as_bytes().to_vec(),
+            Self::P256(x) => x.as_bytes().to_vec(),
         }
     }
 
@@ -202,11 +230,22 @@ impl EccFieldElement {
         self.mul(self)
     }
 
+    /// Const time equality
+    ///
+    /// Same as == except returns subtle::Choice instead of a bool
+    pub fn ct_eq(&self, other: &Self) -> ThresholdEcdsaResult<subtle::Choice> {
+        match (self, other) {
+            (Self::K256(x), Self::K256(y)) => Ok(x.ct_eq(y)),
+            (Self::P256(x), Self::P256(y)) => Ok(x.ct_eq(y)),
+            (_, _) => Err(ThresholdEcdsaError::CurveMismatch),
+        }
+    }
+
     /// Conditional assignment
     ///
     /// If assign is true then set self to other. Otherwise self is left
     /// unmodified.
-    pub fn ct_assign(&mut self, other: &Self, assign: bool) -> ThresholdEcdsaResult<()> {
+    pub fn ct_assign(&mut self, other: &Self, assign: subtle::Choice) -> ThresholdEcdsaResult<()> {
         match (self, other) {
             (Self::K256(x), Self::K256(y)) => {
                 x.ct_assign(y, assign);
@@ -240,10 +279,18 @@ impl EccFieldElement {
     /// Return the modular square root of self
     ///
     /// Returns zero if self is zero or if no square root exists
-    pub fn sqrt(&self) -> Self {
+    ///
+    /// The validity of the result is decided by the returned Choice
+    pub fn sqrt(&self) -> (subtle::Choice, Self) {
         match self {
-            Self::K256(x) => Self::K256(x.sqrt()),
-            Self::P256(x) => Self::P256(x.sqrt()),
+            Self::K256(x) => {
+                let (valid, s) = x.sqrt();
+                (valid, Self::K256(s))
+            }
+            Self::P256(x) => {
+                let (valid, s) = x.sqrt();
+                (valid, Self::P256(s))
+            }
         }
     }
 
@@ -259,7 +306,7 @@ impl EccFieldElement {
 
     /// Return the "sign" of self
     ///
-    /// See Section 4.1 of draft-irtf-cfrg-hash-to-curve-12 for details
+    /// See Section 4.1 of draft-irtf-cfrg-hash-to-curve-14 for details
     pub fn sign(&self) -> u8 {
         let bytes = match self {
             Self::K256(x) => x.as_bytes(),

@@ -6,45 +6,48 @@ edition = "2018"
 [dependencies]
 async-trait = "0.1.36"
 bincode = "1.2.1"
-crossbeam-channel = "0.5.0"
-enum-map = "0.6.2"
 futures = "0.3.10"
 rand = "0.7.3"
 ic-artifact-manager = { path = "../artifact_manager" }
-ic-base-thread = { path = "../base/thread" }
 ic-config = { path = "../config" }
-ic-crypto = { path = "../crypto" }
-ic-cycles-account-manager = { path = "../cycles_account_manager" }
+ic-crypto-hash = { path = "../crypto/hash" }
 ic-interfaces = { path = "../interfaces" }
+ic-interfaces-p2p = { path = "../interfaces/p2p" }
+ic-interfaces-transport = { path = "../interfaces/transport" }
 ic-types = { path = "../types/types" }
 ic-protobuf = { path = "../protobuf" }
 ic-logger = { path = "../monitoring/logger" }
 ic-metrics = { path = "../monitoring/metrics" }
-ic-registry-client = { path = "../registry/client" }
+ic-registry-client-helpers = { path = "../registry/helpers" }
 ic-registry-subnet-type = { path = "../registry/subnet_type" }
 linked-hash-map = "0.5.3"
-lru = { version = "0.6.0", default-features = false }
+lru = { version = "0.7.1", default-features = false }
+parking_lot = "0.11.1"
 phantom_newtype = { path = "../phantom_newtype" }
 prometheus = { version = "0.12.0", features = [ "process" ] }
 serde = { version = "1.0.99", features = [ "derive" ] }
 slog = { version = "2.5.2", features = ["nested-values", "max_level_trace", "release_max_level_debug"] }
-strum = "0.18.0"
-strum_macros = "0.18.0"
-tokio = { version = "1.9.0", features = ["full"] }
-tower-service = "0.3.1"
+strum = "0.23.0"
+strum_macros = "0.23.0"
+threadpool = "1.8.1"
+tokio = { version = "1.15.0", features = ["full"] }
+tower = { version = "0.4.11", features = ["util"] }
 
 [dev-dependencies]
 ic-consensus-message = { path = "../consensus/message" }
+ic-cycles-account-manager = { path = "../cycles_account_manager" }
 ic-execution-environment = { path = "../execution_environment" }
-ic-registry-common = { path = "../registry/common" }
-ic-test-utilities = { path = "../test_utilities" }
-ic-registry-subnet-type = { path = "../registry/subnet_type" }
 ic-logger = { path = "../monitoring/logger" }
-ic-transport = { path = "../transport" }
+ic-registry-common = { path = "../registry/common" }
+ic-registry-client = { path = "../registry/client" }
+ic-registry-client-fake = { path = "../registry/fake" }
+ic-registry-subnet-type = { path = "../registry/subnet_type" }
 ic-replica-setup-ic-network = { path = "../replica/setup_ic_network" }
+ic-test-utilities = { path = "../test_utilities" }
+ic-test-utilities-registry = { path = "../test_utilities/registry" }
 mockall = "0.7.2"
-tempfile = "3.1.0"
 proptest = "0.9.4"
+tempfile = "3.1.0"
 
 [features]
 malicious_code = ["ic-artifact-manager/malicious_code"]

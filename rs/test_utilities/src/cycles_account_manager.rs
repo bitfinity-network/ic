@@ -59,10 +59,14 @@ impl CyclesAccountManagerBuilder {
         self
     }
 
+    pub fn with_ecdsa_signature_fee(mut self, ecdsa_signature_fee: Cycles) -> Self {
+        self.config.ecdsa_signature_fee = ecdsa_signature_fee;
+        self
+    }
+
     pub fn build(self) -> CyclesAccountManager {
         CyclesAccountManager::new(
             self.max_num_instructions,
-            self.cycles_limit_per_canister,
             self.subnet_type,
             self.subnet_id,
             self.config,

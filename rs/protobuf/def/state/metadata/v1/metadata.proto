@@ -5,6 +5,7 @@ import "state/ingress/v1/ingress.proto";
 import "state/queues/v1/queues.proto";
 import "registry/routing_table/v1/routing_table.proto";
 import "registry/subnet/v1/subnet.proto";
+import "registry/crypto/v1/crypto.proto";
 import "google/protobuf/wrappers.proto";
 
 message NodeTopology {
@@ -23,6 +24,8 @@ message SubnetTopology {
     // https://sdk.dfinity.org/docs/interface-spec/index.html#certification)
     bytes public_key = 2;
     registry.subnet.v1.SubnetType subnet_type = 3;
+    registry.subnet.v1.SubnetFeatures subnet_features = 4;
+    repeated registry.crypto.v1.EcdsaKeyId ecdsa_keys_held = 5;
 }
 
 message SubnetsEntry {
@@ -30,10 +33,18 @@ message SubnetsEntry {
     SubnetTopology subnet_topology = 2;
 }
 
+message EcdsaKeyEntry {
+    reserved 1;
+    registry.crypto.v1.EcdsaKeyId key_id = 3;
+    repeated types.v1.SubnetId subnet_ids = 2;
+}
+
 message NetworkTopology {
     repeated SubnetsEntry subnets = 1;
     registry.routing_table.v1.RoutingTable routing_table = 2;
     types.v1.SubnetId nns_subnet_id = 3;
+    registry.routing_table.v1.CanisterMigrations canister_migrations = 4;
+    repeated EcdsaKeyEntry ecdsa_keys = 5;
 }
 
 message SetupInitialDkgContext {
@@ -54,13 +65,55 @@ message SignWithEcdsaContext {
     state.queues.v1.Request request = 1;
     bytes pseudo_random_id = 2;
     bytes message_hash = 3;
-    bytes derivation_path = 4;
+    reserved 4;
+    reserved "derivation_path";
     uint64 batch_time = 5;
+    repeated bytes derivation_path_vec = 6;
 }
 
 message SignWithEcdsaContextTree {
     uint64 callback_id = 1;
     SignWithEcdsaContext context = 2;
+}
+
+enum HttpMethod {
+    HTTP_METHOD_UNSPECIFIED = 0;
+    HTTP_METHOD_GET = 1;
+}
+
+message HttpHeader {
+    string name = 1;
+    string value = 2;
+}
+
+message CanisterHttpRequestContext {
+    state.queues.v1.Request request = 1;
+    string url = 2;
+    google.protobuf.BytesValue body = 3;
+    google.protobuf.StringValue transform_method_name = 4;
+    HttpMethod http_method = 8;
+    uint64 time = 6;
+    repeated HttpHeader headers = 7;
+    
+    reserved 5;
+}
+
+message CanisterHttpRequestContextTree {
+    uint64 callback_id = 1;
+    CanisterHttpRequestContext context = 2;
+}
+
+message EcdsaDealingsContext {
+    state.queues.v1.Request request = 1;
+    reserved 2;
+    repeated types.v1.NodeId nodes = 3;
+    uint64 registry_version = 4;
+    registry.crypto.v1.EcdsaKeyId key_id = 5;
+}
+
+message EcdsaDealingsContextTree {
+    uint64 callback_id = 1;
+    EcdsaDealingsContext context = 2;
 }
 
 message SubnetCallContextManager {
@@ -69,7 +122,10 @@ message SubnetCallContextManager {
     reserved "contexts";
     repeated SetupInitialDkgContextTree setup_initial_dkg_contexts = 3;
     repeated SignWithEcdsaContextTree sign_with_ecdsa_contexts = 4;
-    repeated SignWithEcdsaContextTree sign_with_mock_ecdsa_contexts = 5;
+    reserved 5;
+    reserved "sign_with_mock_ecdsa_contexts";
+    repeated CanisterHttpRequestContextTree canister_http_request_contexts = 6;
+    repeated EcdsaDealingsContextTree ecdsa_dealings_contexts = 7;
 }
 
 message TimeOfLastAllocationCharge {

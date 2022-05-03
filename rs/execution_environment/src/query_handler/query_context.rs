@@ -39,25 +39,25 @@ use super::query_allocations::QueryAllocationsUsed;
 use crate::{
     hypervisor::Hypervisor,
     metrics::{MeasurementScope, QueryHandlerMetrics},
-    QueryExecutionType,
+    NonReplicatedQueryKind, QueryExecutionType,
 };
 use ic_base_types::NumBytes;
+use ic_error_types::{ErrorCode, RejectCode, UserError};
 use ic_interfaces::execution_environment::{
-    ExecutionParameters, HypervisorError, HypervisorResult, SubnetAvailableMemory,
+    ExecutionMode, ExecutionParameters, HypervisorError, HypervisorResult, SubnetAvailableMemory,
 };
 use ic_logger::{debug, error, fatal, warn, ReplicaLogger};
-use ic_registry_routing_table::RoutingTable;
 use ic_registry_subnet_type::SubnetType;
-use ic_replicated_state::{CallContextAction, CallOrigin, CanisterState, ReplicatedState};
-use ic_system_api::NonReplicatedQueryKind;
+use ic_replicated_state::{
+    CallContextAction, CallOrigin, CanisterState, NetworkTopology, ReplicatedState,
+};
 use ic_types::{
     ingress::WasmResult,
     messages::{
         CallContextId, CallbackId, Payload, RejectContext, Request, RequestOrResponse, Response,
         UserQuery,
     },
-    user_error::{ErrorCode, RejectCode, UserError},
-    CanisterId, Cycles, NumInstructions, NumMessages, PrincipalId, QueryAllocation, SubnetId,
+    CanisterId, Cycles, NumInstructions, NumMessages, PrincipalId, QueryAllocation,
 };
 use std::{
     collections::BTreeMap,
@@ -97,11 +97,10 @@ fn generate_response(request: Request, payload: Payload) -> Response {
 pub(super) struct QueryContext<'a> {
     log: &'a ReplicaLogger,
     hypervisor: &'a Hypervisor,
-    own_subnet_id: SubnetId,
     own_subnet_type: SubnetType,
     // The state against which all queries in the context will be executed.
     state: Arc<ReplicatedState>,
-    routing_table: Arc<RoutingTable>,
+    network_topology: Arc<NetworkTopology>,
     data_certificate: Vec<u8>,
     canisters: BTreeMap<CanisterId, CanisterState>,
     outstanding_requests: Vec<Request>,
@@ -120,7 +119,6 @@ impl<'a> QueryContext<'a> {
     pub(super) fn new(
         log: &'a ReplicaLogger,
         hypervisor: &'a Hypervisor,
-        own_subnet_id: SubnetId,
         own_subnet_type: SubnetType,
         state: Arc<ReplicatedState>,
         data_certificate: Vec<u8>,
@@ -129,11 +127,10 @@ impl<'a> QueryContext<'a> {
         max_canister_memory_size: NumBytes,
         max_instructions_per_message: NumInstructions,
     ) -> Self {
-        let routing_table = Arc::clone(&state.metadata.network_topology.routing_table);
+        let network_topology = Arc::new(state.metadata.network_topology.clone());
         Self {
             log,
             hypervisor,
-            own_subnet_id,
             own_subnet_type,
             canisters: BTreeMap::new(),
             outstanding_requests: Vec::new(),
@@ -141,7 +138,7 @@ impl<'a> QueryContext<'a> {
             state,
             data_certificate,
             query_allocations_used,
-            routing_table,
+            network_topology,
             subnet_available_memory,
             max_canister_memory_size,
             max_instructions_per_message,
@@ -166,7 +163,7 @@ impl<'a> QueryContext<'a> {
     ) -> Result<WasmResult, UserError> {
         let canister_id = query.receiver;
         debug!(self.log, "Executing query for {}", canister_id);
-        let old_canister = self.get_canister_from_state(&canister_id)?;
+        let old_canister = self.state.get_active_canister(&canister_id)?;
         let call_origin = CallOrigin::Query(query.source);
         // EXC-500: Contain the usage of inter-canister query calls to the subnets
         // that currently use it until we decide on the future of this feature and
@@ -201,7 +198,7 @@ impl<'a> QueryContext<'a> {
             if let Err(HypervisorError::ContractViolation(..)) = result {
                 let measurement_scope =
                     MeasurementScope::nested(&metrics.query_retry_call, measurement_scope);
-                let old_canister = self.get_canister_from_state(&canister_id)?;
+                let old_canister = self.state.get_active_canister(&canister_id)?;
                 let (new_canister, new_result) = self.execute_query(
                     old_canister,
                     call_origin,
@@ -303,7 +300,7 @@ impl<'a> QueryContext<'a> {
     ) -> CallContextId {
         let canister_id = canister.canister_id();
         // The `unwrap()` here is safe as we ensured that the canister has a call
-        // context manager in `get_canister_from_state()`.
+        // context manager in `get_active_canister()`.
         let manager = canister
             .system_state
             .call_context_manager_mut()
@@ -314,7 +311,7 @@ impl<'a> QueryContext<'a> {
                     canister_id
                 )
             });
-        manager.new_call_context(call_origin, Cycles::from(0))
+        manager.new_call_context(call_origin, Cycles::from(0), self.state.time())
     }
 
     // A helper function that enqueues any outgoing requests that the canister
@@ -331,7 +328,7 @@ impl<'a> QueryContext<'a> {
             .unwrap_or_else(|| {
                 fatal!(
                     self.log,
-                    "Canister {}: Expected to find a CallContextmanager",
+                    "Canister {}: Expected to find a CallContextManager",
                     canister_id
                 )
             });
@@ -415,7 +412,7 @@ impl<'a> QueryContext<'a> {
         let (canister, instructions_left, result) = self.hypervisor.execute_query(
             QueryExecutionType::NonReplicated {
                 call_context_id,
-                routing_table: Arc::clone(&self.routing_table),
+                network_topology: Arc::clone(&self.network_topology),
                 query_kind,
             },
             method_name,
@@ -473,13 +470,6 @@ impl<'a> QueryContext<'a> {
             .unwrap();
         let call_context_id = callback.call_context_id;
 
-        // We do not support inter canister queries between subnets so
-        // we can use nominal values for these fields to satisfy the
-        // constraints.
-        let mut subnet_records = BTreeMap::new();
-        subnet_records.insert(self.own_subnet_id, self.own_subnet_type);
-        let subnet_records = Arc::new(subnet_records);
-
         let instruction_limit = self.max_instructions_per_message.min(
             self.query_allocations_used
                 .write()
@@ -497,10 +487,8 @@ impl<'a> QueryContext<'a> {
                 // No cycles are refunded in a response to a query call.
                 Cycles::from(0),
                 self.state.time(),
-                Arc::clone(&self.routing_table),
-                subnet_records,
+                Arc::clone(&self.network_topology),
                 execution_parameters,
-                self.state.metadata.network_topology.nns_subnet_id,
             );
         let instructions_executed = instruction_limit - instructions_left;
         measurement_scope.add(instructions_executed, NumMessages::from(1));
@@ -512,32 +500,6 @@ impl<'a> QueryContext<'a> {
                 QueryAllocation::from(instructions_executed),
             );
         (canister, call_context_id, call_origin, execution_result)
-    }
-
-    // Loads a fresh version of the canister from the state and ensures that it
-    // has a call context manager i.e. it is not stopped.
-    fn get_canister_from_state(
-        &self,
-        canister_id: &CanisterId,
-    ) -> Result<CanisterState, UserError> {
-        let canister = self.state.canister_state(canister_id).ok_or_else(|| {
-            UserError::new(
-                ErrorCode::CanisterNotFound,
-                format!("Canister {} not found", canister_id),
-            )
-        })?;
-
-        if canister.system_state.call_context_manager().is_none() {
-            Err(UserError::new(
-                ErrorCode::CanisterStopped,
-                format!(
-                    "Canister {} is stopped and therefore does not have a CallContextManager",
-                    canister.canister_id()
-                ),
-            ))
-        } else {
-            Ok(canister.clone())
-        }
     }
 
     // Executes a query sent from one canister to another. If a loop in the call
@@ -563,7 +525,7 @@ impl<'a> QueryContext<'a> {
             error!(self.log, "[EXC-BUG] The canister that we want to execute a request on should not already be loaded.");
         }
 
-        let canister = match self.get_canister_from_state(&request.receiver) {
+        let canister = match self.state.get_active_canister(&request.receiver) {
             Ok(canister) => canister,
             Err(err) => {
                 let payload = Payload::Reject(RejectContext::from(err));
@@ -923,11 +885,13 @@ impl<'a> QueryContext<'a> {
         instruction_limit: NumInstructions,
     ) -> ExecutionParameters {
         ExecutionParameters {
-            instruction_limit,
+            total_instruction_limit: instruction_limit,
+            slice_instruction_limit: instruction_limit,
             canister_memory_limit: canister.memory_limit(self.max_canister_memory_size),
             subnet_available_memory: self.subnet_available_memory.clone(),
             compute_allocation: canister.scheduler_state.compute_allocation,
             subnet_type: self.own_subnet_type,
+            execution_mode: ExecutionMode::NonReplicated,
         }
     }
 }

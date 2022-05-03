@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use ic_metrics::{
     buckets::{decimal_buckets, decimal_buckets_with_zero, linear_buckets},
     MetricsRegistry,
@@ -6,12 +8,19 @@ use ic_types::nominal_cycles::NominalCycles;
 use prometheus::{Gauge, Histogram, IntCounter, IntGauge, IntGaugeVec};
 
 use crate::metrics::{
-    duration_histogram, instructions_histogram, messages_histogram, ScopedMetrics,
+    cycles_histogram, duration_histogram, instructions_histogram, memory_histogram,
+    messages_histogram, ScopedMetrics,
 };
 
 pub(super) struct SchedulerMetrics {
     pub(super) canister_age: Histogram,
     pub(super) canister_compute_allocation_violation: IntCounter,
+    pub(super) canister_balance: Histogram,
+    pub(super) canister_binary_size: Histogram,
+    pub(super) canister_wasm_memory_usage: Histogram,
+    pub(super) canister_stable_memory_usage: Histogram,
+    pub(super) canister_memory_allocation: Histogram,
+    pub(super) canister_compute_allocation: Histogram,
     pub(super) compute_utilization_per_core: Histogram,
     pub(super) instructions_consumed_per_message: Histogram,
     pub(super) instructions_consumed_per_round: Histogram,
@@ -55,11 +64,18 @@ pub(super) struct SchedulerMetrics {
     pub(super) execution_round_failed_heartbeat_executions: IntCounter,
     pub(super) canister_heap_delta_debits: Histogram,
     pub(super) heap_delta_rate_limited_canisters_per_round: Histogram,
+    pub(super) canisters_not_in_routing_table: IntGauge,
+    pub(super) canister_install_code_debits: Histogram,
+    pub(super) old_open_call_contexts: IntGaugeVec,
 }
 
 const LABEL_MESSAGE_KIND: &str = "kind";
 pub(super) const MESSAGE_KIND_INGRESS: &str = "ingress";
 pub(super) const MESSAGE_KIND_CANISTER: &str = "canister";
+
+/// Alert for call contexts older than this cutoff (one day).
+pub(super) const OLD_CALL_CONTEXT_CUTOFF_ONE_DAY: Duration = Duration::from_secs(60 * 60 * 24);
+pub(super) const OLD_CALL_CONTEXT_LABEL_ONE_DAY: &str = "1d";
 
 impl SchedulerMetrics {
     pub(super) fn new(metrics_registry: &MetricsRegistry) -> Self {
@@ -73,6 +89,36 @@ impl SchedulerMetrics {
             canister_compute_allocation_violation: metrics_registry.int_counter(
                 "scheduler_compute_allocation_violations",
                 "Total number of canister allocation violations.",
+            ),
+            canister_balance: cycles_histogram(
+                "canister_balance_cycles",
+                "Canisters balance distribution in Cycles.",
+                metrics_registry,
+            ),
+            canister_binary_size: memory_histogram(
+                "canister_binary_size_bytes",
+                "Canisters WASM binary size distribution in bytes.",
+                metrics_registry,
+            ),
+            canister_wasm_memory_usage: memory_histogram(
+                "canister_wasm_memory_usage_bytes",
+                "Canisters WASM memory usage distribution in bytes.",
+                metrics_registry,
+            ),
+            canister_stable_memory_usage: memory_histogram(
+                "canister_stable_memory_usage_bytes",
+                "Canisters stable memory usage distribution in bytes.",
+                metrics_registry,
+            ),
+            canister_memory_allocation: memory_histogram(
+                "canister_memory_allocation_bytes",
+                "Canisters memory allocation distribution in bytes.",
+                metrics_registry,
+            ),
+            canister_compute_allocation: metrics_registry.histogram(
+                "canister_compute_allocation_ratio",
+                "Canisters compute allocation distribution ratio (0-1).",
+                linear_buckets(0.0, 0.1, 11),
             ),
             compute_utilization_per_core: metrics_registry.histogram(
                 "scheduler_compute_utilization_per_core",
@@ -412,6 +458,21 @@ impl SchedulerMetrics {
                 "Number of canisters that were heap delta rate limited in a given round.",
                 // 0, 1, 2, 5, …, 1000, 2000, 5000
                 decimal_buckets_with_zero(0, 3),
+            ),
+            canisters_not_in_routing_table: metrics_registry.int_gauge(
+                "replicated_state_canisters_not_in_routing_table",
+                "Number of canisters in the state not assigned to the subnet range in the routing table."
+            ),
+            canister_install_code_debits: instructions_histogram(
+                "scheduler_canister_install_code_debits",
+                "The install code debit of a canister at the end of the round, before \
+                subtracting the rate limit allowed amount",
+                metrics_registry,
+            ),
+            old_open_call_contexts: metrics_registry.int_gauge_vec(
+                "scheduler_old_open_call_contexts",
+                "Number of call contexts that have been open for more than the given age.",
+                &["age"]
             ),
         }
     }

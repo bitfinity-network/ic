@@ -15,8 +15,7 @@ use phantom_newtype::Id;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 use proptest_derive::Arbitrary;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
-use std::fmt;
+use std::{collections::BTreeSet, fmt, str::FromStr};
 use strum_macros::EnumIter;
 
 /// An id of a key. These ids are used to refer to entries in the crypto secret
@@ -104,6 +103,22 @@ pub enum KeyPurpose {
     IDkgMEGaEncryption = 5,
 }
 
+// FromStr implementation for the the registry admin tool.
+impl FromStr for KeyPurpose {
+    type Err = String;
+
+    fn from_str(string: &str) -> Result<Self, <Self as FromStr>::Err> {
+        match string {
+            "node_signing" => Ok(KeyPurpose::NodeSigning),
+            "query_response_signing" => Ok(KeyPurpose::QueryResponseSigning),
+            "dkg_dealing_encryption" => Ok(KeyPurpose::DkgDealingEncryption),
+            "committee_signing" => Ok(KeyPurpose::CommitteeSigning),
+            "idkg_mega_encryption" => Ok(KeyPurpose::IDkgMEGaEncryption),
+            _ => Err(format!("Invalid key purpose: {:?}", string)),
+        }
+    }
+}
+
 /// An algorithm ID. This is used to specify the signature algorithm associated
 /// with a public key.
 #[derive(
@@ -128,6 +143,7 @@ pub enum AlgorithmId {
     IcCanisterSignature = 13,
     RsaSha256 = 14,
     ThresholdEcdsaSecp256k1 = 15,
+    MegaSecp256k1 = 16,
 }
 
 impl From<CspThresholdSigPublicKey> for AlgorithmId {
@@ -153,6 +169,7 @@ impl From<usize> for KeyPurpose {
             2 => KeyPurpose::QueryResponseSigning,
             3 => KeyPurpose::DkgDealingEncryption,
             4 => KeyPurpose::CommitteeSigning,
+            5 => KeyPurpose::IDkgMEGaEncryption,
             _ => KeyPurpose::Placeholder,
         }
     }
@@ -176,6 +193,7 @@ impl From<i32> for AlgorithmId {
             13 => AlgorithmId::IcCanisterSignature,
             14 => AlgorithmId::RsaSha256,
             15 => AlgorithmId::ThresholdEcdsaSecp256k1,
+            16 => AlgorithmId::MegaSecp256k1,
             _ => AlgorithmId::Placeholder,
         }
     }
@@ -557,7 +575,7 @@ impl<T: CountBytes> CountBytes for BasicSigOf<T> {
 }
 
 /// An individual multi-signature.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 pub struct IndividualMultiSig(#[serde(with = "serde_bytes")] pub Vec<u8>);
 /// An individual multi-signature for content of type `T`
 pub type IndividualMultiSigOf<T> = Id<T, IndividualMultiSig>; // Use newtype instead?
@@ -575,7 +593,7 @@ impl<T: CountBytes> CountBytes for IndividualMultiSigOf<T> {
 }
 
 /// A combined multi-signature.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 pub struct CombinedMultiSig(#[serde(with = "serde_bytes")] pub Vec<u8>);
 /// A combined multi-signature for content of type `T`
 pub type CombinedMultiSigOf<T> = Id<T, CombinedMultiSig>; // Use newtype instead?
@@ -593,7 +611,7 @@ impl<T: CountBytes> CountBytes for CombinedMultiSigOf<T> {
 }
 
 /// A threshold signature share.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 pub struct ThresholdSigShare(#[serde(with = "serde_bytes")] pub Vec<u8>);
 /// A threshold signature share for content of type `T`
 pub type ThresholdSigShareOf<T> = Id<T, ThresholdSigShare>; // Use newtype instead?

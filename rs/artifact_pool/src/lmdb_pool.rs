@@ -1,23 +1,32 @@
 use crate::consensus_pool::{InitializablePoolSection, PoolSectionOp, PoolSectionOps};
-use crate::lmdb_iterator::LMDBIterator;
+use crate::lmdb_iterator::{LMDBEcdsaIterator, LMDBIterator};
+use crate::metrics::EcdsaPoolMetrics;
 use ic_config::artifact_pool::LMDBConfig;
 use ic_consensus_message::ConsensusMessageHashable;
+use ic_ecdsa_object::ecdsa_msg_hash;
 use ic_interfaces::{
     artifact_pool::ValidatedArtifact,
     consensus_pool::{
         HeightIndexedPool, HeightRange, OnlyError, PoolSection, ValidatedConsensusArtifact,
     },
     crypto::CryptoHashable,
+    ecdsa::{EcdsaPoolSection, MutableEcdsaPoolSection},
 };
-use ic_logger::{error, ReplicaLogger};
+use ic_logger::{error, info, ReplicaLogger};
+use ic_metrics::MetricsRegistry;
 use ic_protobuf::types::v1 as pb;
 use ic_types::{
-    artifact::{CertificationMessageId, ConsensusMessageId},
+    artifact::{CertificationMessageId, ConsensusMessageId, EcdsaMessageId},
     batch::BatchPayload,
     consensus::{
         catchup::CUPWithOriginalProtobuf,
         certification::{Certification, CertificationMessage, CertificationShare},
-        dkg, BlockPayload, BlockProposal, CatchUpPackage, CatchUpPackageShare, ConsensusMessage,
+        dkg,
+        ecdsa::{
+            EcdsaComplaint, EcdsaDealingSupport, EcdsaMessage, EcdsaMessageHash, EcdsaMessageType,
+            EcdsaOpening, EcdsaSigShare, EcdsaSignedDealing,
+        },
+        BlockPayload, BlockProposal, CatchUpPackage, CatchUpPackageShare, ConsensusMessage,
         ConsensusMessageHash, Finalization, FinalizationShare, HasHeight, Notarization,
         NotarizationShare, Payload, RandomBeacon, RandomBeaconShare, RandomTape, RandomTapeShare,
     },
@@ -30,8 +39,10 @@ use lmdb::{
 };
 use serde::{Deserialize, Serialize};
 use std::convert::{TryFrom, TryInto};
+use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::{os::raw::c_uint, path::Path, sync::Arc};
+use strum::IntoEnumIterator;
 
 /// Implementation of a persistent, height indexed pool using LMDB.
 ///
@@ -283,6 +294,34 @@ const MAX_PERSISTENT_POOL_SIZE: usize = 0x0010_0000_0000; // 64GB
 /// Max number of DB readers.
 const MAX_READERS: c_uint = 2048;
 
+fn create_db_env(path: &Path, read_only: bool, max_dbs: c_uint) -> Environment {
+    let mut builder = Environment::new();
+    let mut builder_flags = EnvironmentFlags::NO_TLS;
+    let mut permission = 0o644;
+    if read_only {
+        builder_flags |= EnvironmentFlags::READ_ONLY;
+        builder_flags |= EnvironmentFlags::NO_LOCK;
+        permission = 0o444;
+    }
+    builder.set_flags(builder_flags);
+    builder.set_max_readers(MAX_READERS);
+    builder.set_max_dbs(max_dbs);
+    builder.set_map_size(MAX_PERSISTENT_POOL_SIZE);
+    let db_env = builder
+        .open_with_permissions(path, permission)
+        .unwrap_or_else(|err| panic!("Error opening LMDB environment at {:?}: {:?}", path, err));
+
+    unsafe {
+        // Mark fds created by lmdb as FD_CLOEXEC to prevent them from leaking into
+        // canister sandbox process. Details in NODE-166
+        let mut fd: lmdb_sys::mdb_filehandle_t = lmdb_sys::mdb_filehandle_t::default();
+        lmdb_sys::mdb_env_get_fd(db_env.env(), &mut fd);
+        nix::fcntl::fcntl(fd, nix::fcntl::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC))
+            .expect("Unable to mark FD_CLOEXEC");
+    };
+    db_env
+}
+
 ///////////////////////////// Generic Pool /////////////////////////////
 
 /// Collection of generic pool functions, indexed by Artifact type.
@@ -296,32 +335,7 @@ impl<Artifact: PoolArtifact> PersistentHeightIndexedPool<Artifact> {
         log: ReplicaLogger,
     ) -> PersistentHeightIndexedPool<Artifact> {
         let type_keys = Artifact::type_keys();
-        let mut builder = Environment::new();
-        let mut builder_flags = EnvironmentFlags::NO_TLS;
-        let mut permission = 0o644;
-        if read_only {
-            builder_flags |= EnvironmentFlags::READ_ONLY;
-            builder_flags |= EnvironmentFlags::NO_LOCK;
-            permission = 0o444;
-        }
-        builder.set_flags(builder_flags);
-        builder.set_max_readers(MAX_READERS);
-        builder.set_max_dbs((type_keys.len() + 2) as c_uint);
-        builder.set_map_size(MAX_PERSISTENT_POOL_SIZE);
-        let db_env = builder
-            .open_with_permissions(path, permission)
-            .unwrap_or_else(|err| {
-                panic!("Error opening LMDB environment at {:?}: {:?}", path, err)
-            });
-
-        unsafe {
-            // Mark fds created by lmdb as FD_CLOEXEC to prevent them from leaking into
-            // canister sandbox process. Details in NODE-166
-            let mut fd: lmdb_sys::mdb_filehandle_t = lmdb_sys::mdb_filehandle_t::default();
-            lmdb_sys::mdb_env_get_fd(db_env.env(), &mut fd);
-            nix::fcntl::fcntl(fd, nix::fcntl::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC))
-                .expect("Unable to mark FD_CLOEXEC");
-        };
+        let db_env = create_db_env(path, read_only, (type_keys.len() + 2) as c_uint);
 
         // Create all databases.
         let meta = if read_only {
@@ -839,6 +853,7 @@ impl PoolArtifact for ConsensusMessage {
                     (
                         BatchPayload::default(),
                         dkg::Dealings::new_empty(start_height),
+                        None,
                     )
                         .into()
                 }),
@@ -1258,16 +1273,391 @@ impl crate::certification_pool::MutablePoolSection
     }
 }
 
+///////////////////////////// ECDSA Pool /////////////////////////////
+
+impl From<EcdsaMessageHash> for IdKey {
+    fn from(msg_hash: EcdsaMessageHash) -> IdKey {
+        let bytes = match msg_hash {
+            EcdsaMessageHash::EcdsaSignedDealing(hash) => hash.get().0,
+            EcdsaMessageHash::EcdsaDealingSupport(hash) => hash.get().0,
+            EcdsaMessageHash::EcdsaSigShare(hash) => hash.get().0,
+            EcdsaMessageHash::EcdsaComplaint(hash) => hash.get().0,
+            EcdsaMessageHash::EcdsaOpening(hash) => hash.get().0,
+        };
+        IdKey(bytes)
+    }
+}
+
+/// The per-message type DB
+struct EcdsaMessageDb {
+    db_env: Arc<Environment>,
+    db: Database,
+    object_type: EcdsaMessageType,
+    metrics: EcdsaPoolMetrics,
+    log: ReplicaLogger,
+}
+
+impl EcdsaMessageDb {
+    fn new(
+        db_env: Arc<Environment>,
+        db: Database,
+        object_type: EcdsaMessageType,
+        metrics: EcdsaPoolMetrics,
+        log: ReplicaLogger,
+    ) -> Self {
+        Self {
+            db_env,
+            db,
+            object_type,
+            metrics,
+            log,
+        }
+    }
+
+    fn insert_object(&self, message: EcdsaMessage) {
+        assert_eq!(EcdsaMessageType::from(&message), self.object_type);
+        let key = IdKey::from(ecdsa_msg_hash(&message));
+        let bytes = match bincode::serialize::<EcdsaMessage>(&message) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                error!(
+                    self.log,
+                    "EcdsaMessageDb::insert(): serialize(): {:?}/{:?}", key, err
+                );
+                self.metrics.persistence_error("insert_serialize");
+                return;
+            }
+        };
+
+        let mut tx = match self.db_env.begin_rw_txn() {
+            Ok(tx) => tx,
+            Err(err) => {
+                error!(
+                    self.log,
+                    "EcdsaMessageDb::insert(): begin_rw_txn(): {:?}/{:?}", key, err
+                );
+                self.metrics.persistence_error("insert_begin_rw_txn");
+                return;
+            }
+        };
+
+        if let Err(err) = tx.put(self.db, &key, &bytes, WriteFlags::empty()) {
+            error!(
+                self.log,
+                "EcdsaMessageDb::insert(): tx.put(): {:?}/{:?}", key, err
+            );
+            self.metrics.persistence_error("insert_tx_put");
+            return;
+        }
+
+        match tx.commit() {
+            Ok(()) => self.metrics.observe_insert(),
+            Err(err) => {
+                error!(
+                    self.log,
+                    "EcdsaMessageDb::insert(): tx.commit(): {:?}/{:?}", key, err
+                );
+                self.metrics.persistence_error("insert_tx_commit");
+            }
+        }
+    }
+
+    fn get_object(&self, id: &EcdsaMessageHash) -> Option<EcdsaMessage> {
+        let key = IdKey::from(id.clone());
+        let tx = match self.db_env.begin_ro_txn() {
+            Ok(tx) => tx,
+            Err(err) => {
+                error!(
+                    self.log,
+                    "EcdsaMessageDb::get(): begin_ro_txn(): {:?}/{:?}", key, err
+                );
+                self.metrics.persistence_error("get_begin_ro_txn");
+                return None;
+            }
+        };
+
+        let bytes = match tx.get(self.db, &key) {
+            Ok(bytes) => bytes,
+            Err(lmdb::Error::NotFound) => return None,
+            Err(err) => {
+                error!(
+                    self.log,
+                    "EcdsaMessageDb::get(): tx.get(): {:?}/{:?}", key, err
+                );
+                self.metrics.persistence_error("get_tx_get");
+                return None;
+            }
+        };
+
+        match bincode::deserialize::<EcdsaMessage>(bytes) {
+            Ok(msg) => Some(msg),
+            Err(err) => {
+                error!(
+                    self.log,
+                    "EcdsaMessageDb::get(): deserialize(): {:?}/{:?}", key, err
+                );
+                self.metrics.persistence_error("get_deserialize");
+                None
+            }
+        }
+    }
+
+    fn remove_object(&self, id: &EcdsaMessageHash) -> bool {
+        let key = IdKey::from(id.clone());
+        let mut tx = match self.db_env.begin_rw_txn() {
+            Ok(tx) => tx,
+            Err(err) => {
+                error!(
+                    self.log,
+                    "EcdsaMessageDb::remove(): begin_rw_txn(): {:?}/{:?}", key, err
+                );
+                self.metrics.persistence_error("remove_begin_rw_txn");
+                return false;
+            }
+        };
+
+        if let Err(err) = tx.del(self.db, &key, None) {
+            error!(
+                self.log,
+                "EcdsaMessageDb::remove(): tx.del(): {:?}/{:?}", key, err
+            );
+            self.metrics.persistence_error("remove_tx_del");
+            return false;
+        }
+
+        match tx.commit() {
+            Ok(()) => {
+                self.metrics.observe_remove();
+                true
+            }
+            Err(lmdb::Error::NotFound) => false,
+            Err(err) => {
+                error!(
+                    self.log,
+                    "EcdsaMessageDb::remove(): tx.commit(): {:?}/{:?}", key, err
+                );
+                self.metrics.persistence_error("remove_tx_commit");
+                false
+            }
+        }
+    }
+
+    fn iter<T: TryFrom<EcdsaMessage>>(&self) -> Box<dyn Iterator<Item = (EcdsaMessageId, T)> + '_>
+    where
+        <T as TryFrom<EcdsaMessage>>::Error: Debug,
+    {
+        let message_type = self.object_type;
+        let log = self.log.clone();
+        let deserialize_fn = move |key: &[u8], bytes: &[u8]| {
+            // Convert key bytes to outer hash
+            let mut hash_bytes = Vec::<u8>::new();
+            hash_bytes.extend_from_slice(key);
+            let id = EcdsaMessageHash::from((message_type, hash_bytes));
+
+            // Deserialize value bytes and convert to inner type
+            let message = match bincode::deserialize::<EcdsaMessage>(bytes) {
+                Ok(message) => message,
+                Err(err) => {
+                    error!(
+                        log,
+                        "EcdsaMessageDb::iter(): deserialize() failed: {:?}/{:?}/{}/{}",
+                        id,
+                        err,
+                        key.len(),
+                        bytes.len()
+                    );
+                    return None;
+                }
+            };
+
+            match T::try_from(message) {
+                Ok(inner) => Some((id, inner)),
+                Err(err) => {
+                    error!(
+                        log,
+                        "EcdsaMessageDb::iter(): failed to convert to inner type: {:?}/{:?}/{}/{}",
+                        id,
+                        err,
+                        key.len(),
+                        bytes.len()
+                    );
+                    None
+                }
+            }
+        };
+
+        Box::new(LMDBEcdsaIterator::new(
+            self.db_env.clone(),
+            self.db,
+            deserialize_fn,
+            self.log.clone(),
+        ))
+    }
+}
+
+/// The PersistentEcdsaPoolSection is just a collection of per-message type
+/// backend DBs. The main role is to route the operations to the appropriate
+/// backend DB.
+pub(crate) struct PersistentEcdsaPoolSection {
+    // Per message type data base
+    message_dbs: Vec<(EcdsaMessageType, EcdsaMessageDb)>,
+}
+
+impl PersistentEcdsaPoolSection {
+    pub(crate) fn new_ecdsa_pool(
+        config: LMDBConfig,
+        read_only: bool,
+        log: ReplicaLogger,
+        metrics_registry: MetricsRegistry,
+        pool: &str,
+        pool_type: &str,
+    ) -> Self {
+        let mut type_keys = Vec::new();
+        for message_type in EcdsaMessageType::iter() {
+            type_keys.push((message_type, Self::get_type_key(message_type)));
+        }
+
+        let mut path = config.persistent_pool_validated_persistent_db_path;
+        path.push("ecdsa");
+        if let Err(err) = std::fs::create_dir_all(path.as_path()) {
+            panic!("Error creating ECDSA dir {:?}: {:?}", path, err)
+        }
+        let db_env = Arc::new(create_db_env(
+            path.as_path(),
+            read_only,
+            type_keys.len() as c_uint,
+        ));
+
+        let mut message_dbs = Vec::new();
+        let metrics = EcdsaPoolMetrics::new(metrics_registry, pool, pool_type);
+        for (message_type, type_key) in &type_keys {
+            let db = if read_only {
+                db_env.open_db(Some(type_key.name)).unwrap_or_else(|err| {
+                    panic!("Error opening ECDSA db {}: {:?}", type_key.name, err)
+                })
+            } else {
+                db_env
+                    .create_db(Some(type_key.name), DatabaseFlags::empty())
+                    .unwrap_or_else(|err| {
+                        panic!("Error creating ECDSA db {}: {:?}", type_key.name, err)
+                    })
+            };
+            message_dbs.push((
+                *message_type,
+                EcdsaMessageDb::new(
+                    db_env.clone(),
+                    db,
+                    *message_type,
+                    metrics.clone(),
+                    log.clone(),
+                ),
+            ));
+        }
+
+        info!(
+            log,
+            "PersistentEcdsaPoolSection::new_ecdsa_pool(): num_dbs = {}",
+            type_keys.len()
+        );
+        Self { message_dbs }
+    }
+
+    fn insert_object(&self, message: EcdsaMessage) {
+        let message_db = self.get_message_db(EcdsaMessageType::from(&message));
+        message_db.insert_object(message);
+    }
+
+    fn get_object(&self, id: &EcdsaMessageHash) -> Option<EcdsaMessage> {
+        let message_db = self.get_message_db(EcdsaMessageType::from(id));
+        message_db.get_object(id)
+    }
+
+    fn remove_object(&mut self, id: &EcdsaMessageHash) -> bool {
+        let message_db = self.get_message_db(EcdsaMessageType::from(id));
+        message_db.remove_object(id)
+    }
+
+    fn get_message_db(&self, message_type: EcdsaMessageType) -> &EcdsaMessageDb {
+        self.message_dbs
+            .iter()
+            .find(|(db_type, _)| *db_type == message_type)
+            .map(|(_, db)| db)
+            .unwrap()
+    }
+
+    fn get_type_key(message_type: EcdsaMessageType) -> TypeKey {
+        match message_type {
+            EcdsaMessageType::Dealing => TypeKey::new("ECD"),
+            EcdsaMessageType::DealingSupport => TypeKey::new("ECS"),
+            EcdsaMessageType::SigShare => TypeKey::new("ECI"),
+            EcdsaMessageType::Complaint => TypeKey::new("ECC"),
+            EcdsaMessageType::Opening => TypeKey::new("ECO"),
+        }
+    }
+}
+
+impl EcdsaPoolSection for PersistentEcdsaPoolSection {
+    fn contains(&self, msg_id: &EcdsaMessageId) -> bool {
+        self.get_object(msg_id).is_some()
+    }
+
+    fn get(&self, msg_id: &EcdsaMessageId) -> Option<EcdsaMessage> {
+        self.get_object(msg_id)
+    }
+
+    fn signed_dealings(
+        &self,
+    ) -> Box<dyn Iterator<Item = (EcdsaMessageId, EcdsaSignedDealing)> + '_> {
+        let message_db = self.get_message_db(EcdsaMessageType::Dealing);
+        message_db.iter()
+    }
+
+    fn dealing_support(
+        &self,
+    ) -> Box<dyn Iterator<Item = (EcdsaMessageId, EcdsaDealingSupport)> + '_> {
+        let message_db = self.get_message_db(EcdsaMessageType::DealingSupport);
+        message_db.iter()
+    }
+
+    fn signature_shares(&self) -> Box<dyn Iterator<Item = (EcdsaMessageId, EcdsaSigShare)> + '_> {
+        let message_db = self.get_message_db(EcdsaMessageType::SigShare);
+        message_db.iter()
+    }
+
+    fn complaints(&self) -> Box<dyn Iterator<Item = (EcdsaMessageId, EcdsaComplaint)> + '_> {
+        let message_db = self.get_message_db(EcdsaMessageType::Complaint);
+        message_db.iter()
+    }
+
+    fn openings(&self) -> Box<dyn Iterator<Item = (EcdsaMessageId, EcdsaOpening)> + '_> {
+        let message_db = self.get_message_db(EcdsaMessageType::Opening);
+        message_db.iter()
+    }
+}
+
+impl MutableEcdsaPoolSection for PersistentEcdsaPoolSection {
+    fn insert(&mut self, message: EcdsaMessage) {
+        self.insert_object(message)
+    }
+
+    fn remove(&mut self, id: &EcdsaMessageId) -> bool {
+        self.remove_object(id)
+    }
+
+    fn as_pool_section(&self) -> &dyn EcdsaPoolSection {
+        self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consensus_pool::MutablePoolSection;
-    use crate::test_utils::*;
-    use ic_test_utilities::{mock_time, with_test_replica_logger};
-    use ic_types::consensus::BlockProposal;
-    use std::panic;
-    use std::path::Path;
-    use std::time::Duration;
+    use crate::{
+        consensus_pool::MutablePoolSection,
+        test_utils::{fake_random_beacon, random_beacon_ops, PoolTestHelper},
+    };
+    use ic_test_utilities::with_test_replica_logger;
+    use std::{panic, path::PathBuf};
 
     // We test if the binding links to the required LMDB version.
     #[test]
@@ -1300,6 +1690,7 @@ mod tests {
         );
     }
 
+    // TODO: Remove this after it is no longer needed
     // Helper to run the persistence tests below.
     // It creates the config and logger that is passed to the instances and then
     // makes sure that the the databases are destroyed before the test fails.
@@ -1315,332 +1706,61 @@ mod tests {
         })
     }
 
-    // Tests the pool though the PoolSection trait, including inserting
-    // and rebooting.
+    impl PoolTestHelper for LMDBConfig {
+        type PersistentHeightIndexedPool = PersistentHeightIndexedPool<ConsensusMessage>;
+
+        fn run_persistent_pool_test<T, R>(_test_name: &str, test: T) -> R
+        where
+            T: FnOnce(LMDBConfig, ReplicaLogger) -> R + panic::UnwindSafe,
+        {
+            with_test_replica_logger(|log| {
+                ic_test_utilities::artifact_pool_config::with_test_lmdb_pool_config(|config| {
+                    let result = panic::catch_unwind(|| test(config.clone(), log));
+                    assert!(result.is_ok());
+                    result.unwrap()
+                })
+            })
+        }
+
+        fn new_consensus_pool(self, log: ReplicaLogger) -> Self::PersistentHeightIndexedPool {
+            PersistentHeightIndexedPool::new_consensus_pool(self, false, log)
+        }
+
+        fn persistent_pool_validated_persistent_db_path(&self) -> &PathBuf {
+            &self.persistent_pool_validated_persistent_db_path
+        }
+    }
+
     #[test]
     fn test_as_pool_section() {
-        run_persistent_pool_test("test_as_pool_section", |config, log| {
-            let height = Height::from(11);
-            let block_proposal = fake_block_proposal(Height::from(11));
-            let msg = ConsensusMessage::BlockProposal(block_proposal);
-            let msg_expected = msg.clone();
-            let hash = msg_expected.get_cm_hash();
-            let msg_id = ConsensusMessageId { hash, height };
-            // Create a pool and insert an item.
-            {
-                let mut pool = PersistentHeightIndexedPool::new_consensus_pool(
-                    config.clone(),
-                    false,
-                    log.clone(),
-                );
-                let mut ops = PoolSectionOps::new();
-                ops.insert(ValidatedConsensusArtifact {
-                    msg,
-                    timestamp: mock_time(),
-                });
-                pool.mutate(ops);
-            }
-            // Test that we can get the item after rebuilding the pool.
-            {
-                let mut pool = PersistentHeightIndexedPool::new_consensus_pool(
-                    config.clone(),
-                    false,
-                    log.clone(),
-                );
-                assert!(pool.contains(&msg_id));
-                let get_result = pool.get(&msg_id);
-                match get_result {
-                    Some(artifact_result) => {
-                        assert_eq!(artifact_result, msg_expected);
-                    }
-                    None => {
-                        panic!("Get failed");
-                    }
-                }
-                let mut ops = PoolSectionOps::new();
-                ops.remove(msg_id.clone());
-                pool.mutate(ops);
-            }
-            // Test that the item's removal survived a reboot.
-            {
-                let pool = PersistentHeightIndexedPool::new_consensus_pool(config, false, log);
-                assert!(!pool.contains(&msg_id));
-                assert!(pool.get(&msg_id).is_none());
-            }
-        })
+        crate::test_utils::test_as_pool_section::<LMDBConfig>()
     }
 
-    // Tests the pool through the HeightIndexedPool trait.
-    //
-    // This is the most comprehensive functional test. It directly tests all
-    // of the HeightIndexedPool methods, it also indirectly tests whether
-    // reference counting is working properly. This because if we have
-    // reference count leak and some instance of DB is alive, the destroy()
-    // call in run_persistent_pool_test() will fail as it requires exclusive
-    // access to the DB directory.
     #[test]
     fn test_as_height_indexed_pool() {
-        run_persistent_pool_test("test_as_height_indexed_pool", |config, log| {
-            let rb_ops = random_beacon_ops();
-            let fz_ops = finalization_ops();
-            let nz_ops = notarization_ops();
-            let bp_ops = block_proposal_ops();
-            let rbs_ops = random_beacon_share_ops();
-            let nzs_ops = notarization_share_ops();
-            let fzs_ops = finalization_share_ops();
-            let rt_ops = random_tape_ops();
-            let rts_ops = random_tape_share_ops();
-
-            // Insert a bunch of items and test that the pool returns them
-            {
-                let mut pool = PersistentHeightIndexedPool::new_consensus_pool(
-                    config.clone(),
-                    false,
-                    log.clone(),
-                );
-
-                pool.mutate(rb_ops.clone());
-                match_ops_to_results(&rb_ops, pool.random_beacon(), false);
-
-                pool.mutate(fz_ops.clone());
-                match_ops_to_results(&fz_ops, pool.finalization(), false);
-
-                pool.mutate(nz_ops.clone());
-                match_ops_to_results(&nz_ops, pool.notarization(), false);
-
-                pool.mutate(bp_ops.clone());
-                match_ops_to_results(&bp_ops, pool.block_proposal(), false);
-
-                pool.mutate(rbs_ops.clone());
-                match_ops_to_results(&rbs_ops, pool.random_beacon_share(), true);
-
-                pool.mutate(nzs_ops.clone());
-                match_ops_to_results(&nzs_ops, pool.notarization_share(), true);
-
-                pool.mutate(fzs_ops.clone());
-                match_ops_to_results(&fzs_ops, pool.finalization_share(), true);
-
-                pool.mutate(rt_ops.clone());
-                match_ops_to_results(&rt_ops, pool.random_tape(), false);
-
-                pool.mutate(rts_ops.clone());
-                match_ops_to_results(&rts_ops, pool.random_tape_share(), true);
-            }
-
-            // Test the matching after a reboot.
-            {
-                let pool = PersistentHeightIndexedPool::new_consensus_pool(config, false, log);
-                match_ops_to_results(&rb_ops, pool.random_beacon(), false);
-                match_ops_to_results(&fz_ops, pool.finalization(), false);
-                match_ops_to_results(&nz_ops, pool.notarization(), false);
-                match_ops_to_results(&bp_ops, pool.block_proposal(), false);
-                match_ops_to_results(&rbs_ops, pool.random_beacon_share(), true);
-                match_ops_to_results(&nzs_ops, pool.notarization_share(), true);
-                match_ops_to_results(&fzs_ops, pool.finalization_share(), true);
-                match_ops_to_results(&rt_ops, pool.random_tape(), false);
-                match_ops_to_results(&rts_ops, pool.random_tape_share(), true);
-            }
-        })
+        crate::test_utils::test_as_height_indexed_pool::<LMDBConfig>()
     }
 
-    fn make_random_beacon_at_height(i: u64) -> ValidatedConsensusArtifact {
-        let random_beacon = fake_random_beacon(Height::from(i));
-        ValidatedConsensusArtifact {
-            msg: ConsensusMessage::RandomBeacon(random_beacon),
-            timestamp: mock_time(),
-        }
-    }
-
-    fn make_random_beacon_msg_id_at_height(i: u64) -> ConsensusMessageId {
-        let hash = make_random_beacon_at_height(i).msg.get_cm_hash();
-        let height = Height::from(i);
-        ConsensusMessageId { hash, height }
-    }
-
-    fn check_iter_original(iter: Box<dyn Iterator<Item = RandomBeacon>>) {
-        // Now make sure the iterator still sees the old values
-        // and doesn't see the new ones.
-        let msgs_from_pool: Vec<RandomBeacon> = iter.collect();
-        assert_eq!(msgs_from_pool.len(), 16);
-        for i in 3..15 {
-            let msg = &msgs_from_pool[i - 3];
-            assert_eq!(msg.content.height, Height::from(i as u64));
-        }
-    }
-
-    fn check_iter_mutated(iter: Box<dyn Iterator<Item = RandomBeacon>>) {
-        let msgs_from_pool: Vec<RandomBeacon> = iter.collect();
-        assert_eq!(msgs_from_pool.len(), 3);
-        assert_eq!(msgs_from_pool[0].content.height, Height::from(1));
-        assert_eq!(msgs_from_pool[1].content.height, Height::from(2));
-        assert_eq!(msgs_from_pool[2].content.height, Height::from(20));
-    }
-
-    // Tests if payloads are persisted and removed correctly together with block
-    // proposals.
     #[test]
     fn test_block_proposal_and_payload_correspondence() {
-        run_persistent_pool_test(
-            "test_block_proposal_and_payload_correspondence",
-            |config, log| {
-                let insert_ops = block_proposal_ops();
-                let msgs = insert_ops
-                    .ops
-                    .iter()
-                    .map(|op| {
-                        if let PoolSectionOp::Insert(artifact) = op {
-                            &artifact.msg
-                        } else {
-                            panic!("Expect Insert but found {:?}", op)
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                let mut remove_ops = msgs
-                    .iter()
-                    .map(|msg| PoolSectionOp::Remove(msg.get_id()))
-                    .collect::<Vec<_>>();
-                let mut payloads: Vec<BlockPayload> = msgs
-                    .iter()
-                    .map(|msg| {
-                        BlockProposal::assert(msg)
-                            .unwrap()
-                            .as_ref()
-                            .payload
-                            .as_ref()
-                            .clone()
-                    })
-                    .collect::<Vec<_>>();
-                let mut pool = PersistentHeightIndexedPool::new_consensus_pool(config, false, log);
-                pool.mutate(insert_ops);
-                let proposals = pool.block_proposal().get_all().collect::<Vec<_>>();
-                assert!(proposals.iter().all(|proposal| proposal.check_integrity()));
-                assert_eq!(
-                    payloads,
-                    proposals
-                        .iter()
-                        .map(|proposal| proposal.as_ref().payload.as_ref().clone())
-                        .collect::<Vec<_>>()
-                );
-
-                // Remove the first 5 block proposals
-                let _ = payloads.split_off(5);
-                let remove_first_5 = remove_ops.split_off(5);
-                pool.mutate(PoolSectionOps {
-                    ops: remove_first_5,
-                });
-                let iter = pool.block_proposal().get_all();
-                assert_eq!(
-                    payloads,
-                    iter.map(|proposal| proposal.as_ref().payload.as_ref().clone())
-                        .collect::<Vec<_>>()
-                );
-
-                // check integrity
-                pool.block_proposal()
-                    .get_all()
-                    .for_each(|proposal| assert!(proposal.check_integrity()));
-
-                // Remove all
-                pool.mutate(PoolSectionOps { ops: remove_ops });
-                let mut iter = pool.block_proposal().get_all();
-                assert!(iter.next().is_none());
-            },
-        )
+        crate::test_utils::test_block_proposal_and_payload_correspondence::<LMDBConfig>()
     }
 
-    // Tests that iterators are created on snapshots of the pool and that
-    // the returned values do not reflect any updates after the iterator
-    // was created.
-    //
-    // This also illustrates passing iterators by value when the pool is
-    // left behind, emulating how iterators might be used to perform
-    // async work.
     #[test]
     fn test_iterating_while_inserting_doesnt_see_new_updates() {
-        run_persistent_pool_test(
-            "test_iterating_while_inserting_doesnt_see_new_updates",
-            |config, log| {
-                let rb_ops = random_beacon_ops();
-                let mut pool = PersistentHeightIndexedPool::new_consensus_pool(config, false, log);
-                pool.mutate(rb_ops);
-                let iter = pool.random_beacon().get_all();
-
-                // Before we go through the iterator values we'll remove all of
-                // of the values in the current range and add values before and after
-                // the iterator's initial range (3..15).
-                let mut ops = PoolSectionOps::new();
-                ops.insert(make_random_beacon_at_height(1));
-                ops.insert(make_random_beacon_at_height(2));
-                ops.insert(make_random_beacon_at_height(20));
-                for i in 3..20 {
-                    ops.remove(make_random_beacon_msg_id_at_height(i));
-                }
-                pool.mutate(ops);
-
-                // The original iterator shouldn't observe the changes
-                // we made above
-                check_iter_original(iter);
-
-                // A new iterator should see the new values.
-                check_iter_mutated(pool.random_beacon().get_all());
-            },
-        );
+        crate::test_utils::test_iterating_while_inserting_doesnt_see_new_updates::<LMDBConfig>()
     }
 
-    // Tests that iterators obtained from the pool can outlive it, meaning it's
-    // safe to pass them around without the pool itself. Even though it isn't
-    // likely that the iterator will outlive the pool, ever, it is necessary
-    // to make make sure it can to guarantee the safety of passing it as an
-    // argument without the pool.
     #[test]
     fn test_iterator_can_outlive_the_pool() {
-        run_persistent_pool_test("test_iterator_can_outlive_the_pool", |config, log| {
-            let rb_ops = random_beacon_ops();
-            let iter;
-
-            // Create a pool in this inner scope, which will be destroyed
-            // before the iterator is used.
-            {
-                let mut pool = PersistentHeightIndexedPool::new_consensus_pool(config, false, log);
-                pool.mutate(rb_ops.clone());
-                iter = pool.random_beacon().get_all();
-            }
-
-            let msgs_from_pool: Vec<RandomBeacon> = iter.collect();
-            assert_eq!(msgs_from_pool.len(), rb_ops.ops.len());
-            for (i, op) in rb_ops.ops.iter().enumerate() {
-                if let PoolSectionOp::Insert(artifact) = &op {
-                    assert_eq!(
-                        RandomBeacon::assert(&artifact.msg).unwrap(),
-                        &msgs_from_pool[i]
-                    );
-                }
-            }
-        });
+        crate::test_utils::test_iterator_can_outlive_the_pool::<LMDBConfig>()
     }
 
-    // Tests that, if configured to do so, the pool will delete the data
-    // directories on drop. This is useful to cleanup after running
-    // tests.
     #[test]
     fn test_persistent_pool_path_is_cleanedup_after_tests() {
-        with_test_replica_logger(|log| {
-            let tmp =
-                ic_test_utilities::artifact_pool_config::with_test_lmdb_pool_config(|config| {
-                    let path = config.persistent_pool_validated_persistent_db_path.clone();
-                    let rb_ops = random_beacon_ops();
-                    {
-                        let mut pool =
-                            PersistentHeightIndexedPool::new_consensus_pool(config, false, log);
-                        pool.mutate(rb_ops);
-                    }
-                    path
-                });
-            assert!(!Path::new(&tmp).exists());
-        })
+        crate::test_utils::test_persistent_pool_path_is_cleanedup_after_tests::<LMDBConfig>()
     }
 
-    // Test if purge survives reboot.
     #[test]
     fn test_purge_survives_reboot() {
         run_persistent_pool_test("test_purge_survives_reboot", |config, log| {
@@ -1677,43 +1797,8 @@ mod tests {
         });
     }
 
-    // Test if timestamp survives reboot.
     #[test]
     fn test_timestamp_survives_reboot() {
-        run_persistent_pool_test("test_purge_survives_reboot", |config, log| {
-            let time_0 = mock_time() + Duration::from_secs(1234);
-            // create a pool and insert an artifact
-            {
-                let mut pool = PersistentHeightIndexedPool::new_consensus_pool(
-                    config.clone(),
-                    false,
-                    log.clone(),
-                );
-                // insert a few things
-                let mut ops = PoolSectionOps::new();
-                let random_beacon = fake_random_beacon(Height::from(10));
-                let msg = ConsensusMessage::RandomBeacon(random_beacon);
-                let msg_id = msg.get_id();
-                ops.insert(ValidatedConsensusArtifact {
-                    msg,
-                    timestamp: time_0,
-                });
-                pool.mutate(ops);
-
-                assert_eq!(pool.get_timestamp(&msg_id), Some(time_0));
-            }
-
-            // create the same pool again, check if timestamp was preserved
-            {
-                let pool = PersistentHeightIndexedPool::new_consensus_pool(config, false, log);
-                let random_beacon = pool
-                    .random_beacon()
-                    .get_by_height(Height::from(10))
-                    .next()
-                    .unwrap();
-                let msg_id = random_beacon.get_id();
-                assert_eq!(pool.get_timestamp(&msg_id), Some(time_0));
-            }
-        });
+        crate::test_utils::test_timestamp_survives_reboot::<LMDBConfig>()
     }
 }

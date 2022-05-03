@@ -1,8 +1,9 @@
-use crate::validation::ValidationError;
+use crate::{payload::BatchPayloadSectionType, validation::ValidationError};
 
 use ic_types::{
     batch::{SelfValidatingPayload, ValidationContext},
-    NumBytes,
+    consensus::Payload,
+    Height, NumBytes, Time,
 };
 
 /// A SelfValidatingPayload error from which it is not possible to recover.
@@ -16,6 +17,11 @@ pub enum SelfValidatingTransientValidationError {}
 /// A SelfValidationPayload error that results from payload validation.
 pub type SelfValidatingPayloadValidationError =
     ValidationError<InvalidSelfValidatingPayload, SelfValidatingTransientValidationError>;
+
+impl BatchPayloadSectionType for SelfValidatingPayload {
+    type PermanentValidationError = InvalidSelfValidatingPayload;
+    type TransientValidationError = SelfValidatingTransientValidationError;
+}
 
 pub trait SelfValidatingPayloadBuilder: Send + Sync {
     /// Produces a `SelfValidatingPayload` of maximum byte size `byte_limit`
@@ -45,27 +51,21 @@ pub trait SelfValidatingPayloadBuilder: Send + Sync {
         validation_context: &ValidationContext,
         past_payloads: &[&SelfValidatingPayload],
     ) -> Result<NumBytes, SelfValidatingPayloadValidationError>;
-}
 
-// TODO: Remove this once a real SelfValidatingPayloadBuilder is ready.
-pub struct NoOpSelfValidatingPayloadBuilder {}
-
-impl SelfValidatingPayloadBuilder for NoOpSelfValidatingPayloadBuilder {
-    fn get_self_validating_payload(
+    /// Extracts the sequence of past `SelfValidatingPayloads` from `past_payloads`.
+    fn filter_past_payloads<'a>(
         &self,
-        _validation_context: &ValidationContext,
-        _past_payloads: &[&SelfValidatingPayload],
-        _byte_limit: NumBytes,
-    ) -> SelfValidatingPayload {
-        SelfValidatingPayload::new()
-    }
-
-    fn validate_self_validating_payload(
-        &self,
-        _payload: &SelfValidatingPayload,
-        _validation_context: &ValidationContext,
-        _past_payloads: &[&SelfValidatingPayload],
-    ) -> Result<NumBytes, SelfValidatingPayloadValidationError> {
-        Ok(0.into())
+        past_payloads: &'a [(Height, Time, Payload)],
+    ) -> Vec<&'a SelfValidatingPayload> {
+        past_payloads
+            .iter()
+            .filter_map(|(_, _, payload)| {
+                if payload.is_summary() {
+                    None
+                } else {
+                    Some(&payload.as_ref().as_data().batch.self_validating)
+                }
+            })
+            .collect()
     }
 }

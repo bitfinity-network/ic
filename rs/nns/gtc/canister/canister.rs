@@ -17,6 +17,10 @@ use ic_nns_gtc_accounts::FORWARD_WHITELIST;
 #[cfg(target_arch = "wasm32")]
 use dfn_core::println;
 
+// Makes expose_build_metadata! available.
+#[macro_use]
+extern crate ic_nervous_system_common;
+
 static mut GTC: Option<Gtc> = None;
 
 fn gtc() -> &'static Gtc {
@@ -74,13 +78,12 @@ fn canister_post_upgrade() {
 
     let serialized = stable::get();
     let gtc = gtc_mut();
-    match gtc.merge(&serialized[..]) {
-        Err(err) => panic!(
+    if let Err(err) = gtc.merge(&serialized[..]) {
+        panic!(
             "Error deserializing canister state post-upgrade. \
              CANISTER MIGHT HAVE BROKEN STATE!!!!. Error: {:?}",
             err
-        ),
-        Ok(()) => (),
+        )
     }
 
     // If the set of whitelisted accounts is empty (like it would
@@ -93,6 +96,8 @@ fn canister_post_upgrade() {
         }
     }
 }
+
+expose_build_metadata! {}
 
 /// Returns the sum of all token balances in the internal ledger
 #[export_name = "canister_query total"]

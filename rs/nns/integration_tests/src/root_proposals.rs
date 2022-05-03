@@ -1,18 +1,15 @@
 use canister_test::{Canister, Project};
-use ic_base_types::{CanisterInstallMode, PrincipalId};
+use ic_base_types::PrincipalId;
 use ic_canister_client::Sender;
-use ic_nns_constants::{
-    ids::{
-        TEST_NEURON_1_OWNER_KEYPAIR, TEST_USER1_KEYPAIR, TEST_USER1_PRINCIPAL, TEST_USER2_KEYPAIR,
-        TEST_USER2_PRINCIPAL, TEST_USER3_KEYPAIR, TEST_USER4_KEYPAIR, TEST_USER5_KEYPAIR,
-        TEST_USER6_KEYPAIR,
-    },
-    GOVERNANCE_CANISTER_ID,
+use ic_ic00_types::CanisterInstallMode;
+use ic_nervous_system_common_test_keys::{
+    TEST_NEURON_1_OWNER_KEYPAIR, TEST_USER1_KEYPAIR, TEST_USER1_PRINCIPAL, TEST_USER2_KEYPAIR,
+    TEST_USER2_PRINCIPAL, TEST_USER3_KEYPAIR, TEST_USER4_KEYPAIR, TEST_USER5_KEYPAIR,
+    TEST_USER6_KEYPAIR,
 };
-use ic_nns_handler_root::{
-    common::{CanisterIdRecord, CanisterStatusResult, ChangeNnsCanisterProposalPayload},
-    root_proposals::{GovernanceUpgradeRootProposal, RootProposalBallot},
-};
+use ic_nervous_system_root::{CanisterIdRecord, CanisterStatusResult, ChangeCanisterProposal};
+use ic_nns_constants::GOVERNANCE_CANISTER_ID;
+use ic_nns_handler_root::root_proposals::{GovernanceUpgradeRootProposal, RootProposalBallot};
 use ic_nns_test_utils::{
     itest_helpers::{NnsCanisters, NnsInitPayloadsBuilder},
     registry::initial_mutations_for_a_multinode_nns_subnet,
@@ -65,6 +62,16 @@ async fn vote_on_root_proposal_from_multiple_voters(
     Ok(())
 }
 
+fn governance_canister_sha() -> [u8; 32] {
+    let governance_canister_wasm_bytes = Project::cargo_bin_maybe_use_path_relative_to_rs(
+        "nns/governance",
+        "governance-canister",
+        &["test"],
+    )
+    .bytes();
+    ic_crypto_sha::Sha256::hash(&governance_canister_wasm_bytes)
+}
+
 #[test]
 fn test_upgrade_governance_through_root_proposal() {
     ic_nns_test_utils::itest_helpers::local_test_on_nns_subnet(|runtime| async move {
@@ -77,28 +84,20 @@ fn test_upgrade_governance_through_root_proposal() {
             .build();
         let nns_canisters = NnsCanisters::set_up(&runtime, nns_init_payload).await;
 
-        // Get the wasm of the governance canister.
-        let governance_canister_wasm_bytes = Project::cargo_bin_maybe_use_path_relative_to_rs(
-            "nns/governance",
-            "governance-canister",
-        )
-        .bytes();
-        let governance_canister_sha = &ic_crypto_sha::Sha256::hash(&governance_canister_wasm_bytes);
-
         // Make the NO of the first node the sender of the proposal.
         let proposer = Sender::from_keypair(&TEST_USER1_KEYPAIR);
         let proposer_pid = *TEST_USER1_PRINCIPAL;
 
         // Build and submit a root proposal
-        let root_proposal = ChangeNnsCanisterProposalPayload::new(
-            true,
-            CanisterInstallMode::Upgrade,
-            GOVERNANCE_CANISTER_ID,
-        )
-        // Note that we upgrade the governance canister to the universal
-        // canister (effectively breaking governance). This is needed so
-        // that we can be sure that the upgrade actually went through.
-        .with_wasm(ic_test_utilities::empty_wasm::EMPTY_WASM.to_vec());
+        let root_proposal =
+            ChangeCanisterProposal::new(true, CanisterInstallMode::Upgrade, GOVERNANCE_CANISTER_ID)
+                .with_memory_allocation(ic_nns_constants::memory_allocation_of(
+                    GOVERNANCE_CANISTER_ID,
+                ))
+                // Note that we upgrade the governance canister to the universal
+                // canister (effectively breaking governance). This is needed so
+                // that we can be sure that the upgrade actually went through.
+                .with_wasm(ic_test_utilities::empty_wasm::EMPTY_WASM.to_vec());
 
         let empty_wasm_sha =
             &ic_crypto_sha::Sha256::hash(ic_test_utilities::empty_wasm::EMPTY_WASM);
@@ -108,7 +107,7 @@ fn test_upgrade_governance_through_root_proposal() {
             .update_from_sender(
                 "submit_root_proposal_to_upgrade_governance_canister",
                 dfn_candid::candid,
-                (governance_canister_sha, root_proposal),
+                (governance_canister_sha(), root_proposal),
                 &proposer,
             )
             .await
@@ -127,7 +126,7 @@ fn test_upgrade_governance_through_root_proposal() {
         vote_on_root_proposal(
             &voter,
             &proposer_pid,
-            &empty_wasm_sha.to_vec(),
+            empty_wasm_sha.as_ref(),
             &nns_canisters.root,
             RootProposalBallot::Yes,
         )
@@ -147,7 +146,7 @@ fn test_upgrade_governance_through_root_proposal() {
                 Sender::from_keypair(&TEST_USER5_KEYPAIR),
             ],
             &proposer_pid,
-            &empty_wasm_sha.to_vec(),
+            empty_wasm_sha.as_ref(),
             &nns_canisters.root,
             RootProposalBallot::Yes,
         )
@@ -188,31 +187,23 @@ fn test_unauthorized_user_cant_submit_on_root_proposals() {
             .build();
         let nns_canisters = NnsCanisters::set_up(&runtime, nns_init_payload).await;
 
-        // Get the wasm of the governance canister.
-        let governance_canister_wasm_bytes = Project::cargo_bin_maybe_use_path_relative_to_rs(
-            "nns/governance",
-            "governance-canister",
-        )
-        .bytes();
-        let governance_canister_sha = &ic_crypto_sha::Sha256::hash(&governance_canister_wasm_bytes);
-
         // Try and submit a proposal from a user that isn't an NO of the nns subnet.
         let proposer = Sender::from_keypair(&TEST_NEURON_1_OWNER_KEYPAIR);
 
         // Build and submit a root proposal
-        let root_proposal = ChangeNnsCanisterProposalPayload::new(
-            true,
-            CanisterInstallMode::Upgrade,
-            GOVERNANCE_CANISTER_ID,
-        )
-        .with_wasm(ic_test_utilities::empty_wasm::EMPTY_WASM.to_vec());
+        let root_proposal =
+            ChangeCanisterProposal::new(true, CanisterInstallMode::Upgrade, GOVERNANCE_CANISTER_ID)
+                .with_memory_allocation(ic_nns_constants::memory_allocation_of(
+                    GOVERNANCE_CANISTER_ID,
+                ))
+                .with_wasm(ic_test_utilities::empty_wasm::EMPTY_WASM.to_vec());
 
         let response: Result<(), String> = nns_canisters
             .root
             .update_from_sender(
                 "submit_root_proposal_to_upgrade_governance_canister",
                 dfn_candid::candid,
-                (governance_canister_sha, root_proposal),
+                (governance_canister_sha(), root_proposal),
                 &proposer,
             )
             .await
@@ -240,12 +231,12 @@ fn test_cant_submit_root_proposal_with_wrong_sha() {
         let proposer = Sender::from_keypair(&TEST_NEURON_1_OWNER_KEYPAIR);
 
         // Build and submit a root proposal
-        let root_proposal = ChangeNnsCanisterProposalPayload::new(
-            true,
-            CanisterInstallMode::Upgrade,
-            GOVERNANCE_CANISTER_ID,
-        )
-        .with_wasm(ic_test_utilities::empty_wasm::EMPTY_WASM.to_vec());
+        let root_proposal =
+            ChangeCanisterProposal::new(true, CanisterInstallMode::Upgrade, GOVERNANCE_CANISTER_ID)
+                .with_memory_allocation(ic_nns_constants::memory_allocation_of(
+                    GOVERNANCE_CANISTER_ID,
+                ))
+                .with_wasm(ic_test_utilities::empty_wasm::EMPTY_WASM.to_vec());
 
         let empty_wasm_sha =
             &ic_crypto_sha::Sha256::hash(ic_test_utilities::empty_wasm::EMPTY_WASM);
@@ -281,28 +272,20 @@ fn test_enough_no_votes_rejects_the_proposal() {
             .build();
         let nns_canisters = NnsCanisters::set_up(&runtime, nns_init_payload).await;
 
-        // Get the wasm of the governance canister.
-        let governance_canister_wasm_bytes = Project::cargo_bin_maybe_use_path_relative_to_rs(
-            "nns/governance",
-            "governance-canister",
-        )
-        .bytes();
-        let governance_canister_sha = &ic_crypto_sha::Sha256::hash(&governance_canister_wasm_bytes);
-
         // Make the NO of the first node the sender of the proposal.
         let proposer = Sender::from_keypair(&TEST_USER1_KEYPAIR);
         let proposer_pid = *TEST_USER1_PRINCIPAL;
 
         // Build and submit a root proposal
-        let root_proposal = ChangeNnsCanisterProposalPayload::new(
-            true,
-            CanisterInstallMode::Upgrade,
-            GOVERNANCE_CANISTER_ID,
-        )
-        // Note that we upgrade the governance canister to the universal
-        // canister (effectively breaking governance). This is needed so
-        // that we can be sure that the upgrade actually went through.
-        .with_wasm(ic_test_utilities::empty_wasm::EMPTY_WASM.to_vec());
+        let root_proposal =
+            ChangeCanisterProposal::new(true, CanisterInstallMode::Upgrade, GOVERNANCE_CANISTER_ID)
+                .with_memory_allocation(ic_nns_constants::memory_allocation_of(
+                    GOVERNANCE_CANISTER_ID,
+                ))
+                // Note that we upgrade the governance canister to the universal
+                // canister (effectively breaking governance). This is needed so
+                // that we can be sure that the upgrade actually went through.
+                .with_wasm(ic_test_utilities::empty_wasm::EMPTY_WASM.to_vec());
 
         let empty_wasm_sha =
             &ic_crypto_sha::Sha256::hash(ic_test_utilities::empty_wasm::EMPTY_WASM);
@@ -312,7 +295,7 @@ fn test_enough_no_votes_rejects_the_proposal() {
             .update_from_sender(
                 "submit_root_proposal_to_upgrade_governance_canister",
                 dfn_candid::candid,
-                (governance_canister_sha, root_proposal),
+                (governance_canister_sha(), root_proposal),
                 &proposer,
             )
             .await
@@ -327,7 +310,7 @@ fn test_enough_no_votes_rejects_the_proposal() {
                 Sender::from_keypair(&TEST_USER4_KEYPAIR),
             ],
             &proposer_pid,
-            &empty_wasm_sha.to_vec(),
+            empty_wasm_sha.as_ref(),
             &nns_canisters.root,
             RootProposalBallot::No,
         )
@@ -348,7 +331,7 @@ fn test_enough_no_votes_rejects_the_proposal() {
             )
             .await
             .unwrap();
-        assert_eq!(status.module_hash.unwrap(), governance_canister_sha);
+        assert_eq!(status.module_hash.unwrap(), governance_canister_sha());
 
         Ok(())
     })
@@ -368,28 +351,20 @@ fn test_changing_the_sha_invalidates_the_proposal() {
             .build();
         let nns_canisters = NnsCanisters::set_up(&runtime, nns_init_payload).await;
 
-        // Get the wasm of the governance canister.
-        let governance_canister_wasm_bytes = Project::cargo_bin_maybe_use_path_relative_to_rs(
-            "nns/governance",
-            "governance-canister",
-        )
-        .bytes();
-        let governance_canister_sha = &ic_crypto_sha::Sha256::hash(&governance_canister_wasm_bytes);
-
         // Make the NO of the first node the sender of the proposal.
         let proposer1 = Sender::from_keypair(&TEST_USER1_KEYPAIR);
         let proposer1_pid = *TEST_USER1_PRINCIPAL;
 
         // Build and submit a root proposal
-        let root_proposal1 = ChangeNnsCanisterProposalPayload::new(
-            true,
-            CanisterInstallMode::Upgrade,
-            GOVERNANCE_CANISTER_ID,
-        )
-        // Note that we upgrade the governance canister to the empty
-        // canister (effectively breaking governance). This is needed so
-        // that we can be sure that the upgrade actually went through.
-        .with_wasm(ic_test_utilities::empty_wasm::EMPTY_WASM.to_vec());
+        let root_proposal1 =
+            ChangeCanisterProposal::new(true, CanisterInstallMode::Upgrade, GOVERNANCE_CANISTER_ID)
+                .with_memory_allocation(ic_nns_constants::memory_allocation_of(
+                    GOVERNANCE_CANISTER_ID,
+                ))
+                // Note that we upgrade the governance canister to the empty
+                // canister (effectively breaking governance). This is needed so
+                // that we can be sure that the upgrade actually went through.
+                .with_wasm(ic_test_utilities::empty_wasm::EMPTY_WASM.to_vec());
 
         let empty_wasm_sha =
             &ic_crypto_sha::Sha256::hash(ic_test_utilities::empty_wasm::EMPTY_WASM);
@@ -399,7 +374,7 @@ fn test_changing_the_sha_invalidates_the_proposal() {
             .update_from_sender(
                 "submit_root_proposal_to_upgrade_governance_canister",
                 dfn_candid::candid,
-                (governance_canister_sha, root_proposal1),
+                (governance_canister_sha(), root_proposal1),
                 &proposer1,
             )
             .await
@@ -415,19 +390,19 @@ fn test_changing_the_sha_invalidates_the_proposal() {
         let proposer2_pid = *TEST_USER2_PRINCIPAL;
 
         // Build and submit a second root proposal
-        let root_proposal2 = ChangeNnsCanisterProposalPayload::new(
-            true,
-            CanisterInstallMode::Upgrade,
-            GOVERNANCE_CANISTER_ID,
-        )
-        .with_wasm(ic_test_utilities::empty_wasm::EMPTY_WASM.to_vec());
+        let root_proposal2 =
+            ChangeCanisterProposal::new(true, CanisterInstallMode::Upgrade, GOVERNANCE_CANISTER_ID)
+                .with_memory_allocation(ic_nns_constants::memory_allocation_of(
+                    GOVERNANCE_CANISTER_ID,
+                ))
+                .with_wasm(ic_test_utilities::empty_wasm::EMPTY_WASM.to_vec());
 
         let response: Result<(), String> = nns_canisters
             .root
             .update_from_sender(
                 "submit_root_proposal_to_upgrade_governance_canister",
                 dfn_candid::candid,
-                (governance_canister_sha, root_proposal2),
+                (governance_canister_sha(), root_proposal2),
                 &proposer2,
             )
             .await
@@ -448,7 +423,7 @@ fn test_changing_the_sha_invalidates_the_proposal() {
                 Sender::from_keypair(&TEST_USER6_KEYPAIR),
             ],
             &proposer2_pid,
-            &empty_wasm_sha.to_vec(),
+            empty_wasm_sha.as_ref(),
             &nns_canisters.root,
             RootProposalBallot::Yes,
         )
@@ -465,7 +440,7 @@ fn test_changing_the_sha_invalidates_the_proposal() {
                 Sender::from_keypair(&TEST_USER5_KEYPAIR),
             ],
             &proposer1_pid,
-            &empty_wasm_sha.to_vec(),
+            empty_wasm_sha.as_ref(),
             &nns_canisters.root,
             RootProposalBallot::Yes,
         )

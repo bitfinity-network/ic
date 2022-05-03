@@ -3,9 +3,12 @@
 // Specifically relevant to the Vec<> parameter.
 #![allow(clippy::ptr_arg)]
 
+use ic_base_types::NumBytes;
 use ic_cycles_account_manager::{
     CyclesAccountManager, IngressInductionCost, IngressInductionCostError,
 };
+use ic_error_types::{ErrorCode, UserError};
+use ic_ic00_types::CanisterStatusType;
 use ic_interfaces::execution_environment::IngressHistoryWriter;
 use ic_logger::{debug, error, trace, ReplicaLogger};
 use ic_metrics::{buckets::decimal_buckets, buckets::linear_buckets, MetricsRegistry};
@@ -17,15 +20,13 @@ use ic_replicated_state::{
     },
     ReplicatedState, StateError,
 };
-use ic_types::messages::HttpRequestContent;
 use ic_types::{
     ingress::IngressStatus,
-    messages::{is_subnet_message, SignedIngressContent},
+    messages::{is_subnet_message, HttpRequestContent, SignedIngressContent},
     time::current_time_and_expiry_time,
-    user_error::{ErrorCode, UserError},
-    CanisterStatusType, SubnetId, Time,
+    SubnetId, Time,
 };
-use prometheus::{Histogram, HistogramVec, IntCounterVec};
+use prometheus::{Histogram, HistogramVec, IntCounterVec, IntGauge};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -38,12 +39,16 @@ struct VsrMetrics {
     /// The latency metric is unreliable because we assume expiry time
     /// was set by 'current_time_and_expiry_time'.
     unreliable_induct_ingress_message_duration: HistogramVec,
+    /// Memory currently used by payloads of statuses in the ingress
+    /// history.
+    ingress_history_size: IntGauge,
 }
 
 const METRIC_INDUCTED_INGRESS_MESSAGES: &str = "mr_inducted_ingress_message_count";
 const METRIC_INDUCTED_INGRESS_PAYLOAD_SIZES: &str = "mr_inducted_ingress_payload_size_bytes";
 const METRIC_UNRELIABLE_INDUCT_INGRESS_MESSAGE_DURATION: &str =
     "mr_unreliable_induct_ingress_message_duration_seconds";
+const METRIC_INGRESS_HISTORY_SIZE: &str = "mr_ingress_history_size_bytes";
 
 const LABEL_STATUS: &str = "status";
 
@@ -69,6 +74,10 @@ impl VsrMetrics {
             linear_buckets(0.0, 0.5, 20),
             &[LABEL_STATUS],
         );
+        let ingress_history_size = metrics_registry.int_gauge(
+            METRIC_INGRESS_HISTORY_SIZE,
+            "Memory currently used by payloads of statuses in the ingress history",
+        );
 
         // Initialize all `inducted_ingress_messages` counters with zero, so they are
         // all exported from process start (`IntCounterVec` is really a map).
@@ -89,6 +98,7 @@ impl VsrMetrics {
             inducted_ingress_messages,
             inducted_ingress_payload_sizes,
             unreliable_induct_ingress_message_duration,
+            ingress_history_size,
         }
     }
 }
@@ -126,7 +136,7 @@ impl ValidSetRuleImpl {
     /// Tries to induct a single ingress message and sets the message status in
     /// `state` accordingly (to `Received` if successful; or to `Failed` with
     /// the relevant error code on failure).
-    fn induct_message(&self, mut state: &mut ReplicatedState, msg: SignedIngressContent) {
+    fn induct_message(&self, state: &mut ReplicatedState, msg: SignedIngressContent) {
         trace!(self.log, "induct_message");
         let message_id = msg.id();
         let source = msg.sender();
@@ -139,7 +149,7 @@ impl ValidSetRuleImpl {
             Ok(()) => {
                 self.observe_inducted_ingress_payload_size(payload_bytes);
                 self.ingress_history_writer.set_status(
-                    &mut state,
+                    state,
                     message_id,
                     IngressStatus::Received {
                         receiver: receiver.get(),
@@ -165,12 +175,16 @@ impl ValidSetRuleImpl {
                     StateError::CanisterOutOfCycles { .. } => ErrorCode::CanisterOutOfCycles,
                     StateError::UnknownSubnetMethod(_) => ErrorCode::CanisterOutOfCycles,
                     StateError::InvalidSubnetPayload => ErrorCode::CanisterOutOfCycles,
-                    StateError::QueueFull { .. } | StateError::OutOfMemory { .. } => {
+                    StateError::QueueFull { .. }
+                    | StateError::OutOfMemory { .. }
+                    | StateError::InvariantBroken { .. }
+                    | StateError::NonMatchingResponse { .. }
+                    | StateError::BitcoinStateError(_) => {
                         unreachable!("Unexpected error: {}", err)
                     }
                 };
                 self.ingress_history_writer.set_status(
-                    &mut state,
+                    state,
                     message_id,
                     IngressStatus::Failed {
                         receiver: receiver.get(),
@@ -225,6 +239,11 @@ impl ValidSetRuleImpl {
             .observe(delta_in_nanos.as_secs_f64());
     }
 
+    /// Records the memory currently used for the ingress history.
+    fn observe_ingress_history_size(&self, bytes: NumBytes) {
+        self.metrics.ingress_history_size.set(bytes.get() as i64);
+    }
+
     // Enqueues an ingress message into input queues.
     fn enqueue(
         &self,
@@ -234,12 +253,15 @@ impl ValidSetRuleImpl {
         // Compute the cost of induction.
         let induction_cost = match self.cycles_account_manager.ingress_induction_cost(&msg) {
             Ok(induction_cost) => induction_cost,
-            Err(IngressInductionCostError::UnknownSubnetMethod) => {
+            Err(
+                IngressInductionCostError::UnknownSubnetMethod
+                | IngressInductionCostError::SubnetMethodNotAllowed,
+            ) => {
                 return Err(StateError::UnknownSubnetMethod(
                     msg.method_name().to_string(),
                 ))
             }
-            Err(IngressInductionCostError::InvalidSubnetPayload) => {
+            Err(IngressInductionCostError::InvalidSubnetPayload(_)) => {
                 return Err(StateError::InvalidSubnetPayload)
             }
         };
@@ -300,6 +322,7 @@ impl ValidSetRule for ValidSetRuleImpl {
                 debug!(self.log, "Didn't induct duplicate message {}", message_id);
             }
         }
+        self.observe_ingress_history_size(state.total_ingress_memory_taken());
     }
 }
 

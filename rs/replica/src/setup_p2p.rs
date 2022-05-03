@@ -1,29 +1,37 @@
+use ic_btc_adapter_client::setup_bitcoin_adapter_client;
+use ic_btc_consensus::BitcoinPayloadBuilder;
 use ic_config::{artifact_pool::ArtifactPoolConfig, subnet_config::SubnetConfig, Config};
 use ic_consensus::certification::VerifierImpl;
+use ic_consensus::ecdsa::get_initial_dealings;
 use ic_crypto::CryptoComponent;
 use ic_cycles_account_manager::CyclesAccountManager;
-use ic_execution_environment::setup_execution;
+use ic_execution_environment::ExecutionServices;
+use ic_interfaces::execution_environment::AnonymousQueryService;
 use ic_interfaces::{
     certified_stream_store::CertifiedStreamStore,
     consensus_pool::ConsensusPoolCache,
     execution_environment::{IngressFilterService, QueryExecutionService, QueryHandler},
-    p2p::IngressIngestionService,
-    p2p::P2PRunner,
     registry::{LocalStoreCertifiedTimeReader, RegistryClient},
-    self_validating_payload::NoOpSelfValidatingPayloadBuilder,
 };
+use ic_interfaces_p2p::IngressIngestionService;
 use ic_logger::{info, ReplicaLogger};
-use ic_messaging::{MessageRoutingImpl, XNetEndpoint, XNetEndpointConfig, XNetPayloadBuilderImpl};
+use ic_messaging::MessageRoutingImpl;
+use ic_p2p::P2PThreadJoiner;
 use ic_registry_subnet_type::SubnetType;
-use ic_replica_setup_ic_network::{create_networking_stack, P2PStateSyncClient};
+use ic_replica_setup_ic_network::{
+    create_networking_stack, init_artifact_pools, P2PStateSyncClient,
+};
 use ic_replicated_state::ReplicatedState;
 use ic_state_manager::StateManagerImpl;
 use ic_types::{consensus::catchup::CUPWithOriginalProtobuf, NodeId, SubnetId};
+use ic_xnet_endpoint::{XNetEndpoint, XNetEndpointConfig};
+use ic_xnet_payload_builder::XNetPayloadBuilderImpl;
 use std::sync::Arc;
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn construct_ic_stack(
     replica_logger: ReplicaLogger,
+    rt_handle: tokio::runtime::Handle,
     config: Config,
     subnet_config: SubnetConfig,
     node_id: NodeId,
@@ -41,15 +49,100 @@ pub fn construct_ic_stack(
     Arc<StateManagerImpl>,
     Arc<dyn QueryHandler<State = ReplicatedState>>,
     QueryExecutionService,
-    Box<dyn P2PRunner>,
+    AnonymousQueryService,
+    P2PThreadJoiner,
     IngressIngestionService,
     Arc<dyn ConsensusPoolCache>,
     IngressFilterService,
     XNetEndpoint,
 )> {
+    let artifact_pool_config = ArtifactPoolConfig::from(config.artifact_pool);
+
+    // Determine the correct catch-up package.
+    let catch_up_package = {
+        use ic_types::consensus::HasHeight;
+        let make_registry_cup = || {
+            CUPWithOriginalProtobuf::from_cup(
+                ic_consensus::dkg::make_registry_cup(&*registry, subnet_id, None)
+                    .expect("Couldn't create a registry CUP"),
+            )
+        };
+        match catch_up_package {
+            // The orchestrator has persisted a CUP for the replica.
+            Some(cup_from_nm) => {
+                let signed = !cup_from_nm
+                    .cup
+                    .signature
+                    .signature
+                    .clone()
+                    .get()
+                    .0
+                    .is_empty();
+                if signed {
+                    // The CUP persisted by the orchestrator is safe to use because it's signed.
+                    info!(
+                        &replica_logger,
+                        "Using the signed CUP with height {}",
+                        cup_from_nm.cup.height()
+                    );
+                    cup_from_nm
+                } else {
+                    // The CUP persisted by the orchestrator is unsigned and hence it was created
+                    // from the registry CUP contents. In this case, we re-create this CUP to avoid
+                    // incompatibility issues, because on other replicas of the same subnet the node
+                    // manager version may differ, so the CUP contents might differ as well.
+                    let registry_cup = make_registry_cup();
+                    // However in a special case of the NNS subnet recovery, we still have to use
+                    // a newer unsigned CUP. The incompatibility issue is not a problem in this
+                    // case, because this CUP will not be created by the orchestrator.
+                    if registry_cup.cup.height() < cup_from_nm.cup.height() {
+                        info!(
+                            &replica_logger,
+                            "Using the newer CUP with height {} passed from the orchestrator",
+                            cup_from_nm.cup.height()
+                        );
+                        cup_from_nm
+                    } else {
+                        info!(
+                            &replica_logger,
+                            "Using the CUP with height {} generated from the registry (CUP height from the orchestrator is {})",
+                            registry_cup.cup.height(),
+                            cup_from_nm.cup.height()
+                        );
+                        registry_cup
+                    }
+                }
+            }
+            // No CUP was persisted by the orchestrator, which is usually the case for fresh nodes.
+            None => {
+                let registry_cup = make_registry_cup();
+                info!(
+                    &replica_logger,
+                    "Using the CUP with height {} generated from the registry",
+                    registry_cup.cup.height()
+                );
+                registry_cup
+            }
+        }
+    };
+
+    let initial_dealings = get_initial_dealings(
+        subnet_id,
+        registry.as_ref(),
+        registry.get_latest_version(),
+        &replica_logger,
+    );
+    let artifact_pools = init_artifact_pools(
+        subnet_id,
+        artifact_pool_config,
+        metrics_registry.clone(),
+        replica_logger.clone(),
+        catch_up_package,
+        initial_dealings,
+    );
+
     let cycles_account_manager = Arc::new(CyclesAccountManager::new(
         subnet_config.scheduler_config.max_instructions_per_message,
-        config.hypervisor.max_cycles_per_canister,
         subnet_type,
         subnet_id,
         subnet_config.cycles_account_manager_config,
@@ -62,16 +155,10 @@ pub fn construct_ic_stack(
         replica_logger.clone(),
         &metrics_registry,
         &config.state_manager,
+        Some(artifact_pools.consensus_pool_cache.starting_height()),
         config.malicious_behaviour.malicious_flags.clone(),
     ));
-    let (
-        ingress_filter,
-        ingress_history_writer,
-        ingress_history_reader,
-        sync_query_handler,
-        async_query_handler,
-        scheduler,
-    ) = setup_execution(
+    let execution_services = ExecutionServices::setup_execution(
         replica_logger.clone(),
         &metrics_registry,
         subnet_id,
@@ -93,7 +180,7 @@ pub fn construct_ic_stack(
         MessageRoutingImpl::new_fake(
             subnet_id,
             Arc::clone(&state_manager) as Arc<_>,
-            ingress_history_writer,
+            execution_services.ingress_history_writer,
             &metrics_registry,
             replica_logger.clone(),
         )
@@ -101,8 +188,8 @@ pub fn construct_ic_stack(
         MessageRoutingImpl::new(
             Arc::clone(&state_manager) as Arc<_>,
             Arc::clone(&certified_stream_store) as Arc<_>,
-            ingress_history_writer,
-            scheduler,
+            execution_services.ingress_history_writer,
+            execution_services.scheduler,
             config.hypervisor,
             Arc::clone(&cycles_account_manager),
             subnet_id,
@@ -117,7 +204,7 @@ pub fn construct_ic_stack(
         XNetEndpointConfig::from(Arc::clone(&registry) as Arc<_>, node_id, &replica_logger);
 
     let xnet_endpoint = XNetEndpoint::new(
-        tokio::runtime::Handle::current(),
+        rt_handle.clone(),
         Arc::clone(&certified_stream_store),
         Arc::clone(&crypto) as Arc<_>,
         Arc::clone(&registry),
@@ -132,7 +219,7 @@ pub fn construct_ic_stack(
         Arc::clone(&certified_stream_store) as Arc<_>,
         Arc::clone(&crypto) as Arc<_>,
         Arc::clone(&registry) as Arc<_>,
-        tokio::runtime::Handle::current(),
+        rt_handle.clone(),
         node_id,
         subnet_id,
         &metrics_registry,
@@ -140,85 +227,30 @@ pub fn construct_ic_stack(
     );
     let xnet_payload_builder = Arc::new(xnet_payload_builder);
 
-    let self_validating_payload_builder = NoOpSelfValidatingPayloadBuilder {};
+    let btc_testnet_client = setup_bitcoin_adapter_client(
+        replica_logger.clone(),
+        rt_handle.clone(),
+        config.adapters_config.bitcoin_testnet_uds_path,
+    );
+    let btc_mainnet_client = setup_bitcoin_adapter_client(
+        replica_logger.clone(),
+        rt_handle.clone(),
+        config.adapters_config.bitcoin_mainnet_uds_path,
+    );
+    let self_validating_payload_builder = BitcoinPayloadBuilder::new(
+        state_manager.clone(),
+        &metrics_registry,
+        btc_mainnet_client,
+        btc_testnet_client,
+        replica_logger.clone(),
+    );
     let self_validating_payload_builder = Arc::new(self_validating_payload_builder);
 
-    let artifact_pool_config = ArtifactPoolConfig::from(config.artifact_pool);
-
-    // Determine the correct catch-up package.
-    let catch_up_package = {
-        use ic_types::consensus::HasHeight;
-        let make_registry_cup = || {
-            CUPWithOriginalProtobuf::from_cup(
-                ic_consensus::dkg::make_registry_cup(&*registry, subnet_id, None)
-                    .expect("Couldn't create a registry CUP"),
-            )
-        };
-        match catch_up_package {
-            // The node manager has persisted a CUP for the replica.
-            Some(cup_from_nm) => {
-                let signed = !cup_from_nm
-                    .cup
-                    .signature
-                    .signature
-                    .clone()
-                    .get()
-                    .0
-                    .is_empty();
-                if signed {
-                    // The CUP persisted by the node manager is safe to use because it's signed.
-                    info!(
-                        &replica_logger,
-                        "Using the signed CUP with height {}",
-                        cup_from_nm.cup.height()
-                    );
-                    cup_from_nm
-                } else {
-                    // The CUP persisted by the node manager is unsigned and hence it was created
-                    // from the registry CUP contents. In this case, we re-create this CUP to avoid
-                    // incompatibility issues, because on other replicas of the same subnet the node
-                    // manager version may differ, so the CUP contents might differ as well.
-                    let registry_cup = make_registry_cup();
-                    // However in a special case of the NNS disaster recovery, we still have to use
-                    // a newer unsigned CUP. The incompatibility issue is not a problem in this
-                    // case, because this CUP will not be created by the node manager.
-                    if registry_cup.cup.height() < cup_from_nm.cup.height() {
-                        info!(
-                            &replica_logger,
-                            "Using the newer CUP with height {} passed from the node manager",
-                            cup_from_nm.cup.height()
-                        );
-                        cup_from_nm
-                    } else {
-                        info!(
-                            &replica_logger,
-                            "Using the CUP with height {} generated from the registry (CUP height from the node manager is {})",
-                            registry_cup.cup.height(),
-                            cup_from_nm.cup.height()
-                        );
-                        registry_cup
-                    }
-                }
-            }
-            // No CUP was persisted by the node manager, which is usually the case for fresh nodes.
-            None => {
-                let registry_cup = make_registry_cup();
-                info!(
-                    &replica_logger,
-                    "Using the CUP with height {} generated from the registry",
-                    registry_cup.cup.height()
-                );
-                registry_cup
-            }
-        }
-    };
-
-    let (p2p_event_handler, p2p_runner, consensus_pool_cache) = create_networking_stack(
+    let (ingress_ingestion_service, p2p_runner) = create_networking_stack(
         metrics_registry,
         replica_logger,
-        tokio::runtime::Handle::current(),
+        rt_handle,
         config.transport,
-        artifact_pool_config,
         config.consensus,
         config.malicious_behaviour.malicious_flags,
         node_id,
@@ -236,23 +268,22 @@ pub fn construct_ic_stack(
         Arc::clone(&crypto) as Arc<_>,
         Arc::clone(&crypto) as Arc<_>,
         registry,
-        ingress_history_reader,
-        catch_up_package,
+        execution_services.ingress_history_reader,
+        &artifact_pools,
         cycles_account_manager,
         local_store_time_reader,
         config.nns_registry_replicator.poll_delay_duration_ms,
-    )
-    .expect("Failed to construct p2p");
-
+    );
     Ok((
         crypto,
         state_manager,
-        sync_query_handler,
-        async_query_handler,
+        execution_services.sync_query_handler,
+        execution_services.async_query_handler,
+        execution_services.anonymous_query_handler,
         p2p_runner,
-        p2p_event_handler,
-        consensus_pool_cache,
-        ingress_filter,
+        ingress_ingestion_service,
+        artifact_pools.consensus_pool_cache,
+        execution_services.ingress_filter,
         xnet_endpoint,
     ))
 }

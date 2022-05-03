@@ -1,10 +1,13 @@
 #[cfg(test)]
 mod tests;
 
+use crate::StateError;
 use ic_interfaces::{execution_environment::HypervisorError, messages::RequestOrIngress};
 use ic_protobuf::proxy::{try_from_option_field, ProxyDecodeError};
 use ic_protobuf::state::canister_state_bits::v1 as pb;
 use ic_protobuf::types::v1 as pb_types;
+use ic_types::messages::Response;
+use ic_types::Time;
 use ic_types::{
     ingress::WasmResult,
     messages::{CallContextId, CallbackId, MessageId},
@@ -14,6 +17,7 @@ use ic_types::{
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::convert::{From, TryFrom, TryInto};
+use std::time::Duration;
 
 /// Call context contains all context information related to an incoming call.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,6 +37,10 @@ pub struct CallContext {
 
     /// Cycles that were sent in the request that created the CallContext.
     available_cycles: Cycles,
+
+    /// Time that the call context was created. This field is only optional to
+    /// accomodate contexts that were created before this field was created.
+    time: Option<Time>,
 }
 
 impl CallContext {
@@ -41,12 +49,14 @@ impl CallContext {
         responded: bool,
         deleted: bool,
         available_cycles: Cycles,
+        time: Time,
     ) -> Self {
         Self {
             call_origin,
             responded,
             deleted,
             available_cycles,
+            time: Some(time),
         }
     }
 
@@ -90,7 +100,13 @@ impl CallContext {
 
     /// Mark the call context as responded.
     pub fn mark_responded(&mut self) {
+        self.available_cycles = Cycles::new(0);
         self.responded = true;
+    }
+
+    /// The time at which the call context was created.
+    pub fn time(&self) -> Option<Time> {
+        self.time
     }
 }
 
@@ -102,6 +118,7 @@ impl From<&CallContext> for pb::CallContext {
             responded: item.responded,
             deleted: item.deleted,
             available_funds: Some((&funds).into()),
+            time_nanos: item.time.map(|t| t.as_nanos_since_unix_epoch()),
         }
     }
 }
@@ -117,6 +134,7 @@ impl TryFrom<pb::CallContext> for CallContext {
             responded: value.responded,
             deleted: value.deleted,
             available_cycles: funds.cycles(),
+            time: value.time_nanos.map(Time::from_nanos_since_unix_epoch),
         })
     }
 }
@@ -272,7 +290,12 @@ impl TryFrom<pb::call_context::CallOrigin> for CallOrigin {
 impl CallContextManager {
     /// Must be used to create a new call context at the beginning of every new
     /// ingress or inter-canister message.
-    pub fn new_call_context(&mut self, call_origin: CallOrigin, cycles: Cycles) -> CallContextId {
+    pub fn new_call_context(
+        &mut self,
+        call_origin: CallOrigin,
+        cycles: Cycles,
+        time: Time,
+    ) -> CallContextId {
         self.next_call_context_id += 1;
         let id = CallContextId::from(self.next_call_context_id);
         self.call_contexts.insert(
@@ -282,6 +305,7 @@ impl CallContextManager {
                 responded: false,
                 deleted: false,
                 available_cycles: cycles,
+                time: Some(time),
             },
         );
         id
@@ -310,6 +334,53 @@ impl CallContextManager {
     /// Returns the `Callback`s maintained by this `CallContextManager`.
     pub fn callbacks(&self) -> &BTreeMap<CallbackId, Callback> {
         &self.callbacks
+    }
+
+    /// Returns a reference to the callback with `callback_id`.
+    pub fn callback(&self, callback_id: &CallbackId) -> Option<&Callback> {
+        self.callbacks.get(callback_id)
+    }
+
+    /// Validates the given response before inducting it into the queue.
+    /// Verifies that the stored respondent and originator associated with the
+    /// `callback_id` match with details provided by the response.
+    ///
+    /// Returns a `StateError::NonMatchingResponse` if could not find the `callback_id` or
+    /// if the response is not valid.
+    pub(crate) fn validate_response(&self, response: &Response) -> Result<(), StateError> {
+        match self.callback(&response.originator_reply_callback) {
+            Some(callback) => {
+                // (EXC-877) Once this is deployed in production,
+                // it's safe to make `respondent` and `originator` non-optional.
+                // Currently optional to ensure backwards compatibility.
+                match (callback.respondent, callback.originator) {
+                    (Some(respondent), Some(originator))
+                        if response.respondent != respondent
+                            || response.originator != originator =>
+                    {
+                        return Err(StateError::NonMatchingResponse {
+                                err_str: format!(
+                                    "invalid details, expected => [originator => {}, respondent => {}], but got response with",
+                                    originator, respondent,
+                                ),
+                                originator: response.originator,
+                                callback_id: response.originator_reply_callback,
+                                respondent: response.respondent,
+                            });
+                    }
+                    _ => Ok(()),
+                }
+            }
+            None => {
+                // Received an unknown callback ID.
+                Err(StateError::NonMatchingResponse {
+                    err_str: "unknown callback id".to_string(),
+                    originator: response.originator,
+                    callback_id: response.originator_reply_callback,
+                    respondent: response.respondent,
+                })
+            }
+        }
     }
 
     /// Accepts a canister result and produces an action that should be taken
@@ -372,11 +443,9 @@ impl CallContextManager {
                 CallContextAction::Reply { payload, refund }
             }
             (Ok(Some(WasmResult::Reply(payload))), Responded::No, OutstandingCalls::Yes) => {
-                context.responded = true;
-                CallContextAction::Reply {
-                    payload,
-                    refund: context.available_cycles,
-                }
+                let refund = context.available_cycles;
+                context.mark_responded();
+                CallContextAction::Reply { payload, refund }
             }
 
             (Ok(Some(WasmResult::Reject(payload))), Responded::No, OutstandingCalls::No) => {
@@ -385,11 +454,9 @@ impl CallContextManager {
                 CallContextAction::Reject { payload, refund }
             }
             (Ok(Some(WasmResult::Reject(payload))), Responded::No, OutstandingCalls::Yes) => {
-                context.responded = true;
-                CallContextAction::Reject {
-                    payload,
-                    refund: context.available_cycles,
-                }
+                let refund = context.available_cycles;
+                context.mark_responded();
+                CallContextAction::Reject { payload, refund }
             }
 
             (Err(error), Responded::No, OutstandingCalls::No) => {
@@ -458,6 +525,38 @@ impl CallContextManager {
             .iter()
             .filter(|(_, callback)| callback.call_context_id == call_context_id)
             .count()
+    }
+
+    /// Expose the `next_callback_id` field so that the canister sandbox can
+    /// predict what the new ids will be.
+    pub fn next_callback_id(&self) -> u64 {
+        self.next_callback_id
+    }
+
+    pub fn call_contexts_older_than(
+        &self,
+        current_time: Time,
+        duration: Duration,
+    ) -> Vec<(CallOrigin, Time)> {
+        // Call contexts are stored in order of increasing CallContextId, and
+        // the IDs are generated sequentially, so we are iterating in order of
+        // creation time. This means we can stop as soon as we encounter a call
+        // context that isn't old enough.
+        self.call_contexts
+            .iter()
+            .take_while(|(_, call_context)| match call_context.time() {
+                Some(context_time) => context_time + duration <= current_time,
+                None => true,
+            })
+            .filter_map(|(_, call_context)| {
+                if let Some(time) = call_context.time() {
+                    if !call_context.is_deleted() {
+                        return Some((call_context.call_origin().clone(), time));
+                    }
+                }
+                None
+            })
+            .collect()
     }
 }
 

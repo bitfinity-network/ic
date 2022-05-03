@@ -20,8 +20,11 @@ use ic_types::{
 use lazy_static::lazy_static;
 use maplit::btreeset;
 use serde::{Deserialize, Serialize};
-use std::convert::{TryFrom, TryInto};
 use std::str::FromStr;
+use std::{
+    collections::BTreeMap,
+    convert::{TryFrom, TryInto},
+};
 use std::{collections::BTreeSet, sync::Arc};
 
 lazy_static! {
@@ -75,6 +78,8 @@ pub struct SystemState {
     pub certified_data: Vec<u8>,
     pub canister_metrics: CanisterMetrics,
 
+    /// Should only be modified through `CyclesAccountManager`.
+    ///
     /// A canister's state has an associated cycles balance, and may `send` a
     /// part of this cycles balance to another canister.
     /// In addition to sending cycles to another canister, a canister `spend`s
@@ -86,7 +91,7 @@ pub struct SystemState {
     ///     1. reserving maximum cycles the operation can require
     ///     2. executing the operation and return `cycles_spent`
     ///     3. reimburse the canister with `cycles_reserved` - `cycles_spent`
-    pub cycles_balance: Cycles,
+    cycles_balance: Cycles,
 }
 
 /// A wrapper around the different canister statuses.
@@ -284,6 +289,16 @@ impl SystemState {
         self.canister_id
     }
 
+    /// Returns a mutable reference to the balance of the canister.
+    pub fn balance_mut(&mut self) -> &mut Cycles {
+        &mut self.cycles_balance
+    }
+
+    /// Returns the amount of cycles that the balance holds.
+    pub fn balance(&self) -> Cycles {
+        self.cycles_balance
+    }
+
     /// This method is used for maintaining the backwards compatibility.
     /// Returns:
     /// - controller ID as-is, if there is only one controller.
@@ -348,6 +363,14 @@ impl SystemState {
             self.canister_id, msg.sender
         );
         self.queues.push_output_request(msg)
+    }
+
+    /// Returns the number of output requests that can be pushed onto the queue
+    /// before it becomes full. Specifically, this is the number of times
+    /// `push_output_request` can be called (assuming the canister has enough
+    /// cycles to pay for sending the messages).
+    pub fn available_output_request_slots(&self) -> BTreeMap<CanisterId, usize> {
+        self.queues.available_output_request_slots()
     }
 
     /// Pushes a `Response` type message into the relevant output queue. The
@@ -437,16 +460,34 @@ impl SystemState {
             }
 
             // Everything else is accepted iff there is available memory and queue slots.
-            (_, CanisterStatus::Running { .. })
-            | (RequestOrResponse::Response(_), CanisterStatus::Stopping { .. }) => push_input(
-                &mut self.queues,
-                index,
-                msg,
-                canister_available_memory,
-                subnet_available_memory,
-                own_subnet_type,
-                input_queue_type,
-            ),
+            (
+                _,
+                CanisterStatus::Running {
+                    call_context_manager,
+                },
+            )
+            | (
+                RequestOrResponse::Response(_),
+                CanisterStatus::Stopping {
+                    call_context_manager,
+                    ..
+                },
+            ) => {
+                if let RequestOrResponse::Response(response) = &msg {
+                    call_context_manager
+                        .validate_response(response)
+                        .map_err(|err| (err, msg.clone()))?;
+                }
+                push_input(
+                    &mut self.queues,
+                    index,
+                    msg,
+                    canister_available_memory,
+                    subnet_available_memory,
+                    own_subnet_type,
+                    input_queue_type,
+                )
+            }
         }
     }
 
@@ -512,9 +553,9 @@ impl SystemState {
         self.queues.filter_ingress_messages(filter);
     }
 
-    /// Returns the memory that is currently used by the `SystemState`.
-    pub fn memory_usage(&self, own_subnet_type: SubnetType) -> NumBytes {
-        if ENFORCE_MESSAGE_MEMORY_USAGE && own_subnet_type != SubnetType::System {
+    /// Returns the memory currently in use by the `SystemState`.
+    pub fn memory_usage(&self) -> NumBytes {
+        if ENFORCE_MESSAGE_MEMORY_USAGE {
             ((self.queues.memory_usage()) as u64).into()
         } else {
             NumBytes::from(0)
@@ -551,6 +592,9 @@ impl SystemState {
     ///
     /// `subnet_available_memory` is updated to reflect the change in
     /// `self.queues` memory usage.
+    ///
+    /// Available memory is ignored (but updated) for system subnets, since we
+    /// don't want to DoS system canisters due to lots of incoming requests.
     pub fn induct_messages_to_self(
         &mut self,
         canister_available_memory: i64,
@@ -563,7 +607,7 @@ impl SystemState {
             CanisterStatus::Stopped | CanisterStatus::Stopping { .. } => return,
         }
 
-        if !ENFORCE_MESSAGE_MEMORY_USAGE || own_subnet_type == SubnetType::System {
+        if !ENFORCE_MESSAGE_MEMORY_USAGE {
             while self.queues.induct_message_to_self(self.canister_id).is_ok() {}
             return;
         }
@@ -573,7 +617,7 @@ impl SystemState {
 
         while let Some(msg) = self.queues.peek_output(&self.canister_id) {
             // Ensure that enough memory is available for inducting `msg`.
-            if can_push(&*msg, available_memory).is_err() {
+            if own_subnet_type != SubnetType::System && can_push(&*msg, available_memory).is_err() {
                 // Bail out if not enough memory available for message.
                 return;
             }
@@ -618,23 +662,26 @@ pub(crate) fn push_input(
     own_subnet_type: SubnetType,
     input_queue_type: InputQueueType,
 ) -> Result<(), (StateError, RequestOrResponse)> {
-    if !ENFORCE_MESSAGE_MEMORY_USAGE || own_subnet_type == SubnetType::System {
+    if !ENFORCE_MESSAGE_MEMORY_USAGE {
         return queues.push_input(index, msg, input_queue_type);
     }
 
-    let available_memory = queues_available_memory.min(*subnet_available_memory);
-    if let Err(required_memory) = can_push(&msg, available_memory) {
-        return Err((
-            StateError::OutOfMemory {
-                requested: NumBytes::new(required_memory as u64),
-                available: available_memory,
-            },
-            msg,
-        ));
+    // Do not enforce limits for local messages on system subnets.
+    if own_subnet_type != SubnetType::System || input_queue_type != InputQueueType::LocalSubnet {
+        let available_memory = queues_available_memory.min(*subnet_available_memory);
+        if let Err(required_memory) = can_push(&msg, available_memory) {
+            return Err((
+                StateError::OutOfMemory {
+                    requested: NumBytes::new(required_memory as u64),
+                    available: available_memory,
+                },
+                msg,
+            ));
+        }
     }
 
-    // Adjust `subnet_available_memory` by `memory_usage_before -
-    // memory_usage_after`. Defer to `CanisterQueues` for the accounting, to avoid
+    // But always adjust `subnet_available_memory` by `memory_usage_before -
+    // memory_usage_after`. Defer the accounting to `CanisterQueues`, to avoid
     // duplication (and the possibility of divergence).
     *subnet_available_memory += queues.memory_usage() as i64;
     let res = queues.push_input(index, msg, input_queue_type);

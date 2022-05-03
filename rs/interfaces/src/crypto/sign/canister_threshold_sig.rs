@@ -2,13 +2,11 @@
 //! (and the associated I-DKG)
 
 use ic_base_types::NodeId;
-use ic_base_types::PrincipalId;
 use ic_types::crypto::canister_threshold_sig::error::{
     IDkgCreateDealingError, IDkgCreateTranscriptError, IDkgLoadTranscriptError,
-    IDkgLoadTranscriptWithOpeningsError, IDkgOpenTranscriptError, IDkgVerifyComplaintError,
-    IDkgVerifyDealingPrivateError, IDkgVerifyDealingPublicError, IDkgVerifyOpeningError,
-    IDkgVerifyTranscriptError, ThresholdEcdsaCombineSigSharesError,
-    ThresholdEcdsaGetPublicKeyError, ThresholdEcdsaSignShareError,
+    IDkgOpenTranscriptError, IDkgVerifyComplaintError, IDkgVerifyDealingPrivateError,
+    IDkgVerifyDealingPublicError, IDkgVerifyOpeningError, IDkgVerifyTranscriptError,
+    ThresholdEcdsaCombineSigSharesError, ThresholdEcdsaSignShareError,
     ThresholdEcdsaVerifyCombinedSignatureError, ThresholdEcdsaVerifySigShareError,
 };
 use ic_types::crypto::canister_threshold_sig::idkg::{
@@ -16,8 +14,7 @@ use ic_types::crypto::canister_threshold_sig::idkg::{
     IDkgTranscriptParams,
 };
 use ic_types::crypto::canister_threshold_sig::{
-    EcdsaPublicKey, ThresholdEcdsaCombinedSignature, ThresholdEcdsaSigInputs,
-    ThresholdEcdsaSigShare,
+    ThresholdEcdsaCombinedSignature, ThresholdEcdsaSigInputs, ThresholdEcdsaSigShare,
 };
 use std::collections::BTreeMap;
 
@@ -48,6 +45,7 @@ pub trait IDkgProtocol {
     fn verify_dealing_public(
         &self,
         params: &IDkgTranscriptParams,
+        dealer_id: NodeId,
         dealing: &IDkgDealing,
     ) -> Result<(), IDkgVerifyDealingPublicError>;
 
@@ -64,6 +62,7 @@ pub trait IDkgProtocol {
     fn verify_dealing_private(
         &self,
         params: &IDkgTranscriptParams,
+        dealer_id: NodeId,
         dealing: &IDkgDealing,
     ) -> Result<(), IDkgVerifyDealingPrivateError>;
 
@@ -109,7 +108,7 @@ pub trait IDkgProtocol {
         transcript: &IDkgTranscript,
     ) -> Result<Vec<IDkgComplaint>, IDkgLoadTranscriptError>;
 
-    /// Verify the validity of a complaint against some dealings.
+    /// Verifies the validity of a complaint against some dealings.
     ///
     /// This:
     /// * Checks the decryption verification proof
@@ -118,17 +117,47 @@ pub trait IDkgProtocol {
     ///   * Confirms that the ciphertext can't be decrypted
     ///   * Checks that the decrypted share is not consistent with the
     ///     polynomial commitment.
+    ///
+    /// # Errors
+    /// * `IDkgVerifyComplaintError::InvalidComplaint` if the complaint is invalid.
+    /// * `IDkgVerifyComplaintError::InvalidArguments` if one or more arguments
+    ///   are invalid.
+    /// * `IDkgVerifyComplaintError::InvalidArgumentsMismatchingTranscriptIDs` if
+    ///   the transcript IDs in the transcript and the complaint do not match (i.e.,
+    ///   are not equal).
+    /// * `IDkgVerifyComplaintError::InvalidArgumentsMissingDealingInTranscript`
+    ///   if the (verified) dealings in the transcript do not contain a dealing
+    ///   whose dealer ID matches the complaint's dealer ID.
+    /// * `IDkgVerifyComplaintError::InvalidArgumentsMissingComplainerInTranscript`
+    ///   if the transcript's receivers do not contain a receiver whose ID matches
+    ///   the complaint's complainer ID.
+    /// * `IDkgVerifyComplaintError::ComplainerPublicKeyNotInRegistry` if the
+    ///   complainer's (MEGa) public key cannot be found in the registry.
+    /// * `IDkgVerifyComplaintError::MalformedComplainerPublicKey` if the
+    ///   complainer's (MEGa) public key fetched from the registry is malformed.
+    /// * `IDkgVerifyComplaintError::UnsupportedComplainerPublicKeyAlgorithm` if
+    ///   the algorithm of the complainer's (MEGa) public key in the registry is
+    ///   not supported.
+    /// * `IDkgVerifyComplaintError::SerializationError` if the (internal raw)
+    ///   complaint cannot be deserialized, or if the dealing corresponding to the
+    ///   complaint's dealer ID cannot be deserialized from the transcript.
+    /// * `IDkgVerifyComplaintError::Registry` if the registry client returns an
+    ///   error, e.g., because the transcript's `registry_version` is not available.
+    /// * `IDkgVerifyComplaintError::InternalError` if an internal error occurred
+    ///   during the verification.
     fn verify_complaint(
         &self,
         transcript: &IDkgTranscript,
-        complainer: NodeId,
+        complainer_id: NodeId,
         complaint: &IDkgComplaint,
     ) -> Result<(), IDkgVerifyComplaintError>;
 
-    /// Generate an opening for the dealing given in `complaint`.
+    /// Generate an opening for the dealing given in `complaint`,
+    /// reported by `complainer_id`.
     fn open_transcript(
         &self,
         transcript: &IDkgTranscript,
+        complainer_id: NodeId,
         complaint: &IDkgComplaint,
     ) -> Result<IDkgOpening, IDkgOpenTranscriptError>;
 
@@ -150,9 +179,9 @@ pub trait IDkgProtocol {
     ///   `verify_opening(transcript, opener, opening, complaint).is_ok()`
     fn load_transcript_with_openings(
         &self,
-        transcript: IDkgTranscript,
-        openings: BTreeMap<IDkgComplaint, BTreeMap<NodeId, IDkgOpening>>,
-    ) -> Result<(), IDkgLoadTranscriptWithOpeningsError>;
+        transcript: &IDkgTranscript,
+        openings: &BTreeMap<IDkgComplaint, BTreeMap<NodeId, IDkgOpening>>,
+    ) -> Result<(), IDkgLoadTranscriptError>;
 
     /// Retain only the given transcripts in the local state.
     fn retain_active_transcripts(&self, active_transcripts: &[IDkgTranscript]);
@@ -185,7 +214,7 @@ pub trait ThresholdEcdsaSigVerifier {
     fn combine_sig_shares(
         &self,
         inputs: &ThresholdEcdsaSigInputs,
-        shares: &[ThresholdEcdsaSigShare],
+        shares: &BTreeMap<NodeId, ThresholdEcdsaSigShare>,
     ) -> Result<ThresholdEcdsaCombinedSignature, ThresholdEcdsaCombineSigSharesError>;
 
     /// Verify that a combined signature was properly created from the inputs.
@@ -194,11 +223,4 @@ pub trait ThresholdEcdsaSigVerifier {
         inputs: &ThresholdEcdsaSigInputs,
         signature: &ThresholdEcdsaCombinedSignature,
     ) -> Result<(), ThresholdEcdsaVerifyCombinedSignatureError>;
-
-    /// Get the master public key for the given canister.
-    fn get_public_key(
-        &self,
-        canister_id: PrincipalId,
-        key_transcript: IDkgTranscript,
-    ) -> Result<EcdsaPublicKey, ThresholdEcdsaGetPublicKeyError>;
 }

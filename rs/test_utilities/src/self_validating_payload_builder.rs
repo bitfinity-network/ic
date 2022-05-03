@@ -1,3 +1,4 @@
+use ic_btc_types_internal::BitcoinAdapterResponse;
 use ic_interfaces::self_validating_payload::{
     SelfValidatingPayloadBuilder, SelfValidatingPayloadValidationError,
 };
@@ -7,11 +8,20 @@ use ic_types::{
 };
 
 #[derive(Default)]
-pub struct FakeSelfValidatingPayloadBuilder {}
+pub struct FakeSelfValidatingPayloadBuilder(Vec<BitcoinAdapterResponse>);
 
 impl FakeSelfValidatingPayloadBuilder {
-    pub fn new() -> FakeSelfValidatingPayloadBuilder {
-        FakeSelfValidatingPayloadBuilder {}
+    pub fn new() -> Self {
+        Default::default()
+    }
+
+    pub fn with_responses(mut self, responses: Vec<BitcoinAdapterResponse>) -> Self {
+        self.0 = responses;
+        self
+    }
+
+    pub fn build(&self) -> SelfValidatingPayload {
+        SelfValidatingPayload::new(self.0.clone())
     }
 }
 
@@ -22,7 +32,7 @@ impl SelfValidatingPayloadBuilder for FakeSelfValidatingPayloadBuilder {
         _past_payloads: &[&SelfValidatingPayload],
         _byte_limit: NumBytes,
     ) -> SelfValidatingPayload {
-        SelfValidatingPayload::new()
+        SelfValidatingPayload::new(self.0.clone())
     }
 
     fn validate_self_validating_payload(

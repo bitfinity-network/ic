@@ -36,7 +36,7 @@ where
             crypto.allowed_tls_clients => format!("{:?}", allowed_clients),
         );
         debug!(logger; crypto.description => "start",);
-        let result = server_handshake::perform_tls_server_handshake(
+        let result = rustls::server_handshake::perform_tls_server_handshake(
             &self.csp,
             self.node_id,
             &self.registry_client,
@@ -95,7 +95,7 @@ where
             crypto.allowed_tls_clients => "all clients allowed",
         );
         debug!(logger; crypto.description => "start",);
-        let result = server_handshake::perform_tls_server_handshake_without_client_auth(
+        let result = rustls::server_handshake::perform_tls_server_handshake_without_client_auth(
             &self.csp,
             self.node_id,
             &self.registry_client,
@@ -152,7 +152,7 @@ where
             crypto.tls_server => format!("{}", server),
         );
         debug!(logger; crypto.description => "start",);
-        let result = client_handshake::perform_tls_client_handshake(
+        let result = rustls::client_handshake::perform_tls_client_handshake(
             &self.csp,
             self.node_id,
             &self.registry_client,
@@ -249,7 +249,7 @@ fn tls_cert_from_registry(
     node_id: NodeId,
     registry_version: RegistryVersion,
 ) -> Result<TlsPublicKeyCert, TlsCertFromRegistryError> {
-    use ic_registry_client::helper::crypto::CryptoRegistry;
+    use ic_registry_client_helpers::crypto::CryptoRegistry;
     registry
         .get_tls_certificate(node_id, registry_version)?
         .map_or_else(

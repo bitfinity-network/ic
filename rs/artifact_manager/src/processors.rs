@@ -5,29 +5,28 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use ic_interfaces::{
     artifact_manager::{ArtifactProcessor, ProcessingResult},
     artifact_pool::UnvalidatedArtifact,
+    canister_http::*,
     certification,
     certification::{Certifier, CertifierGossip, MutableCertificationPool},
     consensus::{Consensus, ConsensusGossip},
     consensus_pool::{ChangeAction as ConsensusAction, ConsensusPoolCache, MutableConsensusPool},
     dkg::{ChangeAction as DkgChangeAction, Dkg, DkgGossip, MutableDkgPool},
     ecdsa::{Ecdsa, EcdsaChangeAction, EcdsaGossip, MutableEcdsaPool},
+    gossip_pool::CanisterHttpGossipPool,
     ingress_manager::IngressHandler,
-    ingress_pool::{
-        ChangeAction as IngressAction, IngressPoolObject, IngressPoolSelect, MutableIngressPool,
-        SelectResult,
-    },
+    ingress_pool::{ChangeAction as IngressAction, MutableIngressPool},
     time_source::{SysTimeSource, TimeSource},
 };
-use ic_logger::{debug, info, warn, ReplicaLogger};
+use ic_logger::{debug, warn, ReplicaLogger};
 use ic_metrics::MetricsRegistry;
-use ic_types::consensus::HasRank;
 use ic_types::{
     artifact::*,
     consensus::{certification::CertificationMessage, dkg, ConsensusMessage},
     malicious_flags::MaliciousFlags,
     messages::SignedIngress,
-    NodeId, Time,
+    NodeId,
 };
+use ic_types::{canister_http::CanisterHttpResponseShare, consensus::HasRank};
 use prometheus::{histogram_opts, labels, Histogram, IntCounter};
 use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 use std::sync::{Arc, Mutex, RwLock};
@@ -248,11 +247,9 @@ impl<Artifact: ArtifactKind + 'static> Drop for ArtifactProcessorManager<Artifac
 const ARTIFACT_MANAGER_TIMER_DURATION_MSEC: u64 = 200;
 
 /// *Consensus* `OnStateChange` client.
-pub struct ConsensusProcessor<PoolConsensus, PoolIngress> {
+pub struct ConsensusProcessor<PoolConsensus> {
     /// The *Consensus* pool.
     consensus_pool: Arc<RwLock<PoolConsensus>>,
-    /// The ingress pool.
-    ingress_pool: Arc<RwLock<PoolIngress>>,
     /// The *Consensus* client.
     client: Box<dyn Consensus>,
     /// The invalidated artifacts counter.
@@ -261,10 +258,8 @@ pub struct ConsensusProcessor<PoolConsensus, PoolIngress> {
     log: ReplicaLogger,
 }
 
-impl<
-        PoolConsensus: MutableConsensusPool + Send + Sync + 'static,
-        PoolIngress: IngressPoolSelect + Send + Sync + 'static,
-    > ConsensusProcessor<PoolConsensus, PoolIngress>
+impl<PoolConsensus: MutableConsensusPool + Send + Sync + 'static>
+    ConsensusProcessor<PoolConsensus>
 {
     #[allow(clippy::too_many_arguments)]
     pub fn build<
@@ -277,7 +272,6 @@ impl<
         setup: F,
         time_source: Arc<SysTimeSource>,
         consensus_pool: Arc<RwLock<PoolConsensus>>,
-        ingress_pool: Arc<RwLock<PoolIngress>>,
         log: ReplicaLogger,
         metrics_registry: MetricsRegistry,
     ) -> (
@@ -287,7 +281,6 @@ impl<
         let (consensus, consensus_gossip) = setup();
         let client = Self {
             consensus_pool: consensus_pool.clone(),
-            ingress_pool,
             client: Box::new(consensus),
             invalidated_artifacts: metrics_registry.int_counter(
                 "consensus_invalidated_artifacts",
@@ -314,10 +307,8 @@ impl<
     }
 }
 
-impl<
-        PoolConsensus: MutableConsensusPool + Send + Sync + 'static,
-        PoolIngress: IngressPoolSelect + Send + Sync + 'static,
-    > ArtifactProcessor<ConsensusArtifact> for ConsensusProcessor<PoolConsensus, PoolIngress>
+impl<PoolConsensus: MutableConsensusPool + Send + Sync + 'static>
+    ArtifactProcessor<ConsensusArtifact> for ConsensusProcessor<PoolConsensus>
 {
     /// The method processes changes in the *Consensus* pool and ingress pool.
     fn process_changes(
@@ -340,9 +331,7 @@ impl<
         let mut adverts = Vec::new();
         let change_set = {
             let consensus_pool = self.consensus_pool.read().unwrap();
-            let ingress_pool = Arc::clone(&self.ingress_pool) as Arc<_>;
-            let ingress_pool = IngressPoolSelectWrapper::new(&ingress_pool);
-            self.client.on_state_change(&*consensus_pool, &ingress_pool)
+            self.client.on_state_change(&*consensus_pool)
         };
         let changed = if !change_set.is_empty() {
             ProcessingResult::StateChanged
@@ -365,7 +354,7 @@ impl<
                     ));
                     if let ConsensusMessage::BlockProposal(p) = to_add {
                         let rank = p.clone().content.decompose().1.rank();
-                        info!(
+                        debug!(
                             self.log,
                             "Added proposal {:?} of rank {:?} to artifact pool", p, rank
                         );
@@ -378,7 +367,7 @@ impl<
                     ));
                     if let ConsensusMessage::BlockProposal(p) = to_move {
                         let rank = p.clone().content.decompose().1.rank();
-                        info!(
+                        debug!(
                             self.log,
                             "Moved proposal {:?} of rank {:?} to artifact pool", p, rank
                         );
@@ -407,31 +396,6 @@ impl<
             .apply_changes(time_source, change_set);
 
         (adverts, changed)
-    }
-}
-
-/// A wrapper for the ingress pool that delays locking until the member function
-/// of `IngressPoolSelect` is actually called.
-struct IngressPoolSelectWrapper {
-    pool: std::sync::Arc<std::sync::RwLock<dyn IngressPoolSelect>>,
-}
-
-impl IngressPoolSelectWrapper {
-    /// The constructor creates a `IngressPoolSelectWrapper` instance.
-    pub fn new(pool: &std::sync::Arc<std::sync::RwLock<dyn IngressPoolSelect>>) -> Self {
-        IngressPoolSelectWrapper { pool: pool.clone() }
-    }
-}
-
-/// `IngressPoolSelectWrapper` implements the `IngressPoolSelect` trait.
-impl IngressPoolSelect for IngressPoolSelectWrapper {
-    fn select_validated<'a>(
-        &self,
-        range: std::ops::RangeInclusive<Time>,
-        f: Box<dyn FnMut(&IngressPoolObject) -> SelectResult<SignedIngress> + 'a>,
-    ) -> Vec<SignedIngress> {
-        let pool = self.pool.read().unwrap();
-        pool.select_validated(range, f)
     }
 }
 
@@ -863,6 +827,118 @@ impl<PoolEcdsa: MutableEcdsaPool + Send + Sync + 'static> ArtifactProcessor<Ecds
         };
 
         self.ecdsa_pool.write().unwrap().apply_changes(change_set);
+        (adverts, changed)
+    }
+}
+
+pub struct CanisterHttpProcessor<PoolCanisterHttp> {
+    consensus_pool_cache: Arc<dyn ConsensusPoolCache>,
+    canister_http_pool: Arc<RwLock<PoolCanisterHttp>>,
+    client: Box<dyn CanisterHttpPoolManager>,
+    log: ReplicaLogger,
+}
+
+impl<
+        PoolCanisterHttp: MutableCanisterHttpPool + CanisterHttpGossipPool + Send + Sync + 'static,
+    > CanisterHttpProcessor<PoolCanisterHttp>
+{
+    pub fn build<
+        C: CanisterHttpPoolManager + 'static,
+        G: CanisterHttpGossip + Send + Sync + 'static,
+        S: Fn(AdvertSendRequest<CanisterHttpArtifact>) + Send + 'static,
+        F: FnOnce() -> (C, G),
+    >(
+        send_advert: S,
+        setup: F,
+        time_source: Arc<SysTimeSource>,
+        consensus_pool_cache: Arc<dyn ConsensusPoolCache>,
+        canister_http_pool: Arc<RwLock<PoolCanisterHttp>>,
+        log: ReplicaLogger,
+        metrics_registry: MetricsRegistry,
+    ) -> (
+        clients::CanisterHttpClient<PoolCanisterHttp>,
+        ArtifactProcessorManager<CanisterHttpArtifact>,
+    ) {
+        let (pool_manager, canister_http_gossip) = setup();
+        let client = Self {
+            consensus_pool_cache: consensus_pool_cache.clone(),
+            canister_http_pool: canister_http_pool.clone(),
+            client: Box::new(pool_manager),
+            log,
+        };
+        let manager = ArtifactProcessorManager::new(
+            time_source,
+            metrics_registry,
+            BoxOrArcClient::BoxClient(Box::new(client)),
+            send_advert,
+        );
+        (
+            clients::CanisterHttpClient::new(canister_http_pool, canister_http_gossip),
+            manager,
+        )
+    }
+}
+
+impl<PoolCanisterHttp: MutableCanisterHttpPool + Send + Sync + 'static>
+    ArtifactProcessor<CanisterHttpArtifact> for CanisterHttpProcessor<PoolCanisterHttp>
+{
+    fn process_changes(
+        &self,
+        _time_source: &dyn TimeSource,
+        artifacts: Vec<UnvalidatedArtifact<CanisterHttpResponseShare>>,
+    ) -> (
+        Vec<AdvertSendRequest<CanisterHttpArtifact>>,
+        ProcessingResult,
+    ) {
+        {
+            let mut pool = self.canister_http_pool.write().unwrap();
+            for artifact in artifacts {
+                pool.insert(artifact);
+            }
+        }
+
+        let mut adverts = Vec::new();
+        let change_set = {
+            let canister_http_pool = self.canister_http_pool.read().unwrap();
+            let change_set = self
+                .client
+                .on_state_change(self.consensus_pool_cache.as_ref(), &*canister_http_pool);
+
+            for change_action in change_set.iter() {
+                match change_action {
+                    CanisterHttpChangeAction::AddToValidated(share, _) => {
+                        adverts.push(CanisterHttpArtifact::message_to_advert_send_request(
+                            share,
+                            AdvertClass::Critical,
+                        ))
+                    }
+                    CanisterHttpChangeAction::MoveToValidated(msg_id) => {
+                        if let Some(msg) = canister_http_pool.lookup_unvalidated(msg_id) {
+                            adverts.push(CanisterHttpArtifact::message_to_advert_send_request(
+                                &msg,
+                                AdvertClass::Critical,
+                            ))
+                        } else {
+                            warn!(
+                                self.log,
+                                "CanisterHttpProcessor::MoveToValidated(): artifact not found: {:?}",
+                                msg_id
+                            );
+                        }
+                    }
+                    CanisterHttpChangeAction::RemoveValidated(_) => {}
+                    CanisterHttpChangeAction::RemoveUnvalidated(_) => {}
+                    CanisterHttpChangeAction::HandleInvalid(_, _) => {}
+                }
+            }
+            change_set
+        };
+
+        let changed = if !change_set.is_empty() {
+            ProcessingResult::StateChanged
+        } else {
+            ProcessingResult::StateUnchanged
+        };
         (adverts, changed)
     }
 }

@@ -1,7 +1,6 @@
 use ic_base_types::{CanisterIdError, PrincipalIdBlobParseError};
-use ic_types::{
-    methods::WasmMethod, user_error::UserError, CanisterId, CanisterStatusType, Cycles,
-};
+use ic_error_types::UserError;
+use ic_types::{methods::WasmMethod, CanisterId, Cycles};
 use ic_wasm_types::{WasmEngineError, WasmInstrumentationError, WasmValidationError};
 use serde::{Deserialize, Serialize};
 
@@ -65,49 +64,6 @@ impl std::fmt::Display for CanisterOutOfCyclesError {
     }
 }
 
-/// Errors when executing `canister_heartbeat`.
-#[derive(Debug, Eq, PartialEq)]
-pub enum CanisterHeartbeatError {
-    /// The canister isn't running.
-    CanisterNotRunning {
-        status: CanisterStatusType,
-    },
-
-    OutOfCycles(CanisterOutOfCyclesError),
-
-    /// Execution failed while executing the `canister_heartbeat`.
-    CanisterExecutionFailed(HypervisorError),
-}
-
-impl std::fmt::Display for CanisterHeartbeatError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            CanisterHeartbeatError::CanisterNotRunning { status } => write!(
-                f,
-                "Canister in status {} instead of {}",
-                status,
-                CanisterStatusType::Running
-            ),
-            CanisterHeartbeatError::OutOfCycles(err) => write!(f, "{}", err),
-            CanisterHeartbeatError::CanisterExecutionFailed(err) => write!(f, "{}", err),
-        }
-    }
-}
-
-impl CanisterHeartbeatError {
-    /// Does this error come from a problem in the execution environment?
-    /// Other errors could be caused by bad canister code.
-    pub fn is_system_error(&self) -> bool {
-        match self {
-            CanisterHeartbeatError::CanisterExecutionFailed(hypervisor_err) => {
-                hypervisor_err.is_system_error()
-            }
-            CanisterHeartbeatError::CanisterNotRunning { status: _ }
-            | CanisterHeartbeatError::OutOfCycles(_) => false,
-        }
-    }
-}
-
 /// Errors returned by the Hypervisor.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum HypervisorError {
@@ -162,6 +118,9 @@ pub enum HypervisorError {
         cleanup_err: Box<HypervisorError>,
     },
     WasmEngineError(WasmEngineError),
+    /// The canister is close to running out of Wasm memory and
+    /// attempted to allocate reserved Wasm pages.
+    WasmReservedPages,
 }
 
 impl From<WasmInstrumentationError> for HypervisorError {
@@ -190,7 +149,7 @@ impl std::fmt::Display for HypervisorError {
 
 impl HypervisorError {
     pub fn into_user_error(self, canister_id: &CanisterId) -> UserError {
-        use ic_types::user_error::ErrorCode as E;
+        use ic_error_types::ErrorCode as E;
 
         match self {
             Self::MessageRejected => UserError::new(
@@ -236,8 +195,8 @@ impl HypervisorError {
                 ),
             ),
             Self::InstructionLimitExceeded => UserError::new(
-                E::CanisterCyclesLimitExceeded,
-                format!("Canister {} exceeded the cycles limit for single message execution.", canister_id),
+                E::CanisterInstructionLimitExceeded,
+                format!("Canister {} exceeded the instruction limit for single message execution.", canister_id),
             ),
             Self::InvalidWasm(err) => UserError::new(
                 E::CanisterInvalidWasm,
@@ -265,6 +224,13 @@ impl HypervisorError {
                 E::CanisterOutOfMemory,
                 format!(
                     "Canister {} exceeded its allowed memory allocation",
+                    canister_id
+                ),
+            ),
+            Self::WasmReservedPages => UserError::new(
+                E::CanisterOutOfMemory,
+                format!(
+                    "Canister {} ran out of available Wasm memory.",
                     canister_id
                 ),
             ),
@@ -340,6 +306,7 @@ impl HypervisorError {
             HypervisorError::InsufficientCyclesBalance { .. } => "InsufficientCyclesBalance",
             HypervisorError::Cleanup { .. } => "Cleanup",
             HypervisorError::WasmEngineError(_) => "WasmEngineError",
+            HypervisorError::WasmReservedPages => "WasmReservedPages",
         }
     }
 
@@ -369,7 +336,8 @@ impl HypervisorError {
             | HypervisorError::InvalidPrincipalId(_)
             | HypervisorError::InvalidCanisterId(_)
             | HypervisorError::MessageRejected
-            | HypervisorError::InsufficientCyclesBalance(_) => false,
+            | HypervisorError::InsufficientCyclesBalance(_)
+            | HypervisorError::WasmReservedPages => false,
         }
     }
 }

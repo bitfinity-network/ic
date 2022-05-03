@@ -1,12 +1,10 @@
-use crate::{
-    registry::{setup_registry, SubnetRecordBuilder},
-    types::ids::{node_test_id, subnet_test_id},
-};
+use crate::types::ids::{node_test_id, subnet_test_id};
 use ic_interfaces::{
     certification::{Verifier, VerifierError},
     crypto::CryptoHashable,
     validation::ValidationResult,
 };
+use ic_test_utilities_registry::{setup_registry, SubnetRecordBuilder};
 use ic_types::{
     batch::*,
     consensus::certification::*,
@@ -14,6 +12,7 @@ use ic_types::{
     consensus::*,
     crypto::threshold_sig::ni_dkg::{NiDkgId, NiDkgTag, NiDkgTargetSubnet},
     crypto::*,
+    signature::*,
     *,
 };
 use serde::{Deserialize, Serialize};
@@ -206,7 +205,12 @@ impl FromParent for Block {
             ic_crypto::crypto_hash(parent),
             Payload::new(
                 ic_crypto::crypto_hash,
-                (BatchPayload::default(), Dealings::new_empty(dkg_start)).into(),
+                (
+                    BatchPayload::default(),
+                    Dealings::new_empty(dkg_start),
+                    None,
+                )
+                    .into(),
             ),
             parent.height.increment(),
             Rank(0),
@@ -257,6 +261,7 @@ fn test_fake_block_is_binary_compatible() {
             (
                 batch::BatchPayload::default(),
                 ic_types::consensus::dkg::Dealings::new_empty(Height::from(1)),
+                None,
             )
                 .into(),
         ),
@@ -284,6 +289,7 @@ fn test_fake_block() {
             (
                 batch::BatchPayload::default(),
                 ic_types::consensus::dkg::Dealings::new_empty(Height::from(1)),
+                None,
             )
                 .into(),
         ),

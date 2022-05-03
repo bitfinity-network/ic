@@ -15,11 +15,13 @@ derive_more = { git = "https://github.com/dfinity-lab/derive_more", branch = "ma
 hex = "0.4.2"
 http = "0.2.5"
 ic-base-types = { path = "../base_types" }
-ic-error-types = { path = "../error_types" }
-ic-ic00-types = { path = "../ic00_types" }
+ic-btc-types-internal = { path = "../../bitcoin/types/internal" }
+ic-constants = { path = "../../constants" }
 ic-crypto-internal-types = { path = "../../crypto/internal/crypto_lib/types" }
 ic-crypto-sha = { path = "../../crypto/sha" }
 ic-crypto-tree-hash = { path = "../../crypto/tree_hash" }
+ic-error-types = { path = "../error_types" }
+ic-ic00-types = { path = "../ic00_types" }
 ic-protobuf = { path = "../../protobuf" }
 ic-registry-transport = { path = "../../registry/transport" }
 ic-utils = { path = "../../utils" }
@@ -33,8 +35,8 @@ serde_bytes = "0.11"
 serde_cbor = "0.11.1"
 serde_with = "1.6.2"
 serde_json = "1.0.40"
-strum = "0.18.0"
-strum_macros = "0.18.0"
+strum = "0.23.0"
+strum_macros = "0.23.0"
 thiserror = "1.0"
 url = { version = "2", features = ["serde"] }
 
@@ -42,7 +44,9 @@ url = { version = "2", features = ["serde"] }
 anyhow = "1"
 assert_matches = "1.3.0"
 hex-literal = "0.2.1"
+ic-crypto-test-utils-canister-threshold-sigs = { path = "../../crypto/test_utils/canister_threshold_sigs" }
 pretty_assertions = "0.6.1"
+rand = "0.7.3"
 rusty-fork = "0.3.0"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]

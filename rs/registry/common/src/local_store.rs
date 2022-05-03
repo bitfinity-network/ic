@@ -1,17 +1,16 @@
-use crate::pb::local_store::v1::{
-    CertifiedTime as PbCertifiedTime, ChangelogEntry as PbChangelogEntry,
-    KeyMutation as PbKeyMutation, MutationType,
-};
 use ic_interfaces::registry::{
     LocalStoreCertifiedTimeReader, RegistryDataProvider, RegistryTransportRecord,
+};
+use ic_registry_common_proto::pb::local_store::v1::{
+    CertifiedTime as PbCertifiedTime, ChangelogEntry as PbChangelogEntry, Delta as PbDelta,
+    KeyMutation as PbKeyMutation, MutationType,
 };
 use ic_types::registry::RegistryDataProviderError;
 use ic_types::RegistryVersion;
 use ic_utils::fs::write_protobuf_using_tmp_file;
 use prost::Message;
 use std::{
-    convert::TryFrom,
-    io,
+    io::{self},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -64,7 +63,7 @@ pub trait LocalStoreWriter: Send + Sync {
     fn update_certified_time(&self, unix_epoch_nanos: u64) -> io::Result<()>;
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct LocalStoreImpl {
     /// Directory with one .pb file per registry version.
     path: PathBuf,
@@ -141,7 +140,9 @@ impl LocalStoreReader for LocalStoreImpl {
             .map(|i| self.get_path(i))
             .take_while(|p| p.exists())
             .try_fold(vec![], |mut res, p| {
-                res.push(ChangelogEntry::try_from(Self::read_changelog_entry(p)?)?);
+                res.push(changelog_entry_try_from_proto(Self::read_changelog_entry(
+                    p,
+                )?)?);
                 Ok(res)
             })
     }
@@ -150,23 +151,7 @@ impl LocalStoreReader for LocalStoreImpl {
 impl LocalStoreWriter for LocalStoreImpl {
     // precondition: version > 0
     fn store(&self, version: RegistryVersion, ce: ChangelogEntry) -> io::Result<()> {
-        assert!(!ce.is_empty());
-        let key_mutations = ce
-            .iter()
-            .map(|km| {
-                let mutation_type = if km.value.is_some() {
-                    MutationType::Set as i32
-                } else {
-                    MutationType::Unset as i32
-                };
-                PbKeyMutation {
-                    key: km.key.clone(),
-                    value: km.value.clone().unwrap_or_default(),
-                    mutation_type,
-                }
-            })
-            .collect();
-        let pb_ce = PbChangelogEntry { key_mutations };
+        let pb_ce = changelog_entry_to_protobuf(ce);
         self.write_changelog_entry(version.get(), pb_ce)
     }
 
@@ -216,65 +201,57 @@ impl RegistryDataProvider for LocalStoreImpl {
     }
 }
 
-impl TryFrom<PbChangelogEntry> for ChangelogEntry {
-    type Error = io::Error;
-
-    fn try_from(value: PbChangelogEntry) -> Result<Self, Self::Error> {
-        if value.key_mutations.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Empty changelog Entry.",
-            ));
-        }
-        value
-            .key_mutations
-            .iter()
-            .try_fold(vec![], |mut res, mutation| {
-                res.push(KeyMutation::try_from(mutation)?);
-                Ok(res)
-            })
+fn changelog_entry_try_from_proto(value: PbChangelogEntry) -> Result<ChangelogEntry, io::Error> {
+    if value.key_mutations.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Empty changelog Entry.",
+        ));
     }
+    value
+        .key_mutations
+        .iter()
+        .try_fold(vec![], |mut res, mutation| {
+            res.push(key_mutation_try_from_proto(mutation)?);
+            Ok(res)
+        })
 }
 
-impl TryFrom<&PbKeyMutation> for KeyMutation {
-    type Error = io::Error;
-
-    fn try_from(value: &PbKeyMutation) -> Result<Self, Self::Error> {
-        let mut_type = match MutationType::from_i32(value.mutation_type) {
-            Some(v) => v,
-            None => {
+fn key_mutation_try_from_proto(value: &PbKeyMutation) -> Result<KeyMutation, io::Error> {
+    let mut_type = match MutationType::from_i32(value.mutation_type) {
+        Some(v) => v,
+        None => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid mutation type.",
+            ))
+        }
+    };
+    let res = match mut_type {
+        MutationType::InvalidState => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid mutation type.",
+            ));
+        }
+        MutationType::Unset => {
+            if !value.value.is_empty() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "Invalid mutation type.",
-                ))
-            }
-        };
-        let res = match mut_type {
-            MutationType::InvalidState => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Invalid mutation type.",
+                    "Non-empty value for UNSET.",
                 ));
             }
-            MutationType::Unset => {
-                if !value.value.is_empty() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "Non-empty value for UNSET.",
-                    ));
-                }
-                KeyMutation {
-                    key: value.key.clone(),
-                    value: None,
-                }
-            }
-            MutationType::Set => KeyMutation {
+            KeyMutation {
                 key: value.key.clone(),
-                value: Some(value.value.clone()),
-            },
-        };
-        Ok(res)
-    }
+                value: None,
+            }
+        }
+        MutationType::Set => KeyMutation {
+            key: value.key.clone(),
+            value: Some(value.value.clone()),
+        },
+    };
+    Ok(res)
 }
 
 impl LocalStoreCertifiedTimeReader for LocalStoreImpl {
@@ -299,6 +276,79 @@ impl LocalStoreCertifiedTimeReader for LocalStoreImpl {
             ic_types::time::Time::from_nanos_since_unix_epoch(lock_guard.1)
         }
     }
+}
+
+/// Translate a compact protobuf message to a changelog.
+///
+/// The original use case is auxiliary services and utilities that interact with
+/// the mainnet-registry and ship with a hardcoded prefix. As the registry is
+/// designed as an append-only store, this has the benefit that the prefix does
+/// not need to be re-fetched. Further, all mainnet configuration information is
+/// already available (provided the software is received through an
+/// authenticated channel).
+pub fn compact_delta_to_changelog(source: &[u8]) -> std::io::Result<(RegistryVersion, Changelog)> {
+    PbDelta::decode(source)
+        .map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Protobuf encoding for registry delta failed: {:?}", e),
+            )
+        })
+        .and_then(|delta| {
+            let changelog =
+                delta
+                    .changelog
+                    .into_iter()
+                    .try_fold(vec![], |mut changelog, entry| {
+                        changelog.push(changelog_entry_try_from_proto(entry)?);
+                        Ok::<_, std::io::Error>(changelog)
+                    })?;
+            Ok((RegistryVersion::from(delta.registry_version), changelog))
+        })
+}
+
+/// Inverse of [compact_delta_to_changelog].
+///
+/// # Panics
+///
+/// This function panics if any of the changelog entries is empty.
+pub fn changelog_to_compact_delta(
+    registry_version: RegistryVersion,
+    changelog: Changelog,
+) -> std::io::Result<Vec<u8>> {
+    let changelog = changelog
+        .into_iter()
+        .map(changelog_entry_to_protobuf)
+        .collect::<Vec<_>>();
+    let delta = PbDelta {
+        registry_version: registry_version.get(),
+        changelog,
+    };
+    let mut buf = vec![];
+    delta
+        .encode(&mut buf)
+        .expect("Encoding protobuf message failed!");
+    Ok(buf)
+}
+
+fn changelog_entry_to_protobuf(ce: ChangelogEntry) -> PbChangelogEntry {
+    assert!(!ce.is_empty());
+    let key_mutations = ce
+        .iter()
+        .map(|km| {
+            let mutation_type = if km.value.is_some() {
+                MutationType::Set as i32
+            } else {
+                MutationType::Unset as i32
+            };
+            PbKeyMutation {
+                key: km.key.clone(),
+                value: km.value.clone().unwrap_or_default(),
+                mutation_type,
+            }
+        })
+        .collect();
+    PbChangelogEntry { key_mutations }
 }
 
 #[cfg(test)]
@@ -403,12 +453,12 @@ mod tests {
         assert_eq!(expected_time, actual_time);
     }
 
-    fn get_random_changelog(n: usize, mut rng: &mut ThreadRng) -> Changelog {
+    fn get_random_changelog(n: usize, rng: &mut ThreadRng) -> Changelog {
         // some pseudo random entries
         (0..n)
             .map(|_i| {
                 let k = rng.gen::<usize>() % 64 + 2;
-                (0..(k + 2)).map(|k| key_mutation(k, &mut rng)).collect()
+                (0..(k + 2)).map(|k| key_mutation(k, rng)).collect()
             })
             .collect()
     }
@@ -424,5 +474,18 @@ mod tests {
                 None
             },
         }
+    }
+
+    #[test]
+    fn mainnet_delta_can_be_read() {
+        let changelog = get_mainnet_delta();
+        assert_eq!(changelog.len(), 0x6dc1);
+    }
+
+    fn get_mainnet_delta() -> Changelog {
+        let mainnet_delta_raw = include_bytes!("../artifacts/mainnet_delta_00-6d-c1.pb");
+        compact_delta_to_changelog(&mainnet_delta_raw[..])
+            .expect("")
+            .1
     }
 }

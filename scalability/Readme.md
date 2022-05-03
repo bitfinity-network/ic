@@ -10,8 +10,8 @@ Currently, there is support for installing canisters, running the workload gener
 
 Experiments typically run in iterations, where each iteration typically increases stress on the system.
 
-Each experiment has an entry point at `run_experiment_n.py`.
-Some of them (currently only Experiment 1) have a maximum capacity script as well (`max-capacity-experiment-n.py`), where the load of the system is incrementally increased until failures occur.
+Each experiment has an entry point at `run_experiment_*.py`.
+Some of them (currently only Experiment 1) have a maximum capacity script as well (`max_capacity_*.py`), where the load of the system is incrementally increased until failures occur.
 
 When running benchmarks, the tool collects all measurements and quite a few metrics, most of them are collected for each iteration the benchmark is running.
 
@@ -19,17 +19,17 @@ A separate tool can be used to generate reports for previously collected benchma
 Those are HTML reports. Later, we can introduce more reports, e.g. to monitor performance over time. 
 Reports contain rich content (such as flamegraphs), but they also contain links to existing material such as existing Grafana dashboards.
 
-
 The code is as follows:
 - `metrics.py`: Abstraction for metrics. Can be started and stopped, which typically happens at the beginning and end of an iteration respectively. Currently supported are:
    - `flamegraphs.py`: Generation of flamegraphs on the target machine.
    - `prometheus.py`: Downloads metrics collected during benchmark execution on Prometheus.
 - `ssh.py`: Helpers to execute commands remotely via SSH
 - `experiment.py`: Base class for experiments. Implements common functionality like installing canisters or running the workload generator.
-   - `run_experiment_{1,2,3}.py`: Implements the given experiments as described in the IC-562
-   - `max-capacity-experiment-1.py`: Maximum capacity variants of the experiments - increases loads iteratively until the system starts to fail. Currently only experiment 1 is implemented.
+   - `workload_experiment.py`: Base class for workload generator based experiments. In addition to `experiment.py`, those experiments have built-in support for running the workload generator.
+   - `run_*_experiment.py`: Each of those implement a single benchmark as descrobed in IC-562
+   - `max_capacity_*.py`: Maximum capacity variants of the experiments - increases loads iteratively until the system starts to fail.
  - `report.py` and `generate_report.py`: Scripts to generate HTML reports out of collected measurements from experiment executions.
-   - `templates/`: folder for storing templates to generate HTML reports. There is one main`experiment.html.hb` is the main experiment report template, with `experiment_{1,2,3}.html.hb` defining the template for the experiment-specific part of the report.
+   - `templates/`: folder for storing templates to generate HTML reports. There is one main`experiment.html.hb` is the main experiment report template, with `experiment_*.html.hb` defining the template for the experiment-specific part of the report. The name of the template file has to match what's given as first argument to `write_summary_file`.
 
 
 # Install dependencies
@@ -42,50 +42,55 @@ A clean way of managing dependencies for a python project, is via isolated virtu
   $ cd ic/scalability
   ``` 
   ```
-  $ pipenv --python 3.8.10 # or some other python version
+  $ pipenv --python 3
   ```
   ```
-  $ pipenv shell # this will activate the environment
-  ```
-  ```
-  $ pip install -r requirements.txt
+  $ pipenv install -r requirements.txt
   ```
 
 # Deploy IC on the testnet
-In order to properly run experiments here, you should book *two* testnets.
 
-One of the testnets will be the one to run the experiments against. It should ideally be close to what we are running in mainnet.
+Experiments that don't require workload generators (directly inheriting from `experiment.py`) require *one* testnet: 
+the testnet on which we install canisters to benchmark.
+It should ideally be close to the hardware we are running in mainnet.
 Currently, testnets `benchmarklarge`, `benchmarksmall01` and `benchmarksmall02` are good candidates.
 
-Experiments typically also need a second testnet. We deploy workload generator instances on the guest OS images in that testnet.
-That means, that we also initially deploy an IC there, even though we turn off replicas there during experimentation so that
+Experiments using workload generators (based on `workload_experiment.py`) require *two* testnets in order to 
+guarantee a consistent setup of the workload generator machines.
+In those tests,
+we deploy workload generator instances on the guest OS images in that second testnet.
+That means, that we also initially deploy an IC there, even though we turn off replicas during experimentation so that
 the workload generator can be started there instead.
 
-This has multiple advantages:
+The use of a second testnet has multiple advantages:
 
  1. We can easily run multiple workload generators, as we have enough machines to deploy to and run the workload generator from.
     This is very important for some of the experiments, as otherwise, the client side of the experiment could become the 
-    bottleneck and not issue enough requests.
+    bottleneck and not issue enough requests (or not issue those requests at a consistent rate).
  2. We get a uniform environment to run the workload generator from (in contrast to some people running it in data centers and others
     from their laptop)
  3. Testnet machines are scrape targets for Prometheus, so we can immediately monitor the client side without additional setup.
 
+`--help` on the experiment file will inform you what the required arguments are 
+(both `--testnet` and `--wg_testnet` or only the former).
+
+Depending on your requirements, boot the testnets as usual.
   ```
-  $ testnet/tools/icos_deploy.sh $TESTNET --git-revision $(git rev-parse origin/master)
-  $ testnet/tools/icos_deploy.sh $WG_TESTNET --git-revision $(git rev-parse origin/master)
+  $ testnet/tools/icos_deploy.sh $TESTNET --git-revision $(./gitlab-ci/src/artifacts/newest_sha_with_disk_image.sh origin/master)
+  $ testnet/tools/icos_deploy.sh $WG_TESTNET --git-revision $(./gitlab-ci/src/artifacts/newest_sha_with_disk_image.sh origin/master)
   ```
 
 # Run the benchmark (experiment)
 
 As described above, make sure you have *two* testnets reserved, then:
 
-- Run the python script corresponding to your benchmark (make sure you are within the `pipenv shell`). A good starting point is the following, which benchmarks system overhead by stressing with query and update calls (default are queries, use `--use_updates=True` for update calls):
+- Run the python script corresponding to your benchmark. A good starting point is the following, which benchmarks system overhead by stressing with query and update calls. Default are queries, use `--use_updates=True` for update calls:
 
   ```
-  $  ./max-capacity-experiment-1.py --testnet $TESTNET --wg_testnet $WG_TESTNET
+  $  pipenv run ./max_capacity_system_baseline.py --testnet $TESTNET --wg_testnet $WG_TESTNET
   ```
 - You can observe the benchmark on the following dashboard: https://grafana.dfinity.systems/d/u016YUeGz/workload-generator-metrics?orgId=1&refresh=5s - make sure to select the target subnetwork *as well as* the subnetwork with workload generators under "IC" and "IC workload generator" at the top respectively.
-- Create the report `python generate_report.py githash timestamp`. This is normally called from the suite automatically, so in many cases you won't to manually run it.
+- Create the report `pipenv run generate_report.py githash timestamp`. This is normally called from the suite automatically, so in many cases you won't to manually run it.
 
 # Run against mainnet
 
@@ -103,7 +108,7 @@ The suite will then not get a flamegraph and hardware information, but the bench
  4. Open a tmux session (just type `tmux` on e.g. spm34).
  5. `cd` into you `scalability` in your IC checkout
  5. Configure the desired rate of updates/second per subnetwork by setting variable `LOAD_MAX`.
- 5. Run `python3 run_mainnet.py`
+ 5. Run `pipenv run run_mainnet.py`
  
  Observe the dashboards
 
@@ -111,12 +116,23 @@ The suite will then not get a flamegraph and hardware information, but the bench
 
 In order to add a new experiment:
 
- - Create a new file `run_experiment_n.py`
- - Create a class `ExperimentN` with inherits from `Experiment`
- - Implement method `init_experiment` which is being called exactly once when the experiment is first started 
+ - Create a new file `run_experiment_foobar.py`
+ - Create a class `ExperimentFoobar` with inherits from `Experiment` or `WorkloadExperiment` depending on whether you need to run workload generator to stress your system.
+ - Implement method `init_experiment` which is being called exactly once when the experiment is first set up.
  - Implement method `run_experiment_internal` which implements the actual benchmark logic. It's typically configurable, so that the benchmark can be executed repeatedly with e.g. increasing load. `config` is a dict that can be used to pass on configuration arguments.
-  - Implement `if __name__ == "__main__":` that initializes your experiment, calls `start_experiment` followed by `run_experiment` with a sensible configuration for your experiment.
-  - Finally call `write_summary_file` and `end_experiment` to generate a report.
- - Add a template file for your experiment to add more details to the generated report in `templates/experiment_n.html.hb`. Have a look at existing ones for inspiration.  
+ - Implement `if __name__ == "__main__":` that initializes your experiment, calls `start_experiment` followed by (potentially a series of) `run_experiment` with a sensible configuration for your experiment.
+ - Finally call `write_summary_file` and `end_experiment` to generate a report.
+ - Add a template file for your experiment to add more details to the generated report in `templates/experiment_foobar.html.hb`. Have a look at existing ones for inspiration.  
   
-Consider other experiments `run_experiment_*.py` for inspiration.
+Consider other experiments `run_experiment_*.py` for inspiration. Notable `run_system_baseline_experiment.py` for an example of a workload experiment as well as `run_xnet_experiment.py` for one that doesn't.
+
+## Debugging
+
+For debugging purposes, it is normally useful to instruct python to pop up a debugger on any exception.
+
+```
+pipenv run python3 -m pdb -c continue ./run_XXX_experiment.py
+```
+
+This way, if an exception occurs, the debugger will be opened and the program state can be displayed at the point at
+which the exception has happened.

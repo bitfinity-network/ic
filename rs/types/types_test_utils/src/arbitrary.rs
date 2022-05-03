@@ -1,12 +1,15 @@
 use crate::ids::{canister_test_id, node_test_id, subnet_test_id, user_test_id};
 use ic_types::crypto::{AlgorithmId, KeyId, KeyPurpose, UserPublicKey};
+use ic_types::messages::{Payload, RejectContext, RequestOrResponse, Response};
 use ic_types::RegistryVersion;
 use ic_types::{
     messages::{CallbackId, Request},
     time::UNIX_EPOCH,
+    xnet::StreamIndex,
     CanisterId, Cycles, Height, IDkgId, NodeId, SubnetId, Time, UserId,
 };
 use proptest::prelude::*;
+use std::convert::TryInto;
 use std::time::Duration;
 use strum::IntoEnumIterator;
 
@@ -130,5 +133,56 @@ prop_compose! {
             method_name,
             method_payload,
         }
+    }
+}
+
+/// Produces an arbitrary response [`Payload`].
+pub fn response_payload() -> impl Strategy<Value = Payload> {
+    prop_oneof![
+        // Data payload.
+        prop::collection::vec(any::<u8>(), 0..16).prop_flat_map(|data| Just(Payload::Data(data))),
+        // Reject payload.
+        (1u64..5, "[a-zA-Z]{1,6}").prop_flat_map(|(code, message)| Just(Payload::Reject(
+            RejectContext {
+                code: code.try_into().unwrap(),
+                message
+            }
+        )))
+    ]
+}
+
+prop_compose! {
+    /// Returns an arbitrary [`Response`].
+    pub fn response()(
+        originator in canister_id(),
+        respondent in canister_id(),
+        callback in any::<u64>(),
+        cycles_refund in any::<u64>(),
+        response_payload in response_payload(),
+    ) -> Response {
+        Response {
+            originator,
+            respondent,
+            originator_reply_callback: CallbackId::from(callback),
+            refund: Cycles::from(cycles_refund),
+            response_payload
+        }
+    }
+}
+
+/// Produces an arbitrary [`RequestOrResponse`].
+pub fn request_or_response() -> impl Strategy<Value = RequestOrResponse> {
+    prop_oneof![
+        request().prop_flat_map(|req| Just(RequestOrResponse::Request(req))),
+        response().prop_flat_map(|rep| Just(RequestOrResponse::Response(rep))),
+    ]
+}
+
+prop_compose! {
+    /// Returns an arbitrary [`StreamIndex`] in the `[0, max)` range.
+    pub fn stream_index(max: u64) (
+      index in 0..max,
+    ) -> StreamIndex {
+        StreamIndex::from(index)
     }
 }

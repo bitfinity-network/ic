@@ -1,16 +1,25 @@
 use ic_types::artifact::StateSyncMessage;
+use ic_types::canister_http::{
+    CanisterHttpResponse, CanisterHttpResponseMetadata, CanisterHttpResponseShare,
+};
 use ic_types::consensus::certification::CertificationMessage;
 use ic_types::consensus::dkg as consensus_dkg;
 use ic_types::consensus::{
     certification::{Certification, CertificationContent, CertificationShare},
-    ecdsa::{EcdsaDealing, EcdsaMessage, EcdsaTranscript},
-    BasicSignature, Block, BlockPayload, CatchUpContent, CatchUpContentProtobufBytes,
-    CatchUpShareContent, ConsensusMessage, FinalizationContent, HashedBlock, MultiSignature,
-    MultiSignatureShare, NotarizationContent, RandomBeaconContent, RandomTapeContent,
-    ThresholdSignature, ThresholdSignatureShare,
+    ecdsa::{
+        EcdsaComplaintContent, EcdsaDealing, EcdsaMessage, EcdsaOpeningContent, EcdsaSigShare,
+        EcdsaTranscript,
+    },
+    Block, BlockPayload, CatchUpContent, CatchUpContentProtobufBytes, CatchUpShareContent,
+    ConsensusMessage, FinalizationContent, HashedBlock, NotarizationContent, RandomBeaconContent,
+    RandomTapeContent,
 };
 use ic_types::crypto::Signed;
 use ic_types::messages::{HttpCanisterUpdate, MessageId, SignedRequestBytes};
+use ic_types::signature::{
+    BasicSignature, MultiSignature, MultiSignatureShare, ThresholdSignature,
+    ThresholdSignatureShare,
+};
 use std::hash::Hash;
 
 /// The domain separator to be used when calculating the sender signature for a
@@ -62,11 +71,24 @@ const DOMAIN_CATCH_UP_PACKAGE_SHARE: &str = "catch_up_package_share_domain";
 const DOMAIN_STATE_SYNC_MESSAGE: &str = "state_sync_message_domain";
 const DOMAIN_CONSENSUS_MESSAGE: &str = "consensus_message_domain";
 const DOMAIN_CERTIFICATION_MESSAGE: &str = "certification_message_domain";
-const DOMAIN_ECDSA_MESSAGE: &str = "ecdsa_message_domain";
-pub(crate) const DOMAIN_ECDSA_DEALING: &str = "ecdsa_dealing_domain";
-const DOMAIN_ECDSA_DEALING_SUPPORT: &str = "ecdsa_dealing_support_domain";
-const DOMAIN_ECDSA_VERIFIED_DEALING: &str = "ecdsa_verified_dealing_domain";
-const DOMAIN_ECDSA_TRANSCRIPT: &str = "ecdsa_transcript_domain";
+const DOMAIN_ECDSA_MESSAGE: &str = "ic-threshold-ecdsa-message-domain";
+pub(crate) const DOMAIN_ECDSA_DEALING: &str = "ic-threshold-ecdsa-dealing-domain";
+pub const DOMAIN_ECDSA_SIGNED_DEALING: &str = "ic-threshold-ecdsa-signed-dealing-domain";
+const DOMAIN_ECDSA_DEALING_SUPPORT: &str = "ic-threshold-ecdsa-dealing-support-domain";
+const DOMAIN_ECDSA_VERIFIED_DEALING: &str = "ic-threshold-ecdsa-verified-dealing-domain";
+const DOMAIN_ECDSA_TRANSCRIPT: &str = "ic-idkg-transcript-domain";
+const DOMAIN_ECDSA_SIG_SHARE: &str = "ic-threshold-ecdsa-sig-share-domain";
+pub(crate) const DOMAIN_ECDSA_COMPLAINT_CONTENT: &str =
+    "ic-threshold-ecdsa-complaint-content-domain";
+pub const DOMAIN_ECDSA_COMPLAINT: &str = "ic-threshold-ecdsa-complaint-domain";
+pub(crate) const DOMAIN_ECDSA_OPENING_CONTENT: &str = "ic-threshold-ecdsa-opening-content-domain";
+pub const DOMAIN_ECDSA_OPENING: &str = "ic-threshold-ecdsa-opening-domain";
+
+pub(crate) const DOMAIN_CANISTER_HTTP_RESPONSE: &str = "ic-canister-http-response-domain";
+pub(crate) const DOMAIN_CRYPTO_HASH_OF_CANISTER_HTTP_RESPONSE_METADATA: &str =
+    "ic-crypto-hash-of-canister-http-response-metadata-domain";
+pub(crate) const DOMAIN_CANISTER_HTTP_RESPONSE_SHARE: &str =
+    "ic-canister-http-response-share-domain";
 
 /// A cryptographically hashable type.
 pub trait CryptoHashable: CryptoHashDomain + Hash {}
@@ -84,6 +106,9 @@ pub trait CryptoHashDomain: private::CryptoHashDomainSeal {
     fn domain(&self) -> String;
 }
 mod private {
+
+    use ic_types::canister_http::CanisterHttpResponseShare;
+
     use super::*;
 
     pub trait CryptoHashDomainSeal {}
@@ -146,12 +171,44 @@ mod private {
     impl CryptoHashDomainSeal for CertificationMessage {}
 
     impl CryptoHashDomainSeal for EcdsaMessage {}
+
     impl CryptoHashDomainSeal for EcdsaDealing {}
+    impl CryptoHashDomainSeal for Signed<EcdsaDealing, BasicSignature<EcdsaDealing>> {}
     impl CryptoHashDomainSeal for Signed<EcdsaDealing, MultiSignatureShare<EcdsaDealing>> {}
     impl CryptoHashDomainSeal for Signed<EcdsaDealing, MultiSignature<EcdsaDealing>> {}
+
     impl CryptoHashDomainSeal for EcdsaTranscript {}
+    impl CryptoHashDomainSeal for EcdsaSigShare {}
+
+    impl CryptoHashDomainSeal for EcdsaComplaintContent {}
+    impl CryptoHashDomainSeal for Signed<EcdsaComplaintContent, BasicSignature<EcdsaComplaintContent>> {}
+
+    impl CryptoHashDomainSeal for EcdsaOpeningContent {}
+    impl CryptoHashDomainSeal for Signed<EcdsaOpeningContent, BasicSignature<EcdsaOpeningContent>> {}
+
+    impl CryptoHashDomainSeal for CanisterHttpResponse {}
+    impl CryptoHashDomainSeal for CanisterHttpResponseMetadata {}
+    impl CryptoHashDomainSeal for CanisterHttpResponseShare {}
 
     impl CryptoHashDomainSeal for CryptoHashableTestDummy {}
+}
+
+impl CryptoHashDomain for CanisterHttpResponse {
+    fn domain(&self) -> String {
+        DOMAIN_CANISTER_HTTP_RESPONSE.to_string()
+    }
+}
+
+impl CryptoHashDomain for CanisterHttpResponseMetadata {
+    fn domain(&self) -> String {
+        DOMAIN_CRYPTO_HASH_OF_CANISTER_HTTP_RESPONSE_METADATA.to_string()
+    }
+}
+
+impl CryptoHashDomain for CanisterHttpResponseShare {
+    fn domain(&self) -> String {
+        DOMAIN_CANISTER_HTTP_RESPONSE_SHARE.to_string()
+    }
 }
 
 impl CryptoHashDomain for NotarizationContent {
@@ -354,6 +411,12 @@ impl CryptoHashDomain for EcdsaDealing {
     }
 }
 
+impl CryptoHashDomain for Signed<EcdsaDealing, BasicSignature<EcdsaDealing>> {
+    fn domain(&self) -> String {
+        DOMAIN_ECDSA_SIGNED_DEALING.to_string()
+    }
+}
+
 impl CryptoHashDomain for Signed<EcdsaDealing, MultiSignatureShare<EcdsaDealing>> {
     fn domain(&self) -> String {
         DOMAIN_ECDSA_DEALING_SUPPORT.to_string()
@@ -369,6 +432,36 @@ impl CryptoHashDomain for Signed<EcdsaDealing, MultiSignature<EcdsaDealing>> {
 impl CryptoHashDomain for EcdsaTranscript {
     fn domain(&self) -> String {
         DOMAIN_ECDSA_TRANSCRIPT.to_string()
+    }
+}
+
+impl CryptoHashDomain for EcdsaSigShare {
+    fn domain(&self) -> String {
+        DOMAIN_ECDSA_SIG_SHARE.to_string()
+    }
+}
+
+impl CryptoHashDomain for EcdsaComplaintContent {
+    fn domain(&self) -> String {
+        DOMAIN_ECDSA_COMPLAINT_CONTENT.to_string()
+    }
+}
+
+impl CryptoHashDomain for Signed<EcdsaComplaintContent, BasicSignature<EcdsaComplaintContent>> {
+    fn domain(&self) -> String {
+        DOMAIN_ECDSA_COMPLAINT.to_string()
+    }
+}
+
+impl CryptoHashDomain for EcdsaOpeningContent {
+    fn domain(&self) -> String {
+        DOMAIN_ECDSA_OPENING_CONTENT.to_string()
+    }
+}
+
+impl CryptoHashDomain for Signed<EcdsaOpeningContent, BasicSignature<EcdsaOpeningContent>> {
+    fn domain(&self) -> String {
+        DOMAIN_ECDSA_OPENING.to_string()
     }
 }
 

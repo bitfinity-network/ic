@@ -4,7 +4,9 @@ use ic_config::{
     subnet_config::SubnetConfigs,
 };
 use ic_cycles_account_manager::CyclesAccountManager;
-use ic_execution_environment::setup_execution;
+use ic_error_types::{ErrorCode, UserError};
+use ic_execution_environment::ExecutionServices;
+use ic_ic00_types::{self as ic00, CanisterInstallMode, Payload};
 use ic_interfaces::{execution_environment::IngressHistoryReader, messaging::MessageRouting};
 use ic_logger::{replica_logger::no_op_logger, ReplicaLogger};
 use ic_messaging::MessageRoutingImpl;
@@ -12,16 +14,13 @@ use ic_metrics::MetricsRegistry;
 use ic_registry_subnet_type::SubnetType;
 use ic_state_manager::StateManagerImpl;
 use ic_test_utilities::{
-    consensus::fake::FakeVerifier, mock_time, registry::MockRegistryClient,
-    types::messages::SignedIngressBuilder,
+    consensus::fake::FakeVerifier, mock_time, types::messages::SignedIngressBuilder,
 };
+use ic_test_utilities_registry::MockRegistryClient;
 use ic_types::{
-    batch::{Batch, BatchPayload, IngressPayload, SelfValidatingPayload, XNetPayload},
-    ic00,
-    ic00::Payload,
+    batch::{Batch, BatchPayload, IngressPayload},
     ingress::{IngressStatus, WasmResult},
-    messages::{CanisterInstallMode, SignedIngress},
-    user_error::UserError,
+    messages::SignedIngress,
     Randomness, RegistryVersion,
 };
 use ic_types::{messages::MessageId, replica_config::ReplicaConfig, CanisterId};
@@ -113,12 +112,10 @@ fn build_batch(message_routing: &dyn MessageRouting, msgs: Vec<SignedIngress>) -
         requires_full_state_hash: !msgs.is_empty(),
         payload: BatchPayload {
             ingress: IngressPayload::from(msgs),
-            xnet: XNetPayload {
-                stream_slices: Default::default(),
-            },
-            self_validating: SelfValidatingPayload::default(),
+            ..BatchPayload::default()
         },
         randomness: Randomness::from([0; 32]),
+        ecdsa_subnet_public_key: None,
         registry_version: RegistryVersion::from(1),
         time: mock_time(),
         consensus_responses: vec![],
@@ -156,6 +153,12 @@ fn execute_ingress_message(
         match ingress_result {
             IngressStatus::Completed { result, .. } => return Ok(result),
             IngressStatus::Failed { error, .. } => return Err(error),
+            IngressStatus::Done { .. } => {
+                return Err(UserError::new(
+                    ErrorCode::SubnetOversubscribed,
+                    "The call has completed but the reply/reject data has been pruned.",
+                ))
+            }
             IngressStatus::Received { .. }
             | IngressStatus::Processing { .. }
             | IngressStatus::Unknown => (),
@@ -174,7 +177,6 @@ fn criterion_calls(criterion: &mut Criterion) {
     let subnet_config = SubnetConfigs::default().own_subnet_config(subnet_type);
     let cycles_account_manager = Arc::new(CyclesAccountManager::new(
         subnet_config.scheduler_config.max_instructions_per_message,
-        ExecutionConfig::default().max_cycles_per_canister,
         subnet_type,
         bench_replica.replica_config.subnet_id,
         SubnetConfigs::default()
@@ -192,19 +194,22 @@ fn criterion_calls(criterion: &mut Criterion) {
         bench_replica.log.clone(),
         &bench_replica.metrics_registry,
         &StateManagerConfig::new(tmpdir.path().to_path_buf()),
+        None,
         ic_types::malicious_flags::MaliciousFlags::default(),
     ));
 
-    let (_, ingress_history_writer, ingress_hist_reader, _, _, scheduler) = setup_execution(
-        bench_replica.log.clone(),
-        &bench_replica.metrics_registry,
-        bench_replica.replica_config.subnet_id,
-        subnet_type,
-        subnet_config.scheduler_config,
-        ExecutionConfig::default(),
-        Arc::clone(&cycles_account_manager),
-        Arc::clone(&state_manager) as Arc<_>,
-    );
+    let (_, ingress_history_writer, ingress_history_reader, _, _, _, scheduler) =
+        ExecutionServices::setup_execution(
+            bench_replica.log.clone(),
+            &bench_replica.metrics_registry,
+            bench_replica.replica_config.subnet_id,
+            subnet_type,
+            subnet_config.scheduler_config,
+            ExecutionConfig::default(),
+            Arc::clone(&cycles_account_manager),
+            Arc::clone(&state_manager) as Arc<_>,
+        )
+        .into_parts();
 
     let mut group = criterion.benchmark_group("user calls");
 
@@ -226,7 +231,7 @@ fn criterion_calls(criterion: &mut Criterion) {
         signed_ingress: SignedIngress,
     }
 
-    bench_replica.install(&message_routing, ingress_hist_reader.as_ref());
+    bench_replica.install(&message_routing, ingress_history_reader.as_ref());
 
     group.bench_function("single-node update", |bench| {
         bench.iter_with_setup(
@@ -252,7 +257,7 @@ fn criterion_calls(criterion: &mut Criterion) {
             },
             |data| {
                 bench_replica.ingress_directly(
-                    ingress_hist_reader.as_ref(),
+                    ingress_history_reader.as_ref(),
                     &message_routing,
                     data.message_id,
                     data.signed_ingress,

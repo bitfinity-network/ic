@@ -2,7 +2,10 @@
 
 use crate::artifact_pool::UnvalidatedArtifact;
 use ic_types::artifact::{EcdsaMessageAttribute, EcdsaMessageId, PriorityFn};
-use ic_types::consensus::ecdsa::{EcdsaDealing, EcdsaDealingSupport, EcdsaMessage};
+use ic_types::consensus::ecdsa::{
+    EcdsaComplaint, EcdsaDealingSupport, EcdsaMessage, EcdsaOpening, EcdsaSigShare,
+    EcdsaSignedDealing,
+};
 
 // TODO: purge/remove from validated
 #[derive(Debug)]
@@ -17,20 +20,44 @@ pub enum EcdsaChangeAction {
 pub type EcdsaChangeSet = Vec<EcdsaChangeAction>;
 
 /// The validated/unvalidated parts of the artifact pool.
-pub trait EcdsaPoolSection {
+pub trait EcdsaPoolSection: Send + Sync {
     /// Checks if the artifact present in the pool.
     fn contains(&self, msg_id: &EcdsaMessageId) -> bool;
 
     /// Looks up an artifact by the Id.
     fn get(&self, msg_id: &EcdsaMessageId) -> Option<EcdsaMessage>;
 
-    /// Iterator for dealing objects.
-    fn dealings(&self) -> Box<dyn Iterator<Item = (EcdsaMessageId, &EcdsaDealing)> + '_>;
+    /// Iterator for signed dealing objects.
+    fn signed_dealings(
+        &self,
+    ) -> Box<dyn Iterator<Item = (EcdsaMessageId, EcdsaSignedDealing)> + '_>;
 
     /// Iterator for dealing support objects.
     fn dealing_support(
         &self,
-    ) -> Box<dyn Iterator<Item = (EcdsaMessageId, &EcdsaDealingSupport)> + '_>;
+    ) -> Box<dyn Iterator<Item = (EcdsaMessageId, EcdsaDealingSupport)> + '_>;
+
+    /// Iterator for signature share objects.
+    fn signature_shares(&self) -> Box<dyn Iterator<Item = (EcdsaMessageId, EcdsaSigShare)> + '_>;
+
+    /// Iterator for complaint objects.
+    fn complaints(&self) -> Box<dyn Iterator<Item = (EcdsaMessageId, EcdsaComplaint)> + '_>;
+
+    /// Iterator for opening objects.
+    fn openings(&self) -> Box<dyn Iterator<Item = (EcdsaMessageId, EcdsaOpening)> + '_>;
+}
+
+/// The mutable interface for validated/unvalidated parts of the artifact pool.
+pub trait MutableEcdsaPoolSection: Send + Sync {
+    /// Adds the message to the pool.
+    fn insert(&mut self, message: EcdsaMessage);
+
+    /// Looks up and removes the specified message from the pool.
+    /// Returns true if the message was found.
+    fn remove(&mut self, id: &EcdsaMessageId) -> bool;
+
+    /// Get the immutable handle.
+    fn as_pool_section(&self) -> &dyn EcdsaPoolSection;
 }
 
 /// Artifact pool for the ECDSA messages (query interface)

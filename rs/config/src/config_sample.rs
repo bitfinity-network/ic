@@ -135,7 +135,14 @@ pub const SAMPLE_CONFIG: &str = r#"
     // ============================================
     crypto: {
         // The directory that should be used to persist node's cryptographic keys.
-        crypto_root: "/tmp/ic_crypto"
+        crypto_root: "/tmp/ic_crypto",
+        // The type of CspVault to be used.
+        // Alternatives:
+        // - EXAMPLE: csp_vault_type: "in_replica",
+        //   CspVault is an internal structure of the replica process.
+        // - EXAMPLE: csp_vault_type: { unix_socket: "/some/path/to/socket" },
+        //   CspVault is run as a separate process, which can be reached via a Unix socket.
+        csp_vault_type: { unix_socket: "/some/path/to/socket" },
     },
     // ========================================
     // Configuration of the message scheduling.
@@ -227,9 +234,9 @@ pub const SAMPLE_CONFIG: &str = r#"
         block_on_overflow: true,
     },
     // ===================================
-    // Configuration of the logging setup for the nodemanager.
+    // Configuration of the logging setup for the orchestrator.
     // ===================================
-    nodemanager_logger: {
+    orchestrator_logger: {
         // The node id to append to log lines. [deprecated]
         node_id: 100,
 
@@ -252,6 +259,46 @@ pub const SAMPLE_CONFIG: &str = r#"
 
         // Output debug logs for these module paths
         // EXAMPLE: debug_overrides: ["ic_consensus::finalizer", "ic_messaging::coordinator"],
+        debug_overrides: [],
+
+        // Output logs for these tags
+        // EXAMPLE: enabled_tags: ["artifact_tracing"],
+        enabled_tags: [],
+
+        // If `true` the async channel for low-priority messages will block instead of drop messages.
+        // This behavior is required for instrumentation in System Testing until we have a
+        // dedicated solution for instrumentation.
+        //
+        // The default for this value is `false` and thus matches the previously expected behavior in
+        // production use cases.
+        block_on_overflow: true,
+    },
+    // ===================================
+    // Configuration of the logging setup for the CSP vault.
+    // ===================================
+    csp_vault_logger: {
+        // The node id to append to log lines. [deprecated]
+        node_id: 100,
+
+        // The datacenter id to append to log lines. [deprecated]
+        dc_id: 200,
+
+        // The log level to use.
+        // EXAMPLE: level: "critical",
+        // EXAMPLE: level: "error",
+        // EXAMPLE: level: "warning",
+        // EXAMPLE: level: "info",
+        // EXAMPLE: level: "debug",
+        // EXAMPLE: level: "trace",
+        level: "info",
+
+        // The format of emitted log lines
+        // EXAMPLE: format: "text_full",
+        // EXAMPLE: format: "json",
+        format: "text_full",
+
+        // Output debug logs for these module paths
+        // EXAMPLE: debug_overrides: ["ic_crypto_internal_csp::vault"],
         debug_overrides: [],
 
         // Output logs for these tags
@@ -295,6 +342,7 @@ pub const SAMPLE_CONFIG: &str = r#"
          maliciously_disable_execution: false,
          maliciously_corrupt_own_state_at_heights: [],
          maliciously_disable_ingress_validation: false,
+         maliciously_corrupt_ecdsa_dealings: false,
        },
     },
 
@@ -316,6 +364,16 @@ pub const SAMPLE_CONFIG: &str = r#"
     // =================================
     nns_registry_replicator: {
       poll_delay_duration_ms: 5000
+    },
+    // ====================================
+    // Configuration of various adapters. 
+    // ====================================
+    adapters_config: {
+        bitcoin_testnet_uds_path: "/tmp/bitcoin_uds",
+        // IPC socket path for canister http adapter. This UDS path has to be the same as
+        // specified in the systemd socket file.
+        // The canister http adapter socket file is: /ic-os/guestos/rootfs/systemd/system/ic-canister-http-adapter.socket
+        canister_http_uds_path: "/run/ic-node/canister-http-adapter/socket",
     },
 }
 "#;

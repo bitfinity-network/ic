@@ -217,9 +217,7 @@ impl RosettaApiHandle {
             network_identifier: self.network_id(),
             public_key: pk,
             metadata: Some(ConstructionDeriveRequestMetadata {
-                account_type: AccountType::Neuron {
-                    neuron_identifier: 0,
-                },
+                account_type: AccountType::Neuron { neuron_index: 0 },
             }),
         };
         to_rosetta_response(
@@ -393,16 +391,23 @@ impl RosettaApiHandle {
         pk_and_idx: Option<(PublicKey, u64)>,
         verified: bool,
     ) -> Result<Result<AccountBalanceResponse, RosettaError>, String> {
-        let neuron_info_req = NeuronInfoRequest {
-            neuron_id: nid,
-            public_key_and_neuron_index: pk_and_idx,
-            verified_query: Some(verified),
+        let account_balance_metadata = AccountBalanceMetadata {
+            account_type: BalanceAccountType::Neuron {
+                neuron_id: nid,
+                subaccount_components: pk_and_idx.map(|(public_key, neuron_index)| {
+                    NeuronSubaccountComponents {
+                        public_key,
+                        neuron_index,
+                    }
+                }),
+                verified_query: Some(verified),
+            },
         };
         let req = AccountBalanceRequest {
             network_identifier: self.network_id(),
             account_identifier: ic_rosetta_api::convert::to_model_account_identifier(&acc),
             block_identifier: None,
-            metadata: Some(neuron_info_req),
+            metadata: Some(account_balance_metadata),
         };
 
         to_rosetta_response(
@@ -485,7 +490,7 @@ impl RosettaApiHandle {
         use nix::unistd::Pid;
         kill(Pid::from_raw(self.process.id() as i32), SIGTERM).ok();
 
-        let mut tries_left = 100i32;
+        let mut tries_left = 300i32;
         let backoff = std::time::Duration::from_millis(100);
         while tries_left > 0 {
             tries_left -= 1;
@@ -515,7 +520,7 @@ impl RosettaApiHandle {
             if self.can_panic {
                 panic!(
                     "rosetta-api did not finish in {} sec",
-                    (backoff * 100).as_secs_f32()
+                    (backoff * 300).as_secs_f32()
                 );
             }
         }

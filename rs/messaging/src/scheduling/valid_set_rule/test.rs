@@ -1,4 +1,5 @@
 use super::*;
+use ic_ic00_types::IC_00;
 use ic_logger::replica_logger::no_op_logger;
 use ic_registry_subnet_type::SubnetType;
 use ic_replicated_state::testing::CanisterQueuesTesting;
@@ -21,7 +22,6 @@ use ic_test_utilities::{
     with_test_replica_logger,
 };
 use ic_types::{
-    ic00::IC_00,
     ingress::IngressStatus,
     messages::{MessageId, SignedIngressContent},
     CanisterId,
@@ -112,6 +112,7 @@ fn induct_message_with_successful_history_update() {
                         user_id: user_test_id(0),
                         time: mock_time(),
                     },
+                    NumBytes::from(u64::MAX),
                 );
             });
 
@@ -179,7 +180,7 @@ fn induct_message_fails_for_stopping_canister() {
             )
             .times(1)
             .returning(move |state, _, status| {
-                state.set_ingress_status(msg_id.clone(), status);
+                state.set_ingress_status(msg_id.clone(), status, NumBytes::from(u64::MAX));
             });
         let ingress_history_writer = Arc::new(ingress_history_writer);
         let metrics_registry = MetricsRegistry::new();
@@ -239,7 +240,7 @@ fn induct_message_fails_for_stopped_canister() {
             )
             .times(1)
             .returning(move |state, _, status| {
-                state.set_ingress_status(msg_id.clone(), status);
+                state.set_ingress_status(msg_id.clone(), status, NumBytes::from(u64::MAX));
             });
 
         let ingress_history_writer = Arc::new(ingress_history_writer);
@@ -310,7 +311,7 @@ fn try_to_induct_a_message_marked_as_already_inducted() {
             user_id: user_test_id(0),
             time: mock_time(),
         };
-        state.set_ingress_status(msg.id(), status);
+        state.set_ingress_status(msg.id(), status, NumBytes::from(u64::MAX));
         valid_set_rule.induct_message(&mut state, msg);
     });
 }
@@ -342,7 +343,7 @@ fn update_history_if_induction_failed() {
             .with(always(), eq(msg.id()), always())
             .times(1)
             .returning(move |state, _, _| {
-                state.set_ingress_status(msg_id.clone(), status.clone());
+                state.set_ingress_status(msg_id.clone(), status.clone(), NumBytes::from(u64::MAX));
             });
 
         let ingress_history_writer = Arc::new(ingress_history_writer);
@@ -415,6 +416,7 @@ fn dont_induct_duplicate_messages() {
                         user_id: user_test_id(0),
                         time: mock_time(),
                     },
+                    NumBytes::from(u64::MAX),
                 );
             });
 
@@ -439,6 +441,7 @@ fn dont_induct_duplicate_messages() {
                 user_id: user_test_id(0),
                 time: mock_time(),
             },
+            NumBytes::from(u64::MAX),
         );
         state.set_ingress_status(
             msg1.id(),
@@ -447,6 +450,7 @@ fn dont_induct_duplicate_messages() {
                 user_id: user_test_id(0),
                 time: mock_time(),
             },
+            NumBytes::from(u64::MAX),
         );
 
         insert_canister(&mut state, canister_id1);
@@ -511,7 +515,7 @@ fn canister_on_application_subnet_charges_for_ingress() {
         .get(&canister_test_id(0))
         .unwrap()
         .system_state
-        .cycles_balance;
+        .balance();
 
     valid_set_rule.induct_messages(&mut state, vec![msg]);
 
@@ -520,7 +524,7 @@ fn canister_on_application_subnet_charges_for_ingress() {
         .get(&canister_test_id(0))
         .unwrap()
         .system_state
-        .cycles_balance;
+        .balance();
 
     assert_eq!(balance_after, balance_before - cost_of_ingress);
 }
@@ -558,7 +562,7 @@ fn canister_on_system_subnet_does_not_charge_for_ingress() {
         .get(&canister_test_id(0))
         .unwrap()
         .system_state
-        .cycles_balance;
+        .balance();
 
     let msg = SignedIngressBuilder::new()
         .canister_id(canister_test_id(0))
@@ -571,7 +575,7 @@ fn canister_on_system_subnet_does_not_charge_for_ingress() {
         .get(&canister_test_id(0))
         .unwrap()
         .system_state
-        .cycles_balance;
+        .balance();
 
     assert_eq!(balance_after, balance_before);
 }
@@ -667,7 +671,7 @@ fn running_canister_on_application_subnet_accepts_and_charges_for_ingress() {
         );
         let canister_id = canister_test_id(0);
         let canister = get_running_canister(canister_id);
-        let balance_before = canister.system_state.cycles_balance;
+        let balance_before = canister.system_state.balance();
         state.put_canister_state(canister);
 
         let ingress = SignedIngressBuilder::new().build().into();
@@ -682,7 +686,7 @@ fn running_canister_on_application_subnet_accepts_and_charges_for_ingress() {
             .canister_state(&canister_id)
             .unwrap()
             .system_state
-            .cycles_balance;
+            .balance();
 
         assert_eq!(balance_after, balance_before - cost);
     });
@@ -716,7 +720,7 @@ fn running_canister_on_system_subnet_accepts_and_does_not_charge_for_ingress() {
         );
         let canister_id = canister_test_id(0);
         let canister = get_running_canister(canister_id);
-        let balance_before = canister.system_state.cycles_balance;
+        let balance_before = canister.system_state.balance();
         state.put_canister_state(canister);
 
         let ingress = SignedIngressBuilder::new().build().into();
@@ -726,7 +730,7 @@ fn running_canister_on_system_subnet_accepts_and_does_not_charge_for_ingress() {
             .canister_state(&canister_id)
             .unwrap()
             .system_state
-            .cycles_balance;
+            .balance();
 
         assert_eq!(balance_after, balance_before);
     });

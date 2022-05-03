@@ -1,7 +1,31 @@
+sources:
+
 [
+  (_: _: { inherit sources; })
   (
     self: super:
       {
+        nc = self.netcat;
+
+        # Override niv with our own pinned version. This version actually calls
+        # pkgs.haskell.lib.justStaticExecutables which significantly reduces closure
+        # size.
+        inherit (import self.sources.niv { pkgs = self; }) niv;
+
+        # Don't run git's test suite on darwin because it takes longer than 5h.
+        gitMinimal = super.gitMinimal.overrideAttrs (
+          _oldAttrs: self.lib.optionalAttrs self.stdenv.isDarwin { doInstallCheck = false; }
+        );
+        git = super.git.overrideAttrs (
+          _oldAttrs: self.lib.optionalAttrs self.stdenv.isDarwin { doInstallCheck = false; }
+        );
+        buildPackages = super.buildPackages // {
+          gitMinimal = super.buildPackages.gitMinimal.overrideAttrs (
+            _oldAttrs: self.lib.optionalAttrs self.stdenv.isDarwin { doInstallCheck = false; }
+          );
+        };
+
+        naersk = self.callPackage self.sources.naersk {};
 
         # The 'pre-commit' tool that we use for a lot of checks (formatting, etc)
         # https://pre-commit.com
@@ -67,13 +91,12 @@
 
         # The rust code-coverage tool. As per the doc, only runs on Linux
         # (doesn't even build on Darwin).
-        cargo-tarpaulin = self.lib.linuxOnly (
+        cargo-tarpaulin =
           self.naersk.buildPackage {
             src = self.sources.tarpaulin;
             doCheck = false;
             buildInputs = [ self.openssl self.pkg-config self.libiconv ];
-          }
-        );
+          };
         cargo-graph = self.naersk.buildPackage self.sources.cargo-graph;
 
         rocksdb = super.callPackage ./rocksdb {};
@@ -114,11 +137,7 @@
 
         jemalloc_static = self.pkgsStatic.jemalloc;
 
-        ic-ref = self.ic-ref-0_16;
-
-        ic-ref-0_16 = (import self.sources.ic-ref-0_16 { inherit (self) system; }).ic-ref;
-        ic-ref-0_17 = (import self.sources.ic-ref-0_17 { inherit (self) system; }).ic-ref;
-        ic-ref-0_18 = (import self.sources.ic-ref-0_18 { inherit (self) system; }).ic-ref;
+        ic-ref = (import self.sources.ic-ref { inherit (self) system; }).ic-ref;
 
         buf = super.callPackage ./buf {};
 
@@ -212,10 +231,5 @@
       }
   )
   (import ./haskell.nix)
-  (import ./rustdoc.nix)
   (import ./motoko.nix)
-
-  # the cargo2nix overlays
-  (self: super: import ./cargo2nix/overlay self super)
-  (import ./cargo2nix.nix)
 ]

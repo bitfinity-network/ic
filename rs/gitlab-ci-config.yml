@@ -5,8 +5,6 @@
 # Precede every crate with a tracking bug.
 
 crates_allowed_to_fail:
-  # https://gitlab.com/dfinity-lab/core/dfinity/-/issues/1
-  - ic-cow-state
 
 # Crates for which the tests should be built in release mode.
 # The total job time is build + test execution time, and if a test runs
@@ -36,8 +34,26 @@ crate_test_name_override:
 
 # Crates with config override.
 crates_config_override:
+  ic-nns-governance:
+    extends: .cargo-crate-test
+    variables:
+      CARGO_TEST_FLAGS_EXTRA: "--features test"
   ic-nns-integration-tests:
     extends: .cargo-crate-tests-process-per-test
+    variables:
+      TARGET_CRATE: ic-nns-integration-tests
+    retry: 1
+    artifacts:
+      paths:
+        - "logs/*"
+  ic-sns-integration-tests:
+    extends: .cargo-crate-tests-process-per-test
+    variables:
+      TARGET_CRATE: ic-sns-integration-tests
+      CARGO_TEST_TIMEOUT: 3600
+    artifacts:
+      paths:
+        - "logs/*"
   ic-nns-handler-root:
     extends: .cargo-crate-tests-process-per-test
   ic-nns-handler-subnet:
@@ -68,34 +84,21 @@ ci_jobs_required:
   # prod tests
   - generic-hourly
   - subnet-update-workload-nightly
-  - global-reboot-nightly
-  - node-assign-test-nightly
-  - subnet-threshold-test-nightly
-  - nns-workload-nightly
-  - xnet-slo-nightly
-  - xnet-slo-nightly-many-single-node-subnets
   - network-reliability-test
   - rejoin-nightly
-  - nns-registry-changes-test
   - maximum-capacity-subnet-update-nightly
   - maximum-capacity-subnet-query-nightly
   - maximum-capacity-xnet-slo-nightly
-  - firewall-test-nightly
   - subnet-update-workload-slo-100-1kb
   - large-subnet-update-workload-slo-200-1kb
   - subnet-update-workload-slo-5-100kb
   - network-reliability-test-slo
   - subnet-query-workload-slo-300-1kb
-  - xnet-slo-test-slo
-  - xnet-slo-test-slo-29-subnets
   - rejoin-test-slo
-  - nns-workload-test-slo
   - maximum-capacity-rejoin-script
   - maximum-capacity-xnet-script
-  - maximum-capacity-large-subnet-update
-  - maximum-capacity-large-subnet-query
-  - wasm-generator-nightly
-  - wasm-generator-slo
+  - maximum-capacity-system-baseline-update
+  - maximum-capacity-system-baseline-query
   # finalize stage
   - notify-gitlab-success
   - notify-gitlab-failure

@@ -2,17 +2,19 @@
 
 use crate::artifact::*;
 use crate::processors::ArtifactProcessorManager;
+use ic_constants::{MAX_INGRESS_TTL, PERMITTED_DRIFT_AT_ARTIFACT_MANAGER};
 use ic_interfaces::{
     artifact_manager::{AdvertMismatchError, ArtifactAcceptance, ArtifactClient, OnArtifactError},
     artifact_pool::{ArtifactPoolError, ReplicaVersionMismatch, UnvalidatedArtifact},
+    canister_http::*,
     certification::{CertificationPool, CertifierGossip},
     consensus::ConsensusGossip,
     consensus_pool::{ConsensusPool, ConsensusPoolCache},
     dkg::{DkgGossip, DkgPool},
     ecdsa::{EcdsaGossip, EcdsaPool},
     gossip_pool::{
-        CertificationGossipPool, ConsensusGossipPool, DkgGossipPool, EcdsaGossipPool,
-        IngressGossipPool,
+        CanisterHttpGossipPool, CertificationGossipPool, ConsensusGossipPool, DkgGossipPool,
+        EcdsaGossipPool, IngressGossipPool,
     },
     ingress_pool::IngressPool,
     time_source::TimeSource,
@@ -21,12 +23,12 @@ use ic_logger::{debug, ReplicaLogger};
 use ic_types::{
     artifact,
     artifact::*,
+    canister_http::*,
     chunkable::*,
     consensus::{
         certification::CertificationMessage, dkg::Message as DkgMessage, ConsensusMessage,
         HasVersion,
     },
-    ingress::MAX_INGRESS_TTL,
     malicious_flags::MaliciousFlags,
     messages::{SignedIngress, SignedRequestBytes},
     p2p, NodeId, ReplicaVersion,
@@ -374,12 +376,6 @@ impl<Pool: IngressPool + IngressGossipPool + Send + Sync> ArtifactClient<Ingress
         bytes: SignedRequestBytes,
         peer_id: &NodeId,
     ) -> Result<ArtifactAcceptance<SignedIngress>, ArtifactPoolError> {
-        // We account for a bit of drift here and accept messages with a bit longer
-        // than `MAX_INGRESS_TTL` time-to-live into the ingress pool.
-        // The purpose is to be a bit more permissive than the HTTP handler when the
-        // ingress was first accepted because here the ingress may have come
-        // from the network.
-        let permitted_drift = std::time::Duration::from_secs(60);
         let msg: SignedIngress = bytes
             .try_into()
             .map_err(|err| ArtifactPoolError::ArtifactRejected(Box::new(err)))?;
@@ -392,7 +388,12 @@ impl<Pool: IngressPool + IngressGossipPool + Send + Sync> ArtifactClient<Ingress
         }
 
         let time_now = self.time_source.get_relative_time();
-        let time_plus_ttl = time_now + MAX_INGRESS_TTL + permitted_drift;
+        // We account for a bit of drift here and accept messages with a bit longer
+        // than `MAX_INGRESS_TTL` time-to-live into the ingress pool.
+        // The purpose is to be a bit more permissive than the HTTP handler when the
+        // ingress was first accepted because here the ingress may have come
+        // from the network.
+        let time_plus_ttl = time_now + MAX_INGRESS_TTL + PERMITTED_DRIFT_AT_ARTIFACT_MANAGER;
         let msg_expiry_time = msg.expiry_time();
         if msg_expiry_time < time_now {
             Err(ArtifactPoolError::MessageExpired)
@@ -665,5 +666,60 @@ impl<Pool: EcdsaPool + EcdsaGossipPool + Send + Sync> ArtifactClient<EcdsaArtifa
 
     fn get_chunk_tracker(&self, _id: &EcdsaMessageId) -> Box<dyn Chunkable + Send + Sync> {
         Box::new(SingleChunked::Ecdsa)
+    }
+}
+
+/// The CanisterHttp Client
+pub struct CanisterHttpClient<Pool> {
+    pool: Arc<RwLock<Pool>>,
+    gossip: Arc<dyn CanisterHttpGossip + Send + Sync>,
+}
+
+impl<Pool: CanisterHttpPool + CanisterHttpGossipPool + Send + Sync> CanisterHttpClient<Pool> {
+    pub fn new<T: CanisterHttpGossip + Send + Sync + 'static>(
+        pool: Arc<RwLock<Pool>>,
+        gossip: T,
+    ) -> Self {
+        Self {
+            pool,
+            gossip: Arc::new(gossip),
+        }
+    }
+}
+
+impl<Pool: CanisterHttpPool + CanisterHttpGossipPool + CanisterHttpGossip + Send + Sync>
+    ArtifactClient<CanisterHttpArtifact> for CanisterHttpClient<Pool>
+{
+    fn check_artifact_acceptance(
+        &self,
+        msg: CanisterHttpResponseShare,
+        _peer_id: &NodeId,
+    ) -> Result<ArtifactAcceptance<CanisterHttpResponseShare>, ArtifactPoolError> {
+        Ok(ArtifactAcceptance::AcceptedForProcessing(msg))
+    }
+
+    fn has_artifact(&self, msg_id: &CanisterHttpResponseId) -> bool {
+        self.pool.read().unwrap().contains(msg_id)
+    }
+
+    fn get_validated_by_identifier(
+        &self,
+        msg_id: &CanisterHttpResponseId,
+    ) -> Option<CanisterHttpResponseShare> {
+        self.pool
+            .read()
+            .unwrap()
+            .get_validated_by_identifier(msg_id)
+    }
+
+    fn get_priority_function(
+        &self,
+    ) -> Option<PriorityFn<CanisterHttpResponseId, CanisterHttpResponseAttribute>> {
+        let pool = &*self.pool.read().unwrap();
+        Some(self.gossip.get_priority_function(pool))
+    }
+
+    fn get_chunk_tracker(&self, _id: &CanisterHttpResponseId) -> Box<dyn Chunkable + Send + Sync> {
+        Box::new(SingleChunked::CanisterHttp)
     }
 }

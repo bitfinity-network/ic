@@ -1,13 +1,16 @@
-use ic_config::embedders::{Config, PersistenceType};
+use ic_config::embedders::Config;
 use ic_embedders::wasm_utils::instrumentation::{instrument, InstructionCostTable};
 use ic_embedders::WasmtimeEmbedder;
-use ic_interfaces::execution_environment::{ExecutionParameters, SubnetAvailableMemory};
+use ic_interfaces::execution_environment::{
+    AvailableMemory, ExecutionMode, ExecutionParameters, SubnetAvailableMemory,
+};
 use ic_logger::{replica_logger::no_op_logger, ReplicaLogger};
 use ic_registry_routing_table::{CanisterIdRange, RoutingTable};
 use ic_registry_subnet_type::SubnetType;
-use ic_replicated_state::{Memory, NumWasmPages};
+use ic_replicated_state::{Memory, NetworkTopology, NumWasmPages, SubnetTopology};
 use ic_sys::PAGE_SIZE;
-use ic_system_api::{ApiType, StaticSystemState, SystemApiImpl};
+use ic_system_api::DefaultOutOfInstructionsHandler;
+use ic_system_api::{sandbox_safe_system_state::SandboxSafeSystemState, ApiType, SystemApiImpl};
 use ic_test_utilities::{
     cycles_account_manager::CyclesAccountManagerBuilder,
     mock_time,
@@ -24,13 +27,14 @@ use lazy_static::lazy_static;
 use maplit::btreemap;
 use proptest::prelude::*;
 use std::collections::BTreeSet;
+use std::convert::TryFrom;
 use std::sync::Arc;
 
 const MAX_NUM_INSTRUCTIONS: NumInstructions = NumInstructions::new(1_000_000_000);
 
 lazy_static! {
     static ref MAX_SUBNET_AVAILABLE_MEMORY: SubnetAvailableMemory =
-        SubnetAvailableMemory::new(i64::MAX / 2);
+        AvailableMemory::new(i64::MAX / 2, i64::MAX / 2).into();
 }
 
 fn test_api_for_update(
@@ -38,14 +42,24 @@ fn test_api_for_update(
     caller: Option<PrincipalId>,
     payload: Vec<u8>,
     subnet_type: SubnetType,
-) -> SystemApiImpl<ic_system_api::SystemStateAccessorDirect> {
+) -> SystemApiImpl {
     let caller = caller.unwrap_or_else(|| user_test_id(24).get());
     let subnet_id = subnet_test_id(1);
-    let routing_table = Arc::new(RoutingTable::new(btreemap! {
-        CanisterIdRange{ start: CanisterId::from(0), end: CanisterId::from(0xff) } => subnet_id,
-    }));
-    let subnet_records = Arc::new(btreemap! {
-        subnet_id => subnet_type,
+    let routing_table = Arc::new(
+        RoutingTable::try_from(btreemap! {
+            CanisterIdRange{ start: CanisterId::from(0), end: CanisterId::from(0xff) } => subnet_id,
+        })
+        .unwrap(),
+    );
+    let network_topology = Arc::new(NetworkTopology {
+        routing_table,
+        subnets: btreemap! {
+            subnet_id => SubnetTopology {
+                subnet_type,
+                ..SubnetTopology::default()
+            }
+        },
+        ..NetworkTopology::default()
     });
     let system_state = SystemStateBuilder::default().build();
     let cycles_account_manager = Arc::new(
@@ -53,13 +67,10 @@ fn test_api_for_update(
             .with_subnet_type(subnet_type)
             .build(),
     );
-    let static_system_state =
-        StaticSystemState::new(&system_state, cycles_account_manager.subnet_type());
+    let static_system_state = SandboxSafeSystemState::new(&system_state, *cycles_account_manager);
     let canister_memory_limit = NumBytes::from(4 << 30);
     let canister_current_memory_usage = NumBytes::from(0);
 
-    let system_state_accessor =
-        ic_system_api::SystemStateAccessorDirect::new(system_state, cycles_account_manager);
     SystemApiImpl::new(
         ApiType::update(
             mock_time(),
@@ -69,25 +80,21 @@ fn test_api_for_update(
             call_context_test_id(13),
             subnet_id,
             subnet_type,
-            if subnet_type == SubnetType::System {
-                subnet_id
-            } else {
-                subnet_test_id(0x101)
-            },
-            routing_table,
-            subnet_records,
+            network_topology,
         ),
-        system_state_accessor,
         static_system_state,
         canister_current_memory_usage,
         ExecutionParameters {
-            instruction_limit: MAX_NUM_INSTRUCTIONS,
+            total_instruction_limit: MAX_NUM_INSTRUCTIONS,
+            slice_instruction_limit: MAX_NUM_INSTRUCTIONS,
             canister_memory_limit,
             subnet_available_memory: MAX_SUBNET_AVAILABLE_MEMORY.clone(),
             compute_allocation: ComputeAllocation::default(),
             subnet_type: SubnetType::Application,
+            execution_mode: ExecutionMode::Replicated,
         },
         Memory::default(),
+        Arc::new(DefaultOutOfInstructionsHandler {}),
         log,
     )
 }
@@ -171,7 +178,7 @@ fn random_writes(heap_size: usize, num_writes: usize) -> impl Strategy<Value = V
     prop::collection::vec(write_strategy, 1..num_writes)
 }
 
-fn buf_apply_write(heap: &mut Vec<u8>, write: &Write) {
+fn buf_apply_write(heap: &mut [u8], write: &Write) {
     // match the behavior of write_bytes: copy the i32 `addr` to heap[0;4]
     heap[0..4].copy_from_slice(&write.dst.to_le_bytes());
     heap[write.dst as usize..(write.dst as usize + write.bytes.len() as usize)]
@@ -214,14 +221,9 @@ mod tests {
             // We will perform identical writes to wasm module's heap and this buffer.
             let mut test_heap = vec![0; TEST_HEAP_SIZE_BYTES];
             // Use SIGSEGV tracking and later compare against /proc/pic/pagemap.
-            let config = Config {
-                persistence_type: PersistenceType::Sigsegv,
-                ..Default::default()
-            };
+            let config = Config::default();
             let embedder = WasmtimeEmbedder::new(config, log);
-            let embedder_cache = embedder
-                .compile(PersistenceType::Sigsegv, &output_instrumentation.binary)
-                .unwrap();
+            let embedder_cache = embedder.compile(&output_instrumentation.binary).unwrap();
             let mut page_map = PageMap::default();
             let mut dirty_pages: BTreeSet<u64> = BTreeSet::new();
 
@@ -238,8 +240,7 @@ mod tests {
                         &embedder_cache,
                         &[],
                         NumWasmPages::from(0),
-                        None,
-                        Some(page_map.clone()),
+                        page_map.clone(),
                         modification_tracking,
                         api,
                     )
@@ -346,6 +347,61 @@ mod tests {
     }
 
     #[test]
+    fn test_charge_instruction_for_data_copy() {
+        with_test_replica_logger(|log| {
+            // This test is to ensure that the callers of `charge_for_system_api_call`
+            // properly convert `size: i32` to u64 and this process does not charge
+            // more than the equivalent of `size` for values >= 2^31.
+            let num_bytes = 2147483648; // equivalent to 2^31
+            let payload = vec![0u8; num_bytes];
+            let wasm = wat2wasm(
+                r#"
+              (module
+                (import "ic0" "trap" (func $trap (param i32) (param i32)))
+
+                (func $func_trap
+                    (call $trap (i32.const 0) (i32.const 2147483648)) ;; equivalent to 2 ^ 31
+                )
+                (memory $memory 65536)
+                (export "memory" (memory $memory))
+                (export "canister_update func_trap" (func $func_trap))
+              )
+            "#,
+            )
+            .unwrap();
+
+            let max_num_instructions = NumInstructions::from(5_000_000_000);
+
+            let embedder = WasmtimeEmbedder::new(Config::default(), log.clone());
+            let output_instrumentation = instrument(&wasm, &InstructionCostTable::new()).unwrap();
+            let api = test_api_for_update(log, None, payload, SubnetType::Application);
+            let mut inst = embedder
+                .new_instance(
+                    canister_test_id(1),
+                    &embedder.compile(&output_instrumentation.binary).unwrap(),
+                    &[],
+                    NumWasmPages::from(0),
+                    PageMap::default(),
+                    ModificationTracking::Ignore,
+                    api,
+                )
+                .map_err(|r| r.0)
+                .expect("Failed to create instance");
+            inst.set_num_instructions(max_num_instructions);
+
+            let _result = inst.run(FuncRef::Method(WasmMethod::Update("func_trap".into())));
+
+            // The amount of instructions consumed: 2 constants, trap() (21 instructions)
+            // plus equivalent of `num_bytes` in instructions.
+            let instructions_consumed = max_num_instructions - inst.get_num_instructions();
+            assert_eq!(
+                instructions_consumed.get(),
+                23 + (num_bytes / BYTES_PER_INSTRUCTION) as u64
+            )
+        });
+    }
+
+    #[test]
     fn test_running_out_of_instructions() {
         with_test_replica_logger(|log| {
             let subnet_type = SubnetType::Application;
@@ -404,7 +460,8 @@ mod tests {
             // `stable_read()` System API call overhead.
             assert_eq!(
                 instructions_consumed_without_data.get(),
-                7 + ic_embedders::wasmtime_embedder::system_api_charges::STABLE_READ.get() as u64
+                7 + ic_embedders::wasmtime_embedder::system_api_complexity::STABLE_READ.get()
+                    as u64
             );
         })
     }
@@ -529,24 +586,17 @@ mod tests {
         let wat = make_module_wat(2 * TEST_NUM_PAGES);
         let wasm = wat2wasm(&wat).unwrap();
 
-        let config = Config {
-            persistence_type: PersistenceType::Sigsegv,
-            ..Default::default()
-        };
-
+        let config = Config::default();
         let embedder = WasmtimeEmbedder::new(config, log.clone());
         let output_instrumentation = instrument(&wasm, &InstructionCostTable::new()).unwrap();
         let api = test_api_for_update(log, None, payload, subnet_type);
         let mut inst = embedder
             .new_instance(
                 canister_test_id(1),
-                &embedder
-                    .compile(PersistenceType::Sigsegv, &output_instrumentation.binary)
-                    .unwrap(),
+                &embedder.compile(&output_instrumentation.binary).unwrap(),
                 &[],
                 NumWasmPages::from(0),
-                None,
-                Some(PageMap::default()),
+                PageMap::default(),
                 ModificationTracking::Track,
                 api,
             )

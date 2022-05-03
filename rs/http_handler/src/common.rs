@@ -1,20 +1,12 @@
-// Common code for both submit.rs and read.rs
-
 use hyper::{Body, HeaderMap, Response, StatusCode};
 use ic_crypto_tree_hash::Path;
 use ic_crypto_tree_hash::{sparse_labeled_tree_from_paths, Label};
-use ic_interfaces::state_manager::StateReader;
+use ic_error_types::UserError;
+use ic_interfaces_state_manager::StateReader;
 use ic_logger::{info, ReplicaLogger};
 use ic_replicated_state::ReplicatedState;
-use ic_types::{
-    canonical_error::{
-        internal_error, invalid_argument_error, permission_denied_error, resource_exhausted_error,
-        CanonicalError,
-    },
-    messages::MessageId,
-};
+use ic_types::messages::MessageId;
 use ic_validator::RequestValidationError;
-use prost::Message;
 use serde::Serialize;
 use std::sync::Arc;
 use tower::{load_shed::error::Overloaded, BoxError};
@@ -23,28 +15,85 @@ pub const CONTENT_TYPE_HTML: &str = "text/html";
 pub const CONTENT_TYPE_CBOR: &str = "application/cbor";
 pub const CONTENT_TYPE_PROTOBUF: &str = "application/x-protobuf";
 
-pub(crate) fn make_response(canonical_error: CanonicalError) -> Response<Body> {
-    let mut resp = Response::new(Body::from(canonical_error.message));
-    *resp.status_mut() = StatusCode::from(canonical_error.code);
+pub(crate) fn make_plaintext_response(status: StatusCode, message: String) -> Response<Body> {
+    let mut resp = Response::new(Body::from(message));
+    *resp.status_mut() = status;
     *resp.headers_mut() = get_cors_headers();
     resp
 }
 
-fn map_box_error_to_canonical_error(err: BoxError) -> CanonicalError {
-    if err.is::<CanonicalError>() {
-        return *err
-            .downcast::<CanonicalError>()
-            .expect("Downcasting must succeed.");
-    }
-    if err.is::<Overloaded>() {
-        return resource_exhausted_error("The service is overloaded.");
-    }
-    internal_error(&format!("Could not convert {:?} to CanonicalError", err))
+/// Converts a user error into an HTTP response.
+///
+/// We need this conversion because we validate user requests twice:
+///
+///   1. Ingress filter checks user messages before including them in blocks
+///      so that we don't have to reach a consensus on payloads that we will
+///      throw away in the execution.
+///      We cannot put UserErrors produced at this stage in the state tree;
+///      We have to return them in the  HTTP body.
+///
+///   2. Once messages reach execution, we include UserErrors into the state tree.
+///      Users can fetch the details via the read_state endpoint.
+///
+/// make_response conversion applies the first case.
+pub(crate) fn make_response(user_error: UserError) -> Response<Body> {
+    use ic_error_types::ErrorCode as C;
+
+    let status = match user_error.code() {
+        C::SubnetOversubscribed => StatusCode::SERVICE_UNAVAILABLE,
+        C::MaxNumberOfCanistersReached => StatusCode::SERVICE_UNAVAILABLE,
+        C::CanisterOutputQueueFull => StatusCode::SERVICE_UNAVAILABLE,
+        C::IngressMessageTimeout => StatusCode::GATEWAY_TIMEOUT,
+        C::CanisterNotFound => StatusCode::NOT_FOUND,
+        C::CanisterMethodNotFound => StatusCode::NOT_FOUND,
+        C::CanisterAlreadyInstalled => StatusCode::PRECONDITION_FAILED,
+        C::CanisterWasmModuleNotFound => StatusCode::SERVICE_UNAVAILABLE,
+        C::CanisterEmpty => StatusCode::SERVICE_UNAVAILABLE,
+        C::InsufficientTransferFunds => StatusCode::SERVICE_UNAVAILABLE,
+        C::InsufficientMemoryAllocation => StatusCode::SERVICE_UNAVAILABLE,
+        C::InsufficientCyclesForCreateCanister => StatusCode::SERVICE_UNAVAILABLE,
+        C::SubnetNotFound => StatusCode::NOT_FOUND,
+        C::CanisterOutOfCycles => StatusCode::SERVICE_UNAVAILABLE,
+        C::CanisterTrapped => StatusCode::INTERNAL_SERVER_ERROR,
+        C::CanisterCalledTrap => StatusCode::INTERNAL_SERVER_ERROR,
+        C::CanisterContractViolation => StatusCode::BAD_REQUEST,
+        C::CanisterInvalidWasm => StatusCode::BAD_REQUEST,
+        C::CanisterDidNotReply => StatusCode::INTERNAL_SERVER_ERROR,
+        C::CanisterOutOfMemory => StatusCode::SERVICE_UNAVAILABLE,
+        C::CanisterStopped => StatusCode::SERVICE_UNAVAILABLE,
+        C::CanisterStopping => StatusCode::SERVICE_UNAVAILABLE,
+        C::CanisterNotStopped => StatusCode::PRECONDITION_FAILED,
+        C::CanisterStoppingCancelled => StatusCode::PRECONDITION_FAILED,
+        C::CanisterInvalidController => StatusCode::FORBIDDEN,
+        C::CanisterFunctionNotFound => StatusCode::NOT_FOUND,
+        C::CanisterNonEmpty => StatusCode::PRECONDITION_FAILED,
+        C::CertifiedStateUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+        C::CanisterRejectedMessage => StatusCode::FORBIDDEN,
+        C::InterCanisterQueryLoopDetected => StatusCode::INTERNAL_SERVER_ERROR,
+        C::UnknownManagementMessage => StatusCode::BAD_REQUEST,
+        C::InvalidManagementPayload => StatusCode::BAD_REQUEST,
+        C::InsufficientCyclesInCall => StatusCode::SERVICE_UNAVAILABLE,
+        C::CanisterWasmEngineError => StatusCode::INTERNAL_SERVER_ERROR,
+        C::CanisterInstructionLimitExceeded => StatusCode::INTERNAL_SERVER_ERROR,
+        C::CanisterInstallCodeRateLimited => StatusCode::TOO_MANY_REQUESTS,
+    };
+    make_plaintext_response(status, user_error.description().to_string())
 }
 
 pub(crate) fn map_box_error_to_response(err: BoxError) -> Response<Body> {
-    let canonical_error = map_box_error_to_canonical_error(err);
-    make_response(canonical_error)
+    if let Some(user_error) = err.downcast_ref::<UserError>() {
+        return make_response(user_error.clone());
+    }
+    if err.is::<Overloaded>() {
+        return make_plaintext_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "The service is overloaded.".to_string(),
+        );
+    }
+    make_plaintext_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("Unexpected error: {}", err),
+    )
 }
 
 /// Add CORS headers to provided Response. In particular we allow
@@ -96,28 +145,6 @@ pub(crate) fn empty_response() -> Response<Body> {
     response
 }
 
-/// Encode the provided prost::Message implementing type as a protobuf Vec<u8>.
-fn encode_as_protobuf_vec<R: Message>(r: &R) -> Vec<u8> {
-    let mut buf = Vec::<u8>::new();
-    r.encode(&mut buf)
-        .expect("impossible: Serialization failed");
-    buf
-}
-
-/// Write the provided prost::Message as a serialized protobuf into a Response
-/// object.
-pub(crate) fn protobuf_response<R: Message>(r: &R) -> Response<Body> {
-    use hyper::header;
-    let mut response = Response::new(Body::from(encode_as_protobuf_vec(r)));
-    *response.status_mut() = StatusCode::OK;
-    *response.headers_mut() = get_cors_headers();
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        header::HeaderValue::from_static(CONTENT_TYPE_PROTOBUF),
-    );
-    response
-}
-
 pub(crate) fn make_response_on_validation_error(
     message_id: MessageId,
     err: RequestValidationError,
@@ -126,7 +153,7 @@ pub(crate) fn make_response_on_validation_error(
     match err {
         RequestValidationError::InvalidIngressExpiry(msg)
         | RequestValidationError::InvalidDelegationExpiry(msg) => {
-            make_response(invalid_argument_error(&msg))
+            make_plaintext_response(StatusCode::BAD_REQUEST, msg)
         }
         _ => {
             let message = format!(
@@ -134,7 +161,7 @@ pub(crate) fn make_response_on_validation_error(
                 message_id, err
             );
             info!(log, "{}", message);
-            make_response(permission_denied_error(&message))
+            make_plaintext_response(StatusCode::FORBIDDEN, message)
         }
     }
 }

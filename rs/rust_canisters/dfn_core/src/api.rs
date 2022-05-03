@@ -337,7 +337,7 @@ pub fn call_raw(
         );
         ic0::call_data_append(data.as_ptr() as u32, data.len() as u32);
         if funds.cycles > 0 {
-            call_cycles_add128(0, funds.cycles);
+            call_cycles_add(funds.cycles);
         }
         if let Some(on_cleanup) = on_cleanup {
             ic0::call_on_cleanup(on_cleanup as usize, env as u32);

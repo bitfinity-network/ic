@@ -1,20 +1,20 @@
 //! Static crypto utility methods.
 use ic_config::crypto::CryptoConfig;
-use ic_crypto_internal_csp::api::{CspKeyGenerator, IDkgProtocolCspClient, NiDkgCspClient};
-use ic_crypto_internal_csp::keygen::public_key_hash_as_key_id;
+use ic_crypto_internal_csp::api::{
+    CspIDkgProtocol, CspKeyGenerator, CspSecretKeyStoreChecker, NiDkgCspClient,
+};
+use ic_crypto_internal_csp::public_key_store;
 use ic_crypto_internal_csp::secret_key_store::proto_store::ProtoSecretKeyStore;
 use ic_crypto_internal_csp::types::{CspPop, CspPublicKey};
 use ic_crypto_internal_csp::Csp;
-use ic_crypto_internal_csp::{public_key_store, CryptoServiceProvider};
 use ic_crypto_tls_interfaces::TlsPublicKeyCert;
 use ic_crypto_utils_basic_sig::conversions as basicsig_conversions;
 use ic_protobuf::crypto::v1::NodePublicKeys;
-use ic_protobuf::registry::crypto::v1::AlgorithmId as AlgorithmIdProto;
 use ic_protobuf::registry::crypto::v1::PublicKey as PublicKeyProto;
+use ic_protobuf::registry::crypto::v1::{AlgorithmId as AlgorithmIdProto, X509PublicKeyCert};
 use ic_types::crypto::{AlgorithmId, CryptoError, CryptoResult};
 use ic_types::NodeId;
 use rand_core::OsRng;
-use std::convert::TryFrom;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -22,6 +22,13 @@ pub mod ni_dkg;
 
 mod temp_crypto;
 
+use crate::keygen::{
+    ensure_committee_signing_key_material_is_set_up_correctly,
+    ensure_dkg_dealing_encryption_key_material_is_set_up_correctly,
+    ensure_idkg_dealing_encryption_key_material_is_set_up_correctly,
+    ensure_node_signing_key_material_is_set_up_correctly,
+    ensure_tls_key_material_is_set_up_correctly,
+};
 pub use crate::sign::utils::combined_threshold_signature_and_public_key;
 use ic_crypto_internal_logmon::metrics::CryptoMetrics;
 pub use temp_crypto::{NodeKeysToGenerate, TempCryptoComponent};
@@ -35,9 +42,9 @@ mod tests;
 /// Stores the secret key in the key store at `crypto_root` and returns the
 /// corresponding public key.
 ///
-/// If the `crypto_root` directory does not exist, it is created with the
-/// required permissions. If there exists no key store in `crypto_root`, a new
-/// one is created.
+/// The `crypto_root` directory must exist and have the [permissions required
+/// for storing crypto state](CryptoConfig::check_dir_has_required_permissions).
+/// If there exists no key store in `crypto_root`, a new one is created.
 pub fn generate_dkg_dealing_encryption_keys(crypto_root: &Path, node_id: NodeId) -> PublicKeyProto {
     let mut csp = csp_at_root(crypto_root);
     let (pubkey, pop) = csp
@@ -51,9 +58,9 @@ pub fn generate_dkg_dealing_encryption_keys(crypto_root: &Path, node_id: NodeId)
 /// Stores the secret key in the key store at `crypto_root` and returns the
 /// corresponding public key.
 ///
-/// If the `crypto_root` directory does not exist, it is created with the
-/// required permissions. If there exists no key store in `crypto_root`, a new
-/// one is created.
+/// The `crypto_root` directory must exist and have the [permissions required
+/// for storing crypto state](CryptoConfig::check_dir_has_required_permissions).
+/// If there exists no key store in `crypto_root`, a new one is created.
 pub fn generate_idkg_dealing_encryption_keys(crypto_root: &Path) -> PublicKeyProto {
     let mut csp = csp_at_root(crypto_root);
     let pubkey = csp
@@ -68,7 +75,6 @@ pub fn generate_idkg_dealing_encryption_keys(crypto_root: &Path) -> PublicKeyPro
     }
 }
 
-// TODO (CRP-994): Extend check_keys_locally to check consistency for all keys.
 /// Obtains the node's cryptographic keys or generates them if they are missing.
 ///
 /// First, tries to retrieve the node's public keys from `crypto_root`. If they
@@ -83,6 +89,10 @@ pub fn generate_idkg_dealing_encryption_keys(crypto_root: &Path) -> PublicKeyPro
 /// bound to this node ID. The newly generated public keys are then returned
 /// together with the corresponding node ID.
 ///
+/// The `crypto_root` directory must exist and have the [permissions required
+/// for storing crypto state](CryptoConfig::check_dir_has_required_permissions).
+/// If there exists no key store in `crypto_root`, a new one is created.
+///
 /// # Panics
 ///  * if public keys exist but are inconsistent with the secret keys.
 ///  * if an error occurs when accessing or generating the keys.
@@ -95,13 +105,15 @@ pub fn get_node_keys_or_generate_if_missing(crypto_root: &Path) -> (NodePublicKe
             let node_id = derive_node_id(&node_signing_pk);
             let dkg_dealing_encryption_pk =
                 generate_dkg_dealing_encryption_keys(crypto_root, node_id);
+            let idkg_dealing_encryption_pk = generate_idkg_dealing_encryption_keys(crypto_root);
             let tls_certificate = generate_tls_keys(crypto_root, node_id).to_proto();
             let node_pks = NodePublicKeys {
-                version: 0,
+                version: 1,
                 node_signing_pk: Some(node_signing_pk),
                 committee_signing_pk: Some(committee_signing_pk),
                 tls_certificate: Some(tls_certificate),
                 dkg_dealing_encryption_pk: Some(dkg_dealing_encryption_pk),
+                idkg_dealing_encryption_pk: Some(idkg_dealing_encryption_pk),
             };
             public_key_store::store_node_public_keys(crypto_root, &node_pks)
                 .unwrap_or_else(|_| panic!("Failed to store public key material"));
@@ -114,7 +126,26 @@ pub fn get_node_keys_or_generate_if_missing(crypto_root: &Path) -> (NodePublicKe
             }
             (node_pks, node_id)
         }
-        Ok(Some(node_pks)) => {
+        Ok(Some(mut node_pks)) => {
+            // Generate I-DKG key if it is not present yet: we generate the key
+            // purely based on whether it already exists and at the same time
+            // set the key material version to 1, so that afterwards the
+            // version will be consistent on all nodes, no matter what it was
+            // before.
+            if node_pks.idkg_dealing_encryption_pk.is_none() {
+                let idkg_dealing_encryption_pk = generate_idkg_dealing_encryption_keys(crypto_root);
+                node_pks.idkg_dealing_encryption_pk = Some(idkg_dealing_encryption_pk);
+                node_pks.version = 1;
+                public_key_store::store_node_public_keys(crypto_root, &node_pks)
+                    .unwrap_or_else(|_| panic!("Failed to store public key material"));
+                // Re-check the generated keys.
+                let stored_keys = check_keys_locally(crypto_root)
+                    .expect("Could not read generated keys.")
+                    .expect("Newly generated keys are inconsistent.");
+                if stored_keys != node_pks {
+                    panic!("Generated keys differ from the stored ones.");
+                }
+            }
             let node_signing_pk = node_pks
                 .node_signing_pk
                 .as_ref()
@@ -170,8 +201,19 @@ fn check_keys_locally(crypto_root: &Path) -> CryptoResult<Option<NodePublicKeys>
         return Ok(None);
     }
     let csp = csp_at_root(crypto_root);
-    ensure_node_signing_key_is_set_up_locally(&node_pks.node_signing_pk, &csp)?;
-    // TODO (CRP-994): add checks for other local keys.
+    ensure_node_signing_key_is_set_up_locally(node_pks.node_signing_pk.clone(), &csp)?;
+    ensure_committee_signing_key_is_set_up_locally(node_pks.committee_signing_pk.clone(), &csp)?;
+    ensure_dkg_dealing_encryption_key_is_set_up_locally(
+        node_pks.dkg_dealing_encryption_pk.clone(),
+        &csp,
+    )?;
+    ensure_tls_cert_is_set_up_locally(node_pks.tls_certificate.clone(), &csp)?;
+    if node_pks.idkg_dealing_encryption_pk.is_some() {
+        ensure_idkg_dealing_encryption_key_is_set_up_locally(
+            node_pks.idkg_dealing_encryption_pk.clone(),
+            &csp,
+        )?;
+    }
     Ok(Some(node_pks))
 }
 
@@ -179,36 +221,73 @@ fn node_public_keys_are_empty(node_pks: &NodePublicKeys) -> bool {
     node_pks.node_signing_pk.is_none()
         && node_pks.committee_signing_pk.is_none()
         && node_pks.dkg_dealing_encryption_pk.is_none()
+        && node_pks.idkg_dealing_encryption_pk.is_none()
         && node_pks.tls_certificate.is_none()
 }
 
 fn ensure_node_signing_key_is_set_up_locally(
-    maybe_pk: &Option<PublicKeyProto>,
-    csp: &dyn CryptoServiceProvider,
+    maybe_pk_proto: Option<PublicKeyProto>,
+    csp: &dyn CspSecretKeyStoreChecker,
 ) -> CryptoResult<()> {
-    let pk_proto = match maybe_pk {
-        Some(pk) => Ok(pk.clone()),
-        None => Err(CryptoError::MalformedPublicKey {
-            algorithm: AlgorithmId::Placeholder,
-            key_bytes: None,
-            internal_error: "No public key found.".to_string(),
-        }),
-    }?;
-    if AlgorithmId::from(pk_proto.algorithm) != AlgorithmId::Ed25519 {
-        return Err(CryptoError::MalformedPublicKey {
-            algorithm: AlgorithmId::Placeholder,
-            key_bytes: None,
-            internal_error: "Expected Ed25519 public key.".to_string(),
-        });
-    }
-    let csp_key = CspPublicKey::try_from(pk_proto)?;
-    let key_id = public_key_hash_as_key_id(&csp_key);
-    if !csp.sks_contains(&key_id) {
-        return Err(CryptoError::SecretKeyNotFound {
-            algorithm: AlgorithmId::Ed25519,
-            key_id,
-        });
-    }
+    let pk_proto = maybe_pk_proto.ok_or_else(|| CryptoError::MalformedPublicKey {
+        algorithm: AlgorithmId::Placeholder,
+        key_bytes: None,
+        internal_error: "missing node signing key in local public key store".to_string(),
+    })?;
+    ensure_node_signing_key_material_is_set_up_correctly(pk_proto, csp)?;
+    Ok(())
+}
+
+fn ensure_committee_signing_key_is_set_up_locally(
+    maybe_pk_proto: Option<PublicKeyProto>,
+    csp: &dyn CspSecretKeyStoreChecker,
+) -> CryptoResult<()> {
+    let pk_proto = maybe_pk_proto.ok_or_else(|| CryptoError::MalformedPublicKey {
+        algorithm: AlgorithmId::MultiBls12_381,
+        key_bytes: None,
+        internal_error: "missing committee signing key in local public key store".to_string(),
+    })?;
+    ensure_committee_signing_key_material_is_set_up_correctly(pk_proto, csp)?;
+    Ok(())
+}
+
+fn ensure_dkg_dealing_encryption_key_is_set_up_locally(
+    maybe_pk_proto: Option<PublicKeyProto>,
+    csp: &dyn CspSecretKeyStoreChecker,
+) -> CryptoResult<()> {
+    let pk_proto = maybe_pk_proto.ok_or_else(|| CryptoError::MalformedPublicKey {
+        algorithm: AlgorithmId::Groth20_Bls12_381,
+        key_bytes: None,
+        internal_error: "missing NI-DKG dealing encryption key in local public key store"
+            .to_string(),
+    })?;
+    ensure_dkg_dealing_encryption_key_material_is_set_up_correctly(pk_proto, csp)?;
+    Ok(())
+}
+
+fn ensure_idkg_dealing_encryption_key_is_set_up_locally(
+    maybe_pk_proto: Option<PublicKeyProto>,
+    csp: &dyn CspSecretKeyStoreChecker,
+) -> CryptoResult<()> {
+    let pk_proto = maybe_pk_proto.ok_or_else(|| CryptoError::MalformedPublicKey {
+        algorithm: AlgorithmId::MegaSecp256k1,
+        key_bytes: None,
+        internal_error: "missing iDKG dealing encryption key in local public key store".to_string(),
+    })?;
+    ensure_idkg_dealing_encryption_key_material_is_set_up_correctly(pk_proto, csp)?;
+    Ok(())
+}
+
+fn ensure_tls_cert_is_set_up_locally(
+    maybe_tls_cert_proto: Option<X509PublicKeyCert>,
+    csp: &dyn CspSecretKeyStoreChecker,
+) -> CryptoResult<()> {
+    let tls_cert_proto = maybe_tls_cert_proto.ok_or_else(|| CryptoError::MalformedPublicKey {
+        algorithm: AlgorithmId::Tls,
+        key_bytes: None,
+        internal_error: "missing TLS public key certificate in local public key store".to_string(),
+    })?;
+    ensure_tls_key_material_is_set_up_correctly(tls_cert_proto, csp)?;
     Ok(())
 }
 
@@ -250,16 +329,7 @@ fn generate_tls_keys(crypto_root: &Path, node: NodeId) -> TlsPublicKeyCert {
 pub(crate) fn csp_at_root(
     crypto_root: &Path,
 ) -> Csp<OsRng, ProtoSecretKeyStore, ProtoSecretKeyStore> {
-    let config = config_with_dir_and_permissions(crypto_root);
+    let config = CryptoConfig::new(crypto_root.to_path_buf());
     // disable metrics
     Csp::new(&config, None, Arc::new(CryptoMetrics::none()))
-}
-
-fn config_with_dir_and_permissions(crypto_root: &Path) -> CryptoConfig {
-    std::fs::create_dir_all(&crypto_root)
-        .unwrap_or_else(|err| panic!("Failed to create crypto root directory: {}", err));
-    let config = CryptoConfig::new(crypto_root.to_path_buf());
-    CryptoConfig::set_dir_with_required_permission(&config.crypto_root)
-        .expect("Could not setup crypto_root directory");
-    config
 }

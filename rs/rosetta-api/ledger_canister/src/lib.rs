@@ -1,7 +1,7 @@
 use candid::CandidType;
 use dfn_protobuf::ProtoBuf;
+use ic_base_types::{CanisterId, PrincipalId};
 use ic_crypto_sha::Sha256;
-use ic_types::{CanisterId, PrincipalId};
 use intmap::IntMap;
 use lazy_static::lazy_static;
 use on_wire::{FromWire, IntoWire};
@@ -24,12 +24,12 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
 
 pub mod account_identifier;
-pub mod http_request;
-pub mod metrics_encoder;
 pub mod tokens;
-#[path = "../gen/ic_ledger.pb.v1.rs"]
 #[rustfmt::skip]
-pub mod protobuf;
+pub mod protobuf {
+    include!(concat!(env!("OUT_DIR"), "/ic_ledger.pb.v1.rs"));
+}
+pub mod range_utils;
 pub mod timestamp;
 pub mod validate_endpoints;
 
@@ -42,17 +42,10 @@ use dfn_core::api::now;
 pub mod spawn;
 pub use account_identifier::{AccountIdentifier, Subaccount};
 pub use protobuf::TimeStamp;
-pub use tokens::{Tokens, DECIMAL_PLACES, MIN_BURN_AMOUNT, TOKEN_SUBDIVIDABLE_BY, TRANSACTION_FEE};
-
-// Helper to print messages in magenta
-pub fn print<S: std::convert::AsRef<str>>(s: S)
-where
-    yansi::Paint<S>: std::string::ToString,
-{
-    dfn_core::api::print(yansi::Paint::magenta(s).to_string());
-}
+pub use tokens::{Tokens, DECIMAL_PLACES, DEFAULT_TRANSFER_FEE, TOKEN_SUBDIVIDABLE_BY};
 
 pub const HASH_LENGTH: usize = 32;
+pub const MAX_BLOCKS_PER_REQUEST: usize = 2000;
 
 #[derive(CandidType, Clone, Hash, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct HashOf<T> {
@@ -161,11 +154,11 @@ impl<'de, T> Deserialize<'de> for HashOf<T> {
     Serialize, Deserialize, CandidType, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash,
 )]
 #[serde(transparent)]
-pub struct EncodedBlock(pub Box<[u8]>);
+pub struct EncodedBlock(pub serde_bytes::ByteBuf);
 
-impl From<Box<[u8]>> for EncodedBlock {
-    fn from(bytes: Box<[u8]>) -> Self {
-        Self(bytes)
+impl From<Vec<u8>> for EncodedBlock {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::from_vec(bytes)
     }
 }
 
@@ -181,21 +174,34 @@ impl EncodedBlock {
         Ok(ProtoBuf::from_bytes(bytes)?.get())
     }
 
+    pub fn from_vec(bytes: Vec<u8>) -> Self {
+        Self(serde_bytes::ByteBuf::from(bytes))
+    }
+
+    pub fn into_vec(self) -> Vec<u8> {
+        self.0.to_vec()
+    }
+
     pub fn size_bytes(&self) -> usize {
         self.0.len()
     }
 }
 
 #[derive(
-    Serialize, Deserialize, CandidType, Clone, Copy, Hash, Debug, PartialEq, Eq, PartialOrd, Ord,
+    Serialize,
+    Deserialize,
+    CandidType,
+    Clone,
+    Copy,
+    Default,
+    Hash,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
 )]
 pub struct Memo(pub u64);
-
-impl Default for Memo {
-    fn default() -> Memo {
-        Memo(0)
-    }
-}
 
 /// Position of a block in the chain. The first block has position 0.
 pub type BlockHeight = u64;
@@ -205,10 +211,12 @@ pub type Certification = Option<Vec<u8>>;
 pub type LedgerBalances = Balances<HashMap<AccountIdentifier, Tokens>>;
 
 pub trait BalancesStore {
+    /// Returns the balance on the specified account.
     fn get_balance(&self, k: &AccountIdentifier) -> Option<&Tokens>;
-    // Update balance for an account using function f.
-    // Its arg is previous balance or None if not found and
-    // return value is the new balance.
+
+    /// Update balance for an account using function f.
+    /// Its arg is previous balance or None if not found and
+    /// return value is the new balance.
     fn update<F, E>(&mut self, acc: AccountIdentifier, action_on_acc: F) -> Result<Tokens, E>
     where
         F: FnMut(Option<&Tokens>) -> Result<Tokens, E>;
@@ -284,9 +292,16 @@ impl<S: Default + BalancesStore> Balances<S> {
                 amount,
                 fee,
             } => {
-                let debit_amount = (*amount + *fee).expect("amount + fee failed");
+                let debit_amount = (*amount + *fee).map_err(|_| {
+                    // No account can hold more than u64::MAX.
+                    let balance = self.account_balance(from);
+                    BalanceError::InsufficientFunds { balance }
+                })?;
                 self.debit(from, debit_amount)?;
                 self.credit(to, *amount);
+                // NB. integer overflow is not possible here unless there is a
+                // severe bug in the system: total amount of tokens in the
+                // circulation cannot exceed u64::MAX.
                 self.token_pool += *fee;
             }
             Operation::Burn { from, amount, .. } => {
@@ -294,8 +309,8 @@ impl<S: Default + BalancesStore> Balances<S> {
                 self.token_pool += *amount;
             }
             Operation::Mint { to, amount, .. } => {
+                self.token_pool = (self.token_pool - *amount).expect("total token supply exceeded");
                 self.credit(to, *amount);
-                self.token_pool -= *amount;
             }
         }
         Ok(())
@@ -331,7 +346,11 @@ impl<S: Default + BalancesStore> Balances<S> {
     pub fn credit(&mut self, to: &AccountIdentifier, amount: Tokens) {
         self.store
             .update(*to, |prev| -> Result<Tokens, std::convert::Infallible> {
-                Ok((amount + *prev.unwrap_or(&Tokens::ZERO)).expect("integer overflow"))
+                // NB. credit cannot overflow unless there is a bug in the
+                // system: the total amount of tokens in the circulation cannot
+                // exceed u64::MAX, so it's impossible to have more than
+                // u64::MAX tokens on a single account.
+                Ok((amount + *prev.unwrap_or(&Tokens::ZERO)).expect("bug: overflow in credit"))
             })
             .unwrap();
     }
@@ -489,8 +508,8 @@ impl Block {
     }
 
     pub fn encode(self) -> Result<EncodedBlock, String> {
-        let slice = ProtoBuf::new(self).into_bytes()?.into_boxed_slice();
-        Ok(EncodedBlock(slice))
+        let bytes = ProtoBuf::new(self).into_bytes()?;
+        Ok(EncodedBlock::from(bytes))
     }
 
     pub fn parent_hash(&self) -> Option<HashOf<EncodedBlock>> {
@@ -582,7 +601,12 @@ impl Blockchain {
     }
 
     pub fn num_unarchived_blocks(&self) -> u64 {
-        self.blocks.len().try_into().unwrap()
+        self.blocks.len() as u64
+    }
+
+    /// The range of block indices that are not archived yet.
+    pub fn local_block_range(&self) -> std::ops::Range<u64> {
+        self.num_archived_blocks..self.num_archived_blocks + self.blocks.len() as u64
     }
 
     pub fn chain_length(&self) -> BlockHeight {
@@ -622,13 +646,13 @@ impl Blockchain {
         let blocks_to_archive: VecDeque<EncodedBlock> =
             VecDeque::from(self.blocks[0..num_blocks_to_archive.min(num_blocks_before)].to_vec());
 
-        print(format!(
+        println!(
             "get_blocks_for_archiving(): trigger_threshold: {}, num_blocks: {}, blocks before archiving: {}, blocks to archive: {}",
             trigger_threshold,
             num_blocks_to_archive,
             num_blocks_before,
             blocks_to_archive.len(),
-        ));
+        );
 
         blocks_to_archive
     }
@@ -688,12 +712,39 @@ where
     deserializer.deserialize_map(IntMapVisitor::new())
 }
 
+fn default_max_transactions_in_window() -> usize {
+    Ledger::DEFAULT_MAX_TRANSACTIONS_IN_WINDOW
+}
+
+fn default_transfer_fee() -> Tokens {
+    DEFAULT_TRANSFER_FEE
+}
+
+//this is only for deserialization from previous version of the ledger
+fn unknown_token() -> String {
+    "???".to_string()
+}
+
+#[derive(Serialize, Deserialize, CandidType, Clone, Debug, PartialEq, Eq)]
+pub struct TransferFee {
+    /// The fee to pay to perform a transfer
+    pub transfer_fee: Tokens,
+}
+
+impl Default for TransferFee {
+    fn default() -> Self {
+        TransferFee {
+            transfer_fee: DEFAULT_TRANSFER_FEE,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Ledger {
     pub balances: LedgerBalances,
     pub blockchain: Blockchain,
     // A cap on the maximum number of accounts
-    maximum_number_of_accounts: usize,
+    pub maximum_number_of_accounts: usize,
     // When maximum number of accounts is exceeded, a specified number of
     // accounts with lowest balances are removed
     accounts_overflow_trim_quantity: usize,
@@ -717,6 +768,20 @@ pub struct Ledger {
     transactions_by_height: VecDeque<TransactionInfo>,
     /// Used to prevent non-whitelisted canisters from sending tokens
     send_whitelist: HashSet<CanisterId>,
+    /// Maximum number of transactions which ledger will accept
+    /// within the transaction_window.
+    #[serde(default = "default_max_transactions_in_window")]
+    max_transactions_in_window: usize,
+    /// The fee to pay to perform a transfer
+    #[serde(default = "default_transfer_fee")]
+    pub transfer_fee: Tokens,
+
+    /// Token symbol
+    #[serde(default = "unknown_token")]
+    pub token_symbol: String,
+    /// Token name
+    #[serde(default = "unknown_token")]
+    pub token_name: String,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -730,7 +795,7 @@ impl Default for Ledger {
         Self {
             balances: LedgerBalances::default(),
             blockchain: Blockchain::default(),
-            maximum_number_of_accounts: 50_000_000,
+            maximum_number_of_accounts: 28_000_000,
             accounts_overflow_trim_quantity: 100_000,
             minting_account_id: None,
             blocks_notified: IntMap::new(),
@@ -738,18 +803,59 @@ impl Default for Ledger {
             transactions_by_hash: BTreeMap::new(),
             transactions_by_height: VecDeque::new(),
             send_whitelist: HashSet::new(),
+            max_transactions_in_window: Self::DEFAULT_MAX_TRANSACTIONS_IN_WINDOW,
+            transfer_fee: DEFAULT_TRANSFER_FEE,
+            token_symbol: unknown_token(),
+            token_name: unknown_token(),
         }
     }
 }
 
 impl Ledger {
+    /// The maximum number of transactions that we attempt to purge in one go.
+    /// If there are many transactions in the buffer, purging them all in one go
+    /// might require more instructions than one message execution allows.
+    /// Hence, we purge old transactions incrementally, up to
+    /// MAX_TRANSACTIONS_TO_PURGE at a time.
+    const MAX_TRANSACTIONS_TO_PURGE: usize = 100_000;
+    /// See Ledger::max_transactions_in_window
+    const DEFAULT_MAX_TRANSACTIONS_IN_WINDOW: usize = 3_000_000;
+
+    /// Returns true if the next transaction should be throttled due to high
+    /// load on the ledger.
+    fn throttle(&self, now: TimeStamp) -> bool {
+        let num_in_window = self.transactions_by_height.len();
+        // We admit the first half of max_transactions_in_window freely.
+        // After that we start throttling on per-second basis.
+        // This way we guarantee that at most max_transactions_in_window will
+        // get through within the transaction window.
+        if num_in_window >= self.max_transactions_in_window / 2 {
+            // max num of transactions allowed per second
+            let max_rate = (0.5 * self.max_transactions_in_window as f64
+                / self.transaction_window.as_secs_f64())
+            .ceil() as usize;
+
+            if self
+                .transactions_by_height
+                .get(num_in_window.saturating_sub(max_rate))
+                .map(|x| x.block_timestamp)
+                .unwrap_or_else(|| TimeStamp::from_nanos_since_unix_epoch(0))
+                + Duration::from_secs(1)
+                > now
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     /// This creates a block and adds it to the ledger
     pub fn add_payment(
         &mut self,
         memo: Memo,
         payment: Operation,
         created_at_time: Option<TimeStamp>,
-    ) -> Result<(BlockHeight, HashOf<EncodedBlock>), TransferError> {
+    ) -> Result<(BlockHeight, HashOf<EncodedBlock>), PaymentError> {
         self.add_payment_with_timestamp(memo, payment, created_at_time, dfn_core::api::now().into())
     }
 
@@ -761,19 +867,27 @@ impl Ledger {
         payment: Operation,
         created_at_time: Option<TimeStamp>,
         now: TimeStamp,
-    ) -> Result<(BlockHeight, HashOf<EncodedBlock>), TransferError> {
-        self.purge_old_transactions(now);
+    ) -> Result<(BlockHeight, HashOf<EncodedBlock>), PaymentError> {
+        let num_pruned = self.purge_old_transactions(now);
 
         let created_at_time = created_at_time.unwrap_or(now);
 
         if created_at_time + self.transaction_window < now {
-            return Err(TransferError::TxTooOld {
+            return Err(PaymentError::TransferError(TransferError::TxTooOld {
                 allowed_window_nanos: self.transaction_window.as_nanos() as u64,
-            });
+            }));
         }
 
-        if created_at_time > now + ic_types::ingress::PERMITTED_DRIFT {
-            return Err(TransferError::TxCreatedInFuture);
+        if created_at_time > now + ic_constants::PERMITTED_DRIFT {
+            return Err(PaymentError::TransferError(
+                TransferError::TxCreatedInFuture,
+            ));
+        }
+
+        // If we pruned some transactions, let this one through
+        // otherwise throttle if there are too many
+        if num_pruned == 0 && self.throttle(now) {
+            return Err(PaymentError::Reject("Too many transactions in replay prevention window, ledger is throttling, please retry later".to_string()));
         }
 
         let transaction = Transaction {
@@ -785,9 +899,9 @@ impl Ledger {
         let transaction_hash = transaction.hash();
 
         if let Some(block_height) = self.transactions_by_hash.get(&transaction_hash) {
-            return Err(TransferError::TxDuplicate {
+            return Err(PaymentError::TransferError(TransferError::TxDuplicate {
                 duplicate_of: *block_height,
-            });
+            }));
         }
 
         let block = Block::new_from_transaction(self.blockchain.last_hash, transaction, now);
@@ -795,7 +909,7 @@ impl Ledger {
 
         self.balances.add_payment(&payment).map_err(|e| match e {
             BalanceError::InsufficientFunds { balance } => {
-                TransferError::InsufficientFunds { balance }
+                PaymentError::TransferError(TransferError::InsufficientFunds { balance })
             }
         })?;
 
@@ -843,14 +957,17 @@ impl Ledger {
         Ok((height, self.blockchain.last_hash.unwrap()))
     }
 
-    /// Remove transactions older than `transaction_window`.
-    fn purge_old_transactions(&mut self, now: TimeStamp) {
+    /// Removes at most [MAX_TRANSACTIONS_TO_PURGE] transactions older
+    /// than `now - transaction_window` and returns the number of pruned
+    /// transactions.
+    fn purge_old_transactions(&mut self, now: TimeStamp) -> usize {
+        let mut cnt = 0usize;
         while let Some(TransactionInfo {
             block_timestamp,
             transaction_hash,
         }) = self.transactions_by_height.front()
         {
-            if *block_timestamp + self.transaction_window > now {
+            if *block_timestamp + self.transaction_window + ic_constants::PERMITTED_DRIFT >= now {
                 // Stop at a sufficiently recent block.
                 break;
             }
@@ -865,7 +982,12 @@ impl Ledger {
                 None => None,
             };
             self.transactions_by_height.pop_front();
+            cnt += 1;
+            if cnt >= Self::MAX_TRANSACTIONS_TO_PURGE {
+                break;
+            }
         }
+        cnt
     }
 
     /// This adds a pre created block to the ledger. This should only be used
@@ -877,6 +999,7 @@ impl Ledger {
         self.blockchain.add_block(block)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn from_init(
         &mut self,
         initial_values: HashMap<AccountIdentifier, Tokens>,
@@ -884,7 +1007,12 @@ impl Ledger {
         timestamp: TimeStamp,
         transaction_window: Option<Duration>,
         send_whitelist: HashSet<CanisterId>,
+        transfer_fee: Option<Tokens>,
+        token_symbol: Option<String>,
+        token_name: Option<String>,
     ) {
+        self.token_symbol = token_symbol.unwrap_or_else(|| "ICP".to_string());
+        self.token_name = token_name.unwrap_or_else(|| "Internet Computer".to_string());
         self.balances.token_pool = Tokens::MAX;
         self.minting_account_id = Some(minting_account);
         if let Some(t) = transaction_window {
@@ -902,6 +1030,9 @@ impl Ledger {
         }
 
         self.send_whitelist = send_whitelist;
+        if let Some(transfer_fee) = transfer_fee {
+            self.transfer_fee = transfer_fee;
+        }
     }
 
     pub fn change_notification_state(
@@ -990,6 +1121,12 @@ impl Ledger {
     pub fn transactions_by_height_len(&self) -> usize {
         self.transactions_by_height.len()
     }
+
+    pub fn transfer_fee(&self) -> TransferFee {
+        TransferFee {
+            transfer_fee: self.transfer_fee,
+        }
+    }
 }
 
 lazy_static! {
@@ -1032,33 +1169,114 @@ pub struct LedgerCanisterInitPayload {
     pub transaction_window: Option<Duration>,
     pub archive_options: Option<ArchiveOptions>,
     pub send_whitelist: HashSet<CanisterId>,
+    pub transfer_fee: Option<Tokens>,
+    pub token_symbol: Option<String>,
+    pub token_name: Option<String>,
 }
 
 impl LedgerCanisterInitPayload {
-    pub fn new(
-        minting_account: AccountIdentifier,
-        initial_values: HashMap<AccountIdentifier, Tokens>,
-        archive_options: Option<ArchiveOptions>,
-        max_message_size_bytes: Option<usize>,
-        transaction_window: Option<Duration>,
-        send_whitelist: HashSet<CanisterId>,
-    ) -> Self {
+    pub fn builder() -> LedgerCanisterInitPayloadBuilder {
+        LedgerCanisterInitPayloadBuilder::new()
+    }
+}
+
+pub struct LedgerCanisterInitPayloadBuilder {
+    minting_account: Option<AccountIdentifier>,
+    initial_values: HashMap<AccountIdentifier, Tokens>,
+    max_message_size_bytes: Option<usize>,
+    transaction_window: Option<Duration>,
+    archive_options: Option<ArchiveOptions>,
+    send_whitelist: HashSet<CanisterId>,
+    transfer_fee: Option<Tokens>,
+    token_symbol: Option<String>,
+    token_name: Option<String>,
+}
+
+impl LedgerCanisterInitPayloadBuilder {
+    fn new() -> Self {
+        Self {
+            minting_account: None,
+            initial_values: Default::default(),
+            max_message_size_bytes: None,
+            transaction_window: None,
+            archive_options: None,
+            send_whitelist: Default::default(),
+            transfer_fee: None,
+            token_symbol: None,
+            token_name: None,
+        }
+    }
+
+    pub fn minting_account(mut self, minting_account: AccountIdentifier) -> Self {
+        self.minting_account = Some(minting_account);
+        self
+    }
+
+    pub fn initial_values(mut self, initial_values: HashMap<AccountIdentifier, Tokens>) -> Self {
+        self.initial_values = initial_values;
+        self
+    }
+
+    pub fn max_message_size_bytes(mut self, max_message_size_bytes: usize) -> Self {
+        self.max_message_size_bytes = Some(max_message_size_bytes);
+        self
+    }
+
+    pub fn transaction_window(mut self, transaction_window: Duration) -> Self {
+        self.transaction_window = Some(transaction_window);
+        self
+    }
+
+    pub fn archive_options(mut self, archive_options: ArchiveOptions) -> Self {
+        self.archive_options = Some(archive_options);
+        self
+    }
+
+    pub fn send_whitelist(mut self, send_whitelist: HashSet<CanisterId>) -> Self {
+        self.send_whitelist = send_whitelist;
+        self
+    }
+
+    pub fn transfer_fee(mut self, transfer_fee: Tokens) -> Self {
+        self.transfer_fee = Some(transfer_fee);
+        self
+    }
+
+    pub fn token_symbol_and_name(mut self, token_symbol: &str, token_name: &str) -> Self {
+        self.token_symbol = Some(token_symbol.to_string());
+        self.token_name = Some(token_name.to_string());
+        self
+    }
+
+    pub fn build(self) -> Result<LedgerCanisterInitPayload, String> {
+        let minting_account = self
+            .minting_account
+            .ok_or("minting_account must be set in the payload")?;
+
         // verify ledger's invariant about the maximum amount
-        let _can_sum = initial_values.values().fold(Tokens::ZERO, |acc, x| {
-            (acc + *x).expect("Summation overflowing?")
-        });
+        let mut sum = Tokens::ZERO;
+        for initial_value in self.initial_values.values() {
+            sum = (sum + *initial_value).map_err(|_| "initial_values sum overflows".to_string())?
+        }
 
         // Don't allow self-transfers of the minting canister
-        assert!(initial_values.get(&minting_account).is_none());
-
-        Self {
-            minting_account,
-            initial_values,
-            max_message_size_bytes,
-            transaction_window,
-            archive_options,
-            send_whitelist,
+        if self.initial_values.get(&minting_account).is_some() {
+            return Err(
+                "initial_values cannot contain transfers to the minting_account".to_string(),
+            );
         }
+
+        Ok(LedgerCanisterInitPayload {
+            minting_account,
+            initial_values: self.initial_values,
+            max_message_size_bytes: self.max_message_size_bytes,
+            transaction_window: self.transaction_window,
+            archive_options: self.archive_options,
+            send_whitelist: self.send_whitelist,
+            transfer_fee: self.transfer_fee,
+            token_symbol: self.token_symbol,
+            token_name: self.token_name,
+        })
     }
 }
 
@@ -1243,13 +1461,16 @@ mod tests {
             SystemTime::UNIX_EPOCH.into(),
             None,
             HashSet::new(),
+            None,
+            Some("ICP".into()),
+            Some("icp".into()),
         );
 
         let txn = Transaction::new(
             PrincipalId::new_user_test_id(0).into(),
             PrincipalId::new_user_test_id(1).into(),
             Tokens::new(10000, 50).unwrap(),
-            TRANSACTION_FEE,
+            state.transfer_fee,
             Memo(456),
             TimeStamp::new(1, 0),
         );
@@ -1276,7 +1497,7 @@ mod tests {
             PrincipalId::new_user_test_id(0).into(),
             PrincipalId::new_user_test_id(200).into(),
             Tokens::new(30000, 10000).unwrap(),
-            TRANSACTION_FEE,
+            state.transfer_fee,
             Memo(0),
             TimeStamp::new(1, 100),
         );
@@ -1324,9 +1545,9 @@ mod tests {
         let now = dfn_core::api::now().into();
 
         assert_eq!(
-            TransferError::TxTooOld {
+            PaymentError::TransferError(TransferError::TxTooOld {
                 allowed_window_nanos: Duration::from_secs(24 * 60 * 60).as_nanos() as u64,
-            },
+            }),
             state
                 .add_payment(
                     Memo(1),
@@ -1345,7 +1566,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            TransferError::TxCreatedInFuture,
+            PaymentError::TransferError(TransferError::TxCreatedInFuture),
             state
                 .add_payment(
                     Memo(3),
@@ -1398,6 +1619,7 @@ mod tests {
                 node_max_memory_size_bytes: None,
                 max_message_size_bytes: None,
                 controller_id: CanisterId::from_u64(876),
+                cycles_for_archive_creation: Some(0),
             }))));
 
         let user1 = PrincipalId::new_user_test_id(1).into();
@@ -1451,7 +1673,7 @@ mod tests {
         );
 
         assert_eq!(
-            TransferError::TxDuplicate { duplicate_of: 0 },
+            PaymentError::TransferError(TransferError::TxDuplicate { duplicate_of: 0 }),
             state
                 .add_payment(Memo::default(), transfer.clone(), Some(now))
                 .unwrap_err()
@@ -1473,13 +1695,87 @@ mod tests {
         );
 
         assert_eq!(
-            TransferError::TxDuplicate { duplicate_of: 4 },
+            PaymentError::TransferError(TransferError::TxDuplicate { duplicate_of: 4 }),
+            state
+                .add_payment_with_timestamp(
+                    Memo::default(),
+                    transfer.clone(),
+                    Some(t),
+                    state.blockchain.last_timestamp + Duration::from_secs(1),
+                )
+                .unwrap_err()
+        );
+
+        // Corner case 1 -- attempts which are transaction_window apart from each other
+        let t = state.blockchain.last_timestamp + Duration::from_secs(100);
+
+        assert_eq!(
+            state
+                .add_payment_with_timestamp(Memo::default(), transfer.clone(), Some(t), t)
+                .unwrap()
+                .0,
+            5
+        );
+
+        assert_eq!(
+            PaymentError::TransferError(TransferError::TxDuplicate { duplicate_of: 5 }),
+            state
+                .add_payment_with_timestamp(
+                    Memo::default(),
+                    transfer.clone(),
+                    Some(t),
+                    t + state.transaction_window,
+                )
+                .unwrap_err()
+        );
+
+        // Corner case 2 -- attempts which are transaction_window + drift apart from
+        // each other
+        let t = state.blockchain.last_timestamp + Duration::from_secs(200);
+        let drift = ic_constants::PERMITTED_DRIFT;
+
+        assert_eq!(
+            PaymentError::TransferError(TransferError::TxCreatedInFuture),
+            state
+                .add_payment_with_timestamp(
+                    Memo::default(),
+                    transfer.clone(),
+                    Some(t),
+                    t - (drift + Duration::from_nanos(1)),
+                )
+                .unwrap_err()
+        );
+
+        assert_eq!(
+            state
+                .add_payment_with_timestamp(Memo::default(), transfer.clone(), Some(t), t - drift)
+                .unwrap()
+                .0,
+            6
+        );
+
+        assert_eq!(
+            PaymentError::TransferError(TransferError::TxDuplicate { duplicate_of: 6 }),
+            state
+                .add_payment_with_timestamp(
+                    Memo::default(),
+                    transfer.clone(),
+                    Some(t),
+                    t + state.transaction_window,
+                )
+                .unwrap_err()
+        );
+
+        assert_eq!(
+            PaymentError::TransferError(TransferError::TxTooOld {
+                allowed_window_nanos: state.transaction_window.as_nanos() as u64,
+            }),
             state
                 .add_payment_with_timestamp(
                     Memo::default(),
                     transfer,
                     Some(t),
-                    state.blockchain.last_timestamp + Duration::from_secs(1),
+                    t + state.transaction_window + Duration::from_nanos(1),
                 )
                 .unwrap_err()
         );
@@ -1500,6 +1796,9 @@ mod tests {
             SystemTime::UNIX_EPOCH.into(),
             None,
             HashSet::new(),
+            None,
+            Some("ICP".into()),
+            Some("icp".into()),
         );
 
         for i in 0..10 {
@@ -1507,7 +1806,7 @@ mod tests {
                 PrincipalId::new_user_test_id(0).into(),
                 PrincipalId::new_user_test_id(1).into(),
                 Tokens::new(1, 0).unwrap(),
-                TRANSACTION_FEE,
+                state.transfer_fee,
                 Memo(i),
                 TimeStamp::new(1, 0),
             );
@@ -1557,6 +1856,9 @@ mod tests {
             genesis,
             Some(Duration::from_millis(10)),
             HashSet::new(),
+            None,
+            Some("ICP".into()),
+            Some("icp".into()),
         );
         let little_later = genesis + Duration::from_millis(1);
 
@@ -1575,7 +1877,7 @@ mod tests {
             "A purge before the end of the window doesn't remove the notification"
         );
 
-        let later = genesis + Duration::from_secs(10);
+        let later = genesis + Duration::from_secs(10) + ic_constants::PERMITTED_DRIFT;
         ledger.purge_old_transactions(later);
 
         let res3 = ledger.blocks_notified.get(1);
@@ -1597,6 +1899,118 @@ mod tests {
         assert_eq!(res6, None);
     }
 
+    fn apply_at(ledger: &mut Ledger, op: &Operation, ts: TimeStamp) -> BlockHeight {
+        let memo = Memo::default();
+        ledger
+            .add_payment_with_timestamp(memo, op.clone(), None, ts)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "Failed to execute operation {:?} with memo {:?} at {:?}: {:?}",
+                    op, memo, ts, e
+                )
+            })
+            .0
+    }
+
+    #[test]
+    #[should_panic(expected = "Too many transactions")]
+    fn test_throttle_tx_per_second_nok() {
+        let millis = Duration::from_millis;
+
+        let mut ledger = Ledger {
+            transaction_window: millis(2000),
+            max_transactions_in_window: 2,
+            ..Ledger::default()
+        };
+
+        let op = Operation::Mint {
+            to: PrincipalId::new_user_test_id(1).into(),
+            amount: Tokens::from_e8s(1000),
+        };
+
+        let now: TimeStamp = dfn_core::api::now().into();
+
+        assert_eq!(apply_at(&mut ledger, &op, now + millis(1)), 0);
+        assert_eq!(apply_at(&mut ledger, &op, now + millis(1002)), 1);
+
+        // expecting panic here
+        apply_at(&mut ledger, &op, now + millis(1003));
+    }
+
+    #[test]
+    fn test_throttle_tx_per_second_ok() {
+        let millis = Duration::from_millis;
+
+        let mut ledger = Ledger {
+            transaction_window: millis(2000),
+            max_transactions_in_window: 2,
+            ..Ledger::default()
+        };
+
+        let op = Operation::Mint {
+            to: PrincipalId::new_user_test_id(1).into(),
+            amount: Tokens::from_e8s(1000),
+        };
+        let now: TimeStamp = dfn_core::api::now().into();
+
+        assert_eq!(apply_at(&mut ledger, &op, now + millis(1)), 0);
+        assert_eq!(apply_at(&mut ledger, &op, now + millis(1002)), 1);
+        assert_eq!(apply_at(&mut ledger, &op, now + millis(2003)), 2);
+    }
+
+    #[test]
+    fn test_throttle_two_tx_per_second_after_soft_limit_ok() {
+        let millis = Duration::from_millis;
+
+        let mut ledger = Ledger {
+            transaction_window: millis(2000),
+            max_transactions_in_window: 8,
+            ..Ledger::default()
+        };
+
+        let op = Operation::Mint {
+            to: PrincipalId::new_user_test_id(1).into(),
+            amount: Tokens::from_e8s(1000),
+        };
+        let now: TimeStamp = dfn_core::api::now().into();
+
+        assert_eq!(apply_at(&mut ledger, &op, now + millis(1)), 0);
+        assert_eq!(apply_at(&mut ledger, &op, now + millis(2)), 1);
+        assert_eq!(apply_at(&mut ledger, &op, now + millis(3)), 2);
+        assert_eq!(apply_at(&mut ledger, &op, now + millis(4)), 3);
+        assert_eq!(apply_at(&mut ledger, &op, now + millis(1005)), 4);
+        assert_eq!(apply_at(&mut ledger, &op, now + millis(1006)), 5);
+        assert_eq!(apply_at(&mut ledger, &op, now + millis(2007)), 6);
+        assert_eq!(apply_at(&mut ledger, &op, now + millis(3008)), 7);
+    }
+
+    #[test]
+    #[should_panic(expected = "Too many transactions")]
+    fn test_throttle_two_tx_per_second_after_soft_limit_nok() {
+        let millis = Duration::from_millis;
+
+        let mut ledger = Ledger {
+            transaction_window: millis(2000),
+            max_transactions_in_window: 8,
+            ..Ledger::default()
+        };
+
+        let op = Operation::Mint {
+            to: PrincipalId::new_user_test_id(1).into(),
+            amount: Tokens::from_e8s(1000),
+        };
+        let now: TimeStamp = dfn_core::api::now().into();
+
+        assert_eq!(apply_at(&mut ledger, &op, now + millis(1)), 0);
+        assert_eq!(apply_at(&mut ledger, &op, now + millis(2)), 1);
+        assert_eq!(apply_at(&mut ledger, &op, now + millis(3)), 2);
+        assert_eq!(apply_at(&mut ledger, &op, now + millis(4)), 3);
+        assert_eq!(apply_at(&mut ledger, &op, now + millis(1005)), 4);
+        assert_eq!(apply_at(&mut ledger, &op, now + millis(1006)), 5);
+        // expecting panic here
+        apply_at(&mut ledger, &op, now + millis(1007));
+    }
+
     /// Verify consistency of transaction hash after renaming transfer to
     /// operation (see NNS1-765).
     #[test]
@@ -1605,7 +2019,7 @@ mod tests {
             PrincipalId::new_user_test_id(0).into(),
             PrincipalId::new_user_test_id(1).into(),
             Tokens::new(1, 0).unwrap(),
-            TRANSACTION_FEE,
+            DEFAULT_TRANSFER_FEE,
             Memo(123456),
             TimeStamp::new(1, 0),
         );
@@ -1678,7 +2092,7 @@ impl fmt::Display for TransferError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::BadFee { expected_fee } => {
-                write!(f, "transaction fee should be {}", expected_fee)
+                write!(f, "transfer fee should be {}", expected_fee)
             }
             Self::InsufficientFunds { balance } => {
                 write!(
@@ -1702,6 +2116,12 @@ impl fmt::Display for TransferError {
             ),
         }
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum PaymentError {
+    Reject(String),
+    TransferError(TransferError),
 }
 
 /// Struct sent by the ledger canister when it notifies a recipient of a payment
@@ -1768,6 +2188,111 @@ impl AccountBalanceArgs {
     }
 }
 
+/// An operation which modifies account balances
+#[derive(
+    Serialize, Deserialize, CandidType, Clone, Hash, Debug, PartialEq, Eq, PartialOrd, Ord,
+)]
+pub enum CandidOperation {
+    Burn {
+        from: AccountIdBlob,
+        amount: Tokens,
+    },
+    Mint {
+        to: AccountIdBlob,
+        amount: Tokens,
+    },
+    Transfer {
+        from: AccountIdBlob,
+        to: AccountIdBlob,
+        amount: Tokens,
+        fee: Tokens,
+    },
+}
+
+impl From<Operation> for CandidOperation {
+    fn from(op: Operation) -> Self {
+        match op {
+            Operation::Burn { from, amount } => Self::Burn {
+                from: from.to_address(),
+                amount,
+            },
+            Operation::Mint { to, amount } => Self::Mint {
+                to: to.to_address(),
+                amount,
+            },
+            Operation::Transfer {
+                from,
+                to,
+                amount,
+                fee,
+            } => Self::Transfer {
+                from: from.to_address(),
+                to: to.to_address(),
+                amount,
+                fee,
+            },
+        }
+    }
+}
+
+/// An operation with the metadata the client generated attached to it
+#[derive(
+    Serialize, Deserialize, CandidType, Clone, Hash, Debug, PartialEq, Eq, PartialOrd, Ord,
+)]
+pub struct CandidTransaction {
+    pub operation: CandidOperation,
+    pub memo: Memo,
+    pub created_at_time: TimeStamp,
+}
+
+impl From<Transaction> for CandidTransaction {
+    fn from(
+        Transaction {
+            operation,
+            memo,
+            created_at_time,
+        }: Transaction,
+    ) -> Self {
+        Self {
+            memo,
+            operation: operation.into(),
+            created_at_time,
+        }
+    }
+}
+
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct CandidBlock {
+    pub parent_hash: Option<[u8; HASH_LENGTH]>,
+    pub transaction: CandidTransaction,
+    pub timestamp: TimeStamp,
+}
+
+impl From<Block> for CandidBlock {
+    fn from(
+        Block {
+            parent_hash,
+            transaction,
+            timestamp,
+        }: Block,
+    ) -> Self {
+        Self {
+            parent_hash: parent_hash.map(|h| h.into_bytes()),
+            transaction: transaction.into(),
+            timestamp,
+        }
+    }
+}
+
+/// Argument taken by the transfer fee endpoint
+///
+/// The reason it is a struct is so that it can be extended -- e.g., to be able
+/// to query past values. Requiring 1 candid value instead of zero is a
+/// non-backward compatible change. But adding optional fields to a struct taken
+/// as input is backward-compatible.
+#[derive(Serialize, Deserialize, CandidType, Clone, Hash, Debug, PartialEq, Eq)]
+pub struct TransferFeeArgs {}
+
 /// Argument taken by the total_supply endpoint
 ///
 /// The reason it is a struct is so that it can be extended -- e.g., to be able
@@ -1777,21 +2302,60 @@ impl AccountBalanceArgs {
 #[derive(Serialize, Deserialize, CandidType, Clone, Hash, Debug, PartialEq, Eq)]
 pub struct TotalSupplyArgs {}
 
+#[derive(Serialize, Deserialize, CandidType, Clone, Hash, Debug, PartialEq, Eq)]
+pub struct Symbol {
+    pub symbol: String,
+}
+
+#[derive(Serialize, Deserialize, CandidType, Clone, Hash, Debug, PartialEq, Eq)]
+pub struct Name {
+    pub name: String,
+}
+
+#[derive(Serialize, Deserialize, CandidType, Clone, Hash, Debug, PartialEq, Eq)]
+pub struct Decimals {
+    pub decimals: u32,
+}
+
+#[derive(Serialize, Deserialize, CandidType, Clone, Hash, Debug, PartialEq, Eq)]
+pub struct ArchiveInfo {
+    pub canister_id: CanisterId,
+}
+
+#[derive(Serialize, Deserialize, CandidType, Clone, Hash, Debug, PartialEq, Eq)]
+pub struct Archives {
+    pub archives: Vec<ArchiveInfo>,
+}
+
 /// Argument returned by the tip_of_chain endpoint
 pub struct TipOfChainRes {
     pub certification: Option<Vec<u8>>,
     pub tip_index: BlockHeight,
 }
 
+#[derive(Serialize, Deserialize, CandidType)]
 pub struct GetBlocksArgs {
     pub start: BlockHeight,
     pub length: usize,
 }
 
-impl GetBlocksArgs {
-    pub fn new(start: BlockHeight, length: usize) -> Self {
-        GetBlocksArgs { start, length }
-    }
+#[derive(Serialize, Deserialize, CandidType, Debug)]
+pub struct BlockRange {
+    pub blocks: Vec<CandidBlock>,
+}
+
+pub type GetBlocksResult = Result<BlockRange, GetBlocksError>;
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize, CandidType)]
+pub enum GetBlocksError {
+    BadFirstBlockIndex {
+        requested_index: BlockHeight,
+        first_valid_index: BlockHeight,
+    },
+    Other {
+        error_code: u64,
+        error_message: String,
+    },
 }
 
 pub struct GetBlocksRes(pub Result<Vec<EncodedBlock>, String>);
@@ -1852,4 +2416,65 @@ pub enum CyclesResponse {
     // Silly requirement by the candid derivation
     ToppedUp(()),
     Refunded(String, Option<BlockHeight>),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(try_from = "candid::types::reference::Func")]
+pub struct QueryArchiveFn {
+    pub canister_id: CanisterId,
+    pub method: String,
+}
+
+impl From<QueryArchiveFn> for candid::types::reference::Func {
+    fn from(archive_fn: QueryArchiveFn) -> Self {
+        Self {
+            principal: candid::Principal::from_slice(archive_fn.canister_id.as_ref()),
+            method: archive_fn.method,
+        }
+    }
+}
+
+impl TryFrom<candid::types::reference::Func> for QueryArchiveFn {
+    type Error = String;
+    fn try_from(func: candid::types::reference::Func) -> Result<Self, Self::Error> {
+        let canister_id = CanisterId::try_from(func.principal.as_slice())
+            .map_err(|e| format!("principal is not a canister id: {}", e))?;
+        Ok(QueryArchiveFn {
+            canister_id,
+            method: func.method,
+        })
+    }
+}
+
+impl CandidType for QueryArchiveFn {
+    fn _ty() -> candid::types::Type {
+        candid::types::Type::Func(candid::types::Function {
+            modes: vec![candid::parser::types::FuncMode::Query],
+            args: vec![GetBlocksArgs::_ty()],
+            rets: vec![GetBlocksResult::_ty()],
+        })
+    }
+
+    fn idl_serialize<S>(&self, serializer: S) -> Result<(), S::Error>
+    where
+        S: candid::types::Serializer,
+    {
+        candid::types::reference::Func::from(self.clone()).idl_serialize(serializer)
+    }
+}
+
+#[derive(Debug, CandidType, Deserialize)]
+pub struct ArchivedBlocksRange {
+    pub start: BlockHeight,
+    pub length: u64,
+    pub callback: QueryArchiveFn,
+}
+
+#[derive(Debug, CandidType, Deserialize)]
+pub struct QueryBlocksResponse {
+    pub chain_length: u64,
+    pub certificate: Option<serde_bytes::ByteBuf>,
+    pub blocks: Vec<CandidBlock>,
+    pub first_block_index: BlockHeight,
+    pub archived_blocks: Vec<ArchivedBlocksRange>,
 }

@@ -16,34 +16,35 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use ic_artifact_pool::ingress_pool::IngressPoolImpl;
 use ic_config::artifact_pool::ArtifactPoolConfig;
+use ic_constants::MAX_INGRESS_TTL;
 use ic_ingress_manager::IngressManager;
 use ic_interfaces::{
     artifact_pool::UnvalidatedArtifact, ingress_manager::IngressHandler,
-    ingress_pool::MutableIngressPool, registry::RegistryClient, state_manager::Labeled,
-    time_source::TimeSource,
+    ingress_pool::MutableIngressPool, registry::RegistryClient, time_source::TimeSource,
 };
-use ic_logger::ReplicaLogger;
+use ic_interfaces_state_manager::Labeled;
+use ic_logger::{replica_logger::no_op_logger, ReplicaLogger};
 use ic_metrics::MetricsRegistry;
 use ic_registry_client::client::RegistryClientImpl;
-use ic_registry_common::proto_registry_data_provider::ProtoRegistryDataProvider;
 use ic_registry_keys::make_subnet_record_key;
+use ic_registry_proto_data_provider::ProtoRegistryDataProvider;
 use ic_registry_subnet_type::SubnetType;
-use ic_replicated_state::{CanisterQueues, ReplicatedState, SystemMetadata};
+use ic_replicated_state::{BitcoinState, CanisterQueues, ReplicatedState, SystemMetadata};
 use ic_test_utilities::{
     consensus::MockConsensusCache,
     crypto::temp_crypto_component_with_fake_registry,
     cycles_account_manager::CyclesAccountManagerBuilder,
     history::MockIngressHistory,
     mock_time,
-    registry::test_subnet_record,
     state::ReplicatedStateBuilder,
     state_manager::MockStateManager,
     types::ids::{canister_test_id, node_test_id, subnet_test_id, user_test_id},
     types::messages::SignedIngressBuilder,
     FastForwardTimeSource,
 };
+use ic_test_utilities_registry::test_subnet_record;
 use ic_types::{
-    ingress::{IngressStatus, MAX_INGRESS_TTL},
+    ingress::IngressStatus,
     malicious_flags::MaliciousFlags,
     messages::{MessageId, SignedIngress},
     Height, RegistryVersion, SubnetId, Time,
@@ -185,6 +186,7 @@ where
                         metadata,
                         CanisterQueues::default(),
                         Vec::new(),
+                        BitcoinState::default(),
                         std::path::PathBuf::new(),
                     )),
                 )
@@ -203,19 +205,28 @@ where
             ));
             let mut state_manager = MockStateManager::new();
             state_manager.expect_get_state_at().return_const(Ok(
-                ic_interfaces::state_manager::Labeled::new(
+                ic_interfaces_state_manager::Labeled::new(
                     Height::new(0),
                     Arc::new(ReplicatedStateBuilder::default().build()),
                 ),
             ));
+
+            let metrics_registry = MetricsRegistry::new();
+            let ingress_pool = Arc::new(RwLock::new(IngressPoolImpl::new(
+                pool_config.clone(),
+                metrics_registry.clone(),
+                no_op_logger(),
+            )));
+
             let cycles_account_manager = Arc::new(CyclesAccountManagerBuilder::new().build());
             let runtime = tokio::runtime::Runtime::new().unwrap();
             let mut ingress_manager = IngressManager::new(
                 Arc::new(consensus_pool_cache),
                 Box::new(ingress_hist_reader),
+                ingress_pool,
                 setup_registry(subnet_id, runtime.handle().clone()),
                 ingress_signature_crypto,
-                MetricsRegistry::new(),
+                metrics_registry,
                 subnet_id,
                 log.clone(),
                 Arc::new(state_manager),

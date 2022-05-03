@@ -1,8 +1,9 @@
 #[rustfmt::skip]
 pub mod v2 {
-    include!(std::concat!("../../gen/registry/registry.node_rewards.v2.rs"));
+    include!(concat!(env!("OUT_DIR"), "/registry/registry.node_rewards.v2.rs"));
     use std::iter::Extend;
     use std::collections::BTreeMap;
+    use std::fmt;
 
     impl UpdateNodeRewardsTableProposalPayload {
         pub fn get_rewards_table(&self) -> NodeRewardsTable {
@@ -42,8 +43,35 @@ pub mod v2 {
                 }
             }
         }
+
+        /// Given a hierarchy of regions (e.g. "North America,US,San Francisco") and a node type,
+        /// returns the reward rates for the most specific region in this hierarchy that contains
+        /// this node type, if such rates exist.
+        pub fn get_rate(&self, region: &str, node_type: &str) -> Option<NodeRewardRate> {
+            let mut sub_regions: Vec<&str> = region.split(',').collect();
+            while !sub_regions.is_empty() {
+                let full_region = sub_regions.join(",");
+                if let Some(rates) = self.table.get(&full_region) {
+                    if let Some(rate) = rates.rates.get(node_type) {
+                        return Some(rate.clone());
+                    }
+                }
+                sub_regions.pop();
+            }
+
+            None
+        }
     }
 
+    impl fmt::Display for NodeRewardsTable {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            let json = serde_json::to_string_pretty(&self)
+                .unwrap_or_else(|e| format!("Error when serializing: {}", e));
+            writeln!(f, "{}", json)
+        }
+    }
+
+    #[cfg(test)]
     mod tests {
         #[allow(unused_imports)]
         use super::*;
@@ -140,13 +168,88 @@ pub mod v2 {
             assert!(fr.get("small").is_none());
             assert!(fr.get("storage_upgrade").is_none());
         }
+
+        #[test]
+        fn test_get_rate() {
+            let existing_entries = btreemap! {
+                "North America,US,NY".to_string() => NodeRewardRates {
+                    rates: btreemap!{
+                        "default".to_string() => NodeRewardRate {
+                            xdr_permyriad_per_node_per_month: 240,
+                        },
+                    }
+                },
+                "North America,US".to_string() => NodeRewardRates {
+                    rates: btreemap!{
+                        "default".to_string() => NodeRewardRate {
+                            xdr_permyriad_per_node_per_month: 677,
+                        },
+                        "type1".to_string() => NodeRewardRate {
+                            xdr_permyriad_per_node_per_month: 456,
+                        },
+                    }
+                },
+                "North America".to_string() => NodeRewardRates {
+                    rates: btreemap!{
+                        "default".to_string() => NodeRewardRate {
+                            xdr_permyriad_per_node_per_month: 801,
+                        },
+                    }
+                }
+            };
+
+            let table = NodeRewardsTable {
+                table: existing_entries
+            };
+
+            // There is no entry for "US,OR" or "US"
+            assert_rate(&table, "US,OR", "default", None);
+            assert_rate(&table, "OR", "default", None);
+
+            // There is no entry for "US,NY" or "US"
+            assert_rate(&table, "US,NY", "default", None);
+            assert_rate(&table, "NY", "default", None);
+
+            // There is an entry for "North America,US,NY" that has a "default" rate
+            assert_rate(&table, "North America,US,NY", "default", Some(240));
+
+            // "North America,US,NY" doesn't have a rate for "type1", but "North America,US" does.
+            // Assert that "North America,US"'s "type1" rate is used
+            assert_rate(&table, "North America,US,NY", "type1", Some(456));
+
+            // None of "North America,US,NY", "North America,US" or "North America" has a rate for
+            // "type2"
+            assert_rate(&table, "North America,US,NY", "type2", None);
+
+            // "North America,US" has rates for "default" and "type1"
+            assert_rate(&table, "North America,US", "default", Some(677));
+            assert_rate(&table, "North America,US", "type1", Some(456));
+
+            // There is no "default" rate for "North America,US,OR", but there is one for
+            // "North America,US"
+            assert_rate(&table, "North America,US,OR", "default", Some(677));
+
+            // There is no "default" rate for "North America,CA,BC", but there is one for
+            // "North America"
+            assert_rate(&table, "North America,CA,BC", "default", Some(801));
+
+            // There is a "default" rate for "North America"
+            assert_rate(&table, "North America", "default", Some(801));
+        }
+
+        fn assert_rate(table: &NodeRewardsTable, region: &str, node_type: &str, rate: Option<u64>) {
+            assert_eq!(
+                table.get_rate(region, node_type).map(|rate| rate.xdr_permyriad_per_node_per_month),
+                rate
+            )
+        }
     }
 }
 
 /// DEPRECATED
 #[rustfmt::skip]
 pub mod v1 {
-    include!(std::concat!("../../gen/registry/registry.node_rewards.v1.rs"));
+    include!(concat!(env!("OUT_DIR"), "/registry/registry.node_rewards.v1.rs"));
     use std::collections::{BTreeMap, HashMap};
     use std::iter::Extend;
 

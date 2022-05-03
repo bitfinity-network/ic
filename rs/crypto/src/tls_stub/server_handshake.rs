@@ -8,13 +8,14 @@ use ic_crypto_tls_interfaces::{
     SomeOrAllNodes, TlsPublicKeyCert, TlsServerHandshakeError, TlsStream,
 };
 use ic_interfaces::registry::RegistryClient;
-use ic_registry_client::helper::node::NodeRegistry;
+use ic_registry_client_helpers::node::NodeRegistry;
 use ic_types::{NodeId, RegistryVersion};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 use tokio::net::TcpStream;
 
 // TODO (CRP-772): Simplify handshake code by moving cert equality check to CSP
+#[allow(unused)]
 pub async fn perform_tls_server_handshake<C: CspTlsServerHandshake>(
     csp: &C,
     self_node_id: NodeId,
@@ -76,6 +77,7 @@ pub async fn perform_tls_server_handshake_temp_with_optional_client_auth<
     }
 }
 
+#[allow(unused)]
 pub async fn perform_tls_server_handshake_without_client_auth<C: CspTlsServerHandshake>(
     csp: &C,
     self_node_id: NodeId,

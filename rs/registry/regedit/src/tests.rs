@@ -137,6 +137,8 @@ pub fn run_ic_prep() -> (TempDir, IcPrepStateDir) {
             p2p_start_flow_tag: 0,
             prometheus_metrics: vec![],
             node_operator_principal_id: None,
+            no_idkg_key: false,
+            secret_key_store: None,
         },
     );
 
@@ -171,12 +173,8 @@ pub fn run_ic_prep() -> (TempDir, IcPrepStateDir) {
         /* target_dir= */ temp_dir.path(),
         topology_config,
         /* replica_version_id= */ None,
-        /* replica_donwload_url= */ None,
-        /* replica_hash */ None,
         /* generate_subnet_records= */ true, // see note above
         /* nns_subnet_index= */ Some(0),
-        /* nodemanager_download_url= */ None,
-        /* nodemanager_sha256_hex */ None,
         /* release_package_url= */ None,
         /* release_package_sha256_hex */ None,
         Some(ProvisionalWhitelist::All),

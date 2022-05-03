@@ -1,10 +1,13 @@
 //! The consensus public interface.
 use crate::{
+    canister_http::{
+        CanisterHttpPayloadValidationError, CanisterHttpPermananentValidationError,
+        CanisterHttpTransientValidationError,
+    },
     consensus_pool::{ChangeSet, ConsensusPool},
     ingress_manager::{
         IngressPayloadValidationError, IngressPermanentError, IngressTransientError,
     },
-    ingress_pool::IngressPoolSelect,
     messaging::{InvalidXNetPayload, XNetPayloadValidationError, XNetTransientValidationError},
     self_validating_payload::{
         InvalidSelfValidatingPayload, SelfValidatingPayloadValidationError,
@@ -12,9 +15,10 @@ use crate::{
     },
     validation::ValidationError,
 };
-use ic_base_types::NumBytes;
-use ic_types::artifact::{
-    ConsensusMessageAttribute, ConsensusMessageFilter, ConsensusMessageId, PriorityFn,
+use ic_base_types::{NumBytes, SubnetId};
+use ic_types::{
+    artifact::{ConsensusMessageAttribute, ConsensusMessageFilter, ConsensusMessageId, PriorityFn},
+    registry::RegistryClientError,
 };
 
 /// Consensus artifact processing interface.
@@ -33,11 +37,7 @@ pub trait Consensus: Send {
     /// 2. Because [ConsensusPool] is passed as an read-only reference, the
     /// caller is free to run other readers concurrently should it choose to.
     /// But this is a minor point.
-    fn on_state_change(
-        &self,
-        consensus_pool: &dyn ConsensusPool,
-        ingress_pool: &dyn IngressPoolSelect,
-    ) -> ChangeSet;
+    fn on_state_change(&self, consensus_pool: &dyn ConsensusPool) -> ChangeSet;
 }
 
 /// Consensus to gossip interface.
@@ -52,13 +52,6 @@ pub trait ConsensusGossip: Send + Sync {
     fn get_filter(&self) -> ConsensusMessageFilter;
 }
 
-/// Error that can occur during invocation of the `PayloadBuilder`.
-/// All errors are transient.
-#[derive(Clone, Debug)]
-pub enum PayloadBuilderError {
-    RegistryUnavailable,
-}
-
 #[derive(Debug)]
 pub enum PayloadPermanentError {
     XNetPayloadValidationError(InvalidXNetPayload),
@@ -68,14 +61,17 @@ pub enum PayloadPermanentError {
         received: NumBytes,
     },
     SelfValidatingPayloadValidationError(InvalidSelfValidatingPayload),
+    CanisterHttpPayloadValidationError(CanisterHttpPermananentValidationError),
 }
 
 #[derive(Debug)]
 pub enum PayloadTransientError {
     XNetPayloadValidationError(XNetTransientValidationError),
     IngressPayloadValidationError(IngressTransientError),
-    RegistryUnavailable,
+    RegistryUnavailable(RegistryClientError),
+    SubnetNotFound(SubnetId),
     SelfValidatingPayloadValidationError(SelfValidatingTransientValidationError),
+    CanisterHttpPayloadValidationError(CanisterHttpTransientValidationError),
 }
 
 /// Payload validation error
@@ -104,6 +100,15 @@ impl From<SelfValidatingPayloadValidationError> for PayloadValidationError {
         err.map(
             PayloadPermanentError::SelfValidatingPayloadValidationError,
             PayloadTransientError::SelfValidatingPayloadValidationError,
+        )
+    }
+}
+
+impl From<CanisterHttpPayloadValidationError> for PayloadValidationError {
+    fn from(err: CanisterHttpPayloadValidationError) -> Self {
+        err.map(
+            PayloadPermanentError::CanisterHttpPayloadValidationError,
+            PayloadTransientError::CanisterHttpPayloadValidationError,
         )
     }
 }

@@ -1,7 +1,8 @@
 //! The crypto public interface.
 mod keygen;
 
-pub use keygen::KeyManager;
+use ic_types::canister_http::CanisterHttpResponseMetadata;
+pub use keygen::{KeyManager, PublicKeyRegistrationStatus};
 
 mod hash;
 
@@ -35,8 +36,9 @@ pub use sign::canister_threshold_sig::*;
 use ic_types::consensus::certification::CertificationContent;
 use ic_types::consensus::dkg as consensus_dkg;
 use ic_types::consensus::{
-    ecdsa::EcdsaDealing, Block, CatchUpContent, CatchUpContentProtobufBytes, FinalizationContent,
-    NotarizationContent, RandomBeaconContent, RandomTapeContent,
+    ecdsa::{EcdsaComplaintContent, EcdsaDealing, EcdsaOpeningContent},
+    Block, CatchUpContent, CatchUpContentProtobufBytes, FinalizationContent, NotarizationContent,
+    RandomBeaconContent, RandomTapeContent,
 };
 use ic_types::messages::{MessageId, WebAuthnEnvelope};
 
@@ -46,6 +48,8 @@ pub trait Crypto:
     // Block
     + BasicSigner<Block>
     + BasicSigVerifier<Block>
+    // MessageId
+    + BasicSigner<MessageId>
     // Dealing
     + BasicSigner<consensus_dkg::DealingContent>
     + BasicSigVerifier<consensus_dkg::DealingContent>
@@ -64,9 +68,21 @@ pub trait Crypto:
     // EcdsaDealing
     + MultiSigner<EcdsaDealing>
     + MultiSigVerifier<EcdsaDealing>
+    // EcdsaSignedDealing
+    + BasicSigner<EcdsaDealing>
+    + BasicSigVerifier<EcdsaDealing>
+    // EcdsaComplaintContent
+    + BasicSigner<EcdsaComplaintContent>
+    + BasicSigVerifier<EcdsaComplaintContent>
+    // EcdsaOpeningContent
+    + BasicSigner<EcdsaOpeningContent>
+    + BasicSigVerifier<EcdsaOpeningContent>
     + IDkgProtocol
     + ThresholdEcdsaSigner
     + ThresholdEcdsaSigVerifier
+    // CanisterHttpResponse
+    + MultiSigner<CanisterHttpResponseMetadata>
+    + MultiSigVerifier<CanisterHttpResponseMetadata>
     // RequestId/WebAuthn
     + BasicSigVerifierByPublicKey<MessageId>
     + BasicSigVerifierByPublicKey<WebAuthnEnvelope>
@@ -102,6 +118,7 @@ impl<T> Crypto for T where
     T: KeyManager
         + BasicSigner<Block>
         + BasicSigVerifier<Block>
+        + BasicSigner<MessageId>
         + BasicSigner<consensus_dkg::DealingContent>
         + BasicSigVerifier<consensus_dkg::DealingContent>
         + NiDkgAlgorithm
@@ -114,6 +131,14 @@ impl<T> Crypto for T where
         + MultiSigVerifier<NotarizationContent>
         + MultiSigner<EcdsaDealing>
         + MultiSigVerifier<EcdsaDealing>
+        + BasicSigner<EcdsaDealing>
+        + BasicSigVerifier<EcdsaDealing>
+        + BasicSigner<EcdsaComplaintContent>
+        + BasicSigVerifier<EcdsaComplaintContent>
+        + BasicSigner<EcdsaOpeningContent>
+        + BasicSigVerifier<EcdsaOpeningContent>
+        + MultiSigner<CanisterHttpResponseMetadata>
+        + MultiSigVerifier<CanisterHttpResponseMetadata>
         + IDkgProtocol
         + ThresholdEcdsaSigner
         + ThresholdEcdsaSigVerifier

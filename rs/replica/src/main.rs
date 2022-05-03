@@ -1,20 +1,19 @@
 //! Replica -- Internet Computer
 
-use ic_base_server::shutdown_signal;
+use ic_async_utils::shutdown_signal;
 use ic_config::registry_client::DataProviderConfig;
 use ic_config::{subnet_config::SubnetConfigs, Config};
 use ic_crypto_sha::Sha256;
 use ic_crypto_tls_interfaces::TlsHandshake;
 use ic_interfaces::crypto::IngressSigVerifier;
 use ic_interfaces::registry::{LocalStoreCertifiedTimeReader, RegistryClient};
-use ic_logger::info;
+use ic_logger::{info, new_replica_logger_from_config};
 use ic_metrics::MetricsRegistry;
 use ic_metrics_exporter::MetricsRuntimeImpl;
-use ic_registry_client::helper::subnet::SubnetRegistry;
+use ic_registry_client_helpers::subnet::SubnetRegistry;
 use ic_replica::{args::ReplicaArgs, setup};
 use ic_sys::PAGE_SIZE;
 use ic_types::{replica_version::REPLICA_BINARY_HASH, PrincipalId, ReplicaVersion, SubnetId};
-use ic_utils::ic_features::*;
 use nix::unistd::{setpgid, Pid};
 use static_assertions::assert_eq_size;
 use std::env;
@@ -136,13 +135,13 @@ async fn run() -> io::Result<()> {
     // Parse command-line args
     let replica_args = setup::parse_args();
     if let Err(e) = &replica_args {
-        eprintln!("Failed to parse command line arguments: {}", e.message);
+        e.print().expect("Failed to print CLI argument error.");
     }
 
     let config_source = setup::get_config_source(&replica_args);
     let config = Config::load_with_tmpdir(config_source, tmpdir.path().to_path_buf());
 
-    let (logger, _async_log_guard) = setup::get_replica_logger(&config);
+    let (logger, _async_log_guard) = new_replica_logger_from_config(&config.logger);
 
     let optional_nns_key_path = match &replica_args {
         Ok(ReplicaArgs {
@@ -225,14 +224,6 @@ async fn run() -> io::Result<()> {
     .await;
 
     let subnet_config = SubnetConfigs::default().own_subnet_config(subnet_type);
-    // Any change to these lines should be mirrored in the file
-    // `rs/replay/src/lib.rs` so that the replica and the replay tool of the same
-    // version have an identical behavior wrt. CoW.
-    if subnet_config.cow_memory_manager_config.enabled {
-        cow_state_feature::enable(cow_state_feature::cow_state);
-    } else {
-        cow_state_feature::disable(cow_state_feature::cow_state);
-    }
 
     // Read the root subnet id from registry
     let root_subnet_id = registry
@@ -288,18 +279,21 @@ async fn run() -> io::Result<()> {
             None
         };
 
+    info!(logger, "Constructing IC stack");
     let (
         crypto,
         state_manager,
         _,
         async_query_handler,
-        mut p2p_runner,
-        p2p_event_handler,
+        _,
+        _p2p_thread_joiner,
+        ingress_ingestion_service,
         consensus_pool_cache,
         ingress_message_filter,
         _xnet_endpoint,
     ) = ic_replica::setup_p2p::construct_ic_stack(
         logger.clone(),
+        tokio::runtime::Handle::current(),
         config.clone(),
         subnet_config,
         node_id,
@@ -311,8 +305,7 @@ async fn run() -> io::Result<()> {
         cup_with_proto,
         registry_certified_time_reader,
     )?;
-
-    p2p_runner.run();
+    info!(logger, "Constructed IC stack");
 
     let malicious_behaviour = &config.malicious_behaviour;
 
@@ -320,7 +313,7 @@ async fn run() -> io::Result<()> {
         metrics_registry.clone(),
         config.http_handler.clone(),
         ingress_message_filter,
-        p2p_event_handler,
+        ingress_ingestion_service,
         async_query_handler,
         state_manager,
         registry,
@@ -333,6 +326,7 @@ async fn run() -> io::Result<()> {
         config.artifact_pool.backup.map(|config| config.spool_path),
         subnet_type,
         malicious_behaviour.malicious_flags.clone(),
+        tokio::runtime::Handle::current(),
     ));
 
     tokio::time::sleep(Duration::from_millis(5000)).await;
@@ -361,8 +355,6 @@ async fn run() -> io::Result<()> {
     // otherwise.
     tmpdir.close()?;
     info!(logger, "IC Replica Terminated");
-    // Ensure we join any threads etc.
-    std::mem::drop(p2p_runner);
     Ok(())
 }
 

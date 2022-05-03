@@ -9,34 +9,46 @@
 // annotated with `#[candid_method(query/update)]` to be able to generate the
 // did definition of the method.
 
-use ic_nns_governance::{governance::ONE_DAY_SECONDS, pb::v1::manage_neuron::NeuronIdOrSubaccount};
+use ic_nns_governance::{
+    governance::TimeWarp,
+    pb::v1::{manage_neuron::NeuronIdOrSubaccount, NetworkEconomics, RewardNodeProviders},
+};
 use rand::rngs::StdRng;
 use rand_core::{RngCore, SeedableRng};
 use std::boxed::Box;
 use std::time::SystemTime;
 
-use async_trait::async_trait;
 use prost::Message;
 
 use candid::candid_method;
 use dfn_candid::{candid, candid_one};
 use dfn_core::{
-    api::{arg_data, call, call_with_callbacks, caller, now},
+    api::{arg_data, call_with_callbacks, caller, now},
     over, over_async, println,
 };
 use dfn_protobuf::protobuf;
 
 use ic_base_types::PrincipalId;
+use ic_nervous_system_common::MethodAuthzChange;
 use ic_nns_common::{
     access_control::{check_caller_is_ledger, check_caller_is_root},
     pb::v1::{CanisterAuthzInfo, NeuronId as NeuronIdProto, ProposalId as ProposalIdProto},
-    types::{MethodAuthzChange, NeuronId, ProposalId},
+    types::{NeuronId, ProposalId},
+};
+
+// Makes expose_build_metadata! available.
+#[macro_use]
+extern crate ic_nervous_system_common;
+
+use ic_nervous_system_common::stable_mem_utils::{
+    BufferedStableMemReader, BufferedStableMemWriter,
 };
 use ic_nns_constants::LEDGER_CANISTER_ID;
-use ic_nns_governance::pb::v1::{RewardEvent, UpdateNodeProvider};
-use ic_nns_governance::stable_mem_utils::{BufferedStableMemReader, BufferedStableMemWriter};
+use ic_nns_governance::pb::v1::{
+    ListNodeProvidersResponse, NodeProvider, RewardEvent, UpdateNodeProvider,
+};
 use ic_nns_governance::{
-    governance::{Environment, Governance, Ledger},
+    governance::{Environment, Governance},
     pb::v1::{
         claim_or_refresh_neuron_from_account_response::Result as ClaimOrRefreshNeuronFromAccountResponseResult,
         governance_error::ErrorType,
@@ -46,19 +58,16 @@ use ic_nns_governance::{
         },
         manage_neuron_response, ClaimOrRefreshNeuronFromAccount,
         ClaimOrRefreshNeuronFromAccountResponse, ExecuteNnsFunction, Governance as GovernanceProto,
-        GovernanceError, ListNeurons, ListNeuronsResponse, ListProposalInfo,
-        ListProposalInfoResponse, ManageNeuron, ManageNeuronResponse, Neuron, NeuronInfo,
-        NnsFunction, Proposal, ProposalInfo, Vote,
+        GovernanceError, ListKnownNeuronsResponse, ListNeurons, ListNeuronsResponse,
+        ListProposalInfo, ListProposalInfoResponse, ManageNeuron, ManageNeuronResponse, Neuron,
+        NeuronInfo, NnsFunction, Proposal, ProposalInfo, Vote,
     },
 };
 
 use dfn_core::api::reject_message;
+use ic_nervous_system_common::ledger::LedgerCanister;
 use ic_nns_common::access_control::check_caller_is_gtc;
 use ic_nns_governance::governance::HeapGrowthPotential;
-use ledger_canister::{
-    metrics_encoder, AccountBalanceArgs, AccountIdentifier, Memo, SendArgs, Subaccount, Tokens,
-    TotalSupplyArgs,
-};
 
 /// Size of the buffer for stable memory reads and writes.
 ///
@@ -70,6 +79,11 @@ const STABLE_MEM_BUFFER_SIZE: u32 = 100 * 1024 * 1024; // 100MiB
 
 pub(crate) const LOG_PREFIX: &str = "[Governance] ";
 
+// https://dfinity.atlassian.net/browse/NNS1-1050: We are not following
+// standard/best practices for canister globals here.
+//
+// Do not access these global variables directly. Instead, use accessor
+// functions, which are defined immediately after.
 static mut GOVERNANCE: Option<Governance> = None;
 
 /// Returns an immutable reference to the global state.
@@ -90,6 +104,7 @@ fn governance_mut() -> &'static mut Governance {
 
 struct CanisterEnv {
     rng: StdRng,
+    time_warp: TimeWarp,
 }
 
 impl CanisterEnv {
@@ -114,16 +129,24 @@ impl CanisterEnv {
                 seed[16..32].copy_from_slice(&now_nanos.to_be_bytes());
                 StdRng::from_seed(seed)
             },
+
+            time_warp: TimeWarp { delta_s: 0 },
         }
     }
 }
 
 impl Environment for CanisterEnv {
     fn now(&self) -> u64 {
-        now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("Could not get the duration.")
-            .as_secs()
+        self.time_warp.apply(
+            now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("Could not get the duration.")
+                .as_secs(),
+        )
+    }
+
+    fn set_time_warp(&mut self, new_time_warp: TimeWarp) {
+        self.time_warp = new_time_warp;
     }
 
     fn random_u64(&mut self) -> u64 {
@@ -203,91 +226,6 @@ impl Environment for CanisterEnv {
     }
 }
 
-struct LedgerCanister {}
-
-#[async_trait]
-impl Ledger for LedgerCanister {
-    async fn transfer_funds(
-        &self,
-        amount_e8s: u64,
-        fee_e8s: u64,
-        from_subaccount: Option<Subaccount>,
-        to: AccountIdentifier,
-        memo: u64,
-    ) -> Result<u64, GovernanceError> {
-        // Send 'amount_e8s' to the target account.
-        //
-        // We deduct the transaction fee from the amount to transfer as in most
-        // cases the neuron sub-account has exactly as much as was staked and if
-        // we try to transfer that amount and charge the transaction fee in addition
-        // the transfer will fail due to insufficient funds.
-        let result: Result<u64, (Option<i32>, String)> = call(
-            LEDGER_CANISTER_ID,
-            "send_pb",
-            protobuf,
-            SendArgs {
-                memo: Memo(memo),
-                amount: Tokens::from_e8s(amount_e8s),
-                fee: Tokens::from_e8s(fee_e8s),
-                from_subaccount,
-                to,
-                created_at_time: None,
-            },
-        )
-        .await;
-
-        result.map_err(|(code, msg)| {
-            GovernanceError::new_with_message(
-                ErrorType::External,
-                format!(
-                    "Error calling method 'send' of the ledger canister. Code: {:?}. Message: {}",
-                    code, msg
-                ),
-            )
-        })
-    }
-
-    async fn total_supply(&self) -> Result<Tokens, GovernanceError> {
-        let result: Result<Tokens, (Option<i32>, String)> = call(
-            LEDGER_CANISTER_ID,
-            "total_supply_pb",
-            protobuf,
-            TotalSupplyArgs {},
-        )
-        .await;
-
-        result.map_err(|(code, msg)| {
-            GovernanceError::new_with_message(
-                ErrorType::External,
-                format!(
-                    "Error calling method 'total_supply' of the ledger canister. Code: {:?}. Message: {}",
-                    code, msg
-                )
-            )
-        })
-    }
-
-    async fn account_balance(&self, account: AccountIdentifier) -> Result<Tokens, GovernanceError> {
-        let result: Result<Tokens, (Option<i32>, String)> = call(
-            LEDGER_CANISTER_ID,
-            "account_balance_pb",
-            protobuf,
-            AccountBalanceArgs { account },
-        )
-        .await;
-
-        result.map_err(|(code, msg)| {
-            GovernanceError::new_with_message(
-                ErrorType::External,
-                format!(
-                    "Error calling method 'account_balance_pb' of the ledger canister. Code: {:?}. Message: {}",
-                    code, msg
-                )
-            )
-        })
-    }
-}
-
 #[export_name = "canister_init"]
 fn canister_init() {
     dfn_core::printer::hook();
@@ -328,7 +266,7 @@ fn canister_init_(init_payload: GovernanceProto) {
         GOVERNANCE = Some(Governance::new(
             init_payload,
             Box::new(CanisterEnv::new()),
-            Box::new(LedgerCanister {}),
+            Box::new(LedgerCanister::new(LEDGER_CANISTER_ID)),
         ));
     }
     governance()
@@ -372,8 +310,17 @@ fn canister_post_upgrade() {
         }
     }
     .expect("Couldn't upgrade canister.");
+}
 
-    governance_mut().proto.wait_for_quiet_threshold_seconds = 2 * ONE_DAY_SECONDS;
+#[cfg(feature = "test")]
+#[export_name = "canister_update set_time_warp"]
+fn set_time_warp() {
+    over(candid_one, set_time_warp_);
+}
+
+#[cfg(feature = "test")]
+fn set_time_warp_(new_time_warp: TimeWarp) {
+    governance_mut().env.set_time_warp(new_time_warp);
 }
 
 #[export_name = "canister_update update_authz"]
@@ -478,6 +425,8 @@ async fn claim_or_refresh_neuron_from_account_(
         _ => panic!("Invalid command response"),
     }
 }
+
+expose_build_metadata! {}
 
 #[export_name = "canister_update claim_gtc_neurons"]
 fn claim_gtc_neurons() {
@@ -631,6 +580,32 @@ fn list_neurons_(req: ListNeurons) -> ListNeuronsResponse {
     governance().list_neurons_by_principal(&req, &caller())
 }
 
+#[export_name = "canister_update get_monthly_node_provider_rewards"]
+fn get_monthly_node_provider_rewards() {
+    println!("{}get_monthly_node_provider_rewards", LOG_PREFIX);
+    over_async(candid, |()| async move {
+        get_monthly_node_provider_rewards_().await
+    })
+}
+
+#[candid_method(update, rename = "get_monthly_node_provider_rewards")]
+async fn get_monthly_node_provider_rewards_() -> Result<RewardNodeProviders, GovernanceError> {
+    governance().get_monthly_node_provider_rewards().await
+}
+
+#[export_name = "canister_query list_known_neurons"]
+fn list_known_neurons() {
+    println!("{}list_known_neurons", LOG_PREFIX);
+    over(candid_one, |()| -> ListKnownNeuronsResponse {
+        list_known_neurons_()
+    })
+}
+
+#[candid_method(query, rename = "list_known_neurons")]
+fn list_known_neurons_() -> ListKnownNeuronsResponse {
+    governance().list_known_neurons()
+}
+
 /// DEPRECATED: Always panics. Use manage_neuron instead.
 /// TODO(NNS1-413): Remove this once we are sure that there are no callers.
 #[export_name = "canister_update submit_proposal"]
@@ -690,6 +665,24 @@ fn get_neuron_ids_() -> Vec<NeuronId> {
         .collect()
 }
 
+#[export_name = "canister_query get_network_economics_parameters"]
+fn get_network_economics_parameters() {
+    println!("{}get_network_economics_parameters", LOG_PREFIX);
+    over(candid, |()| -> NetworkEconomics {
+        get_network_economics_parameters_()
+    })
+}
+
+#[candid_method(query, rename = "get_network_economics_parameters")]
+fn get_network_economics_parameters_() -> NetworkEconomics {
+    governance()
+        .proto
+        .economics
+        .as_ref()
+        .expect("Governance must have network economics.")
+        .clone()
+}
+
 #[export_name = "canister_heartbeat"]
 fn canister_heartbeat() {
     let future = governance_mut().run_periodic_tasks();
@@ -730,13 +723,38 @@ fn update_node_provider() {
     over(candid_one, update_node_provider_)
 }
 
-#[candid_method(query, rename = "update_node_provider")]
+#[candid_method(update, rename = "update_node_provider")]
 fn update_node_provider_(req: UpdateNodeProvider) -> Result<(), GovernanceError> {
     governance_mut().update_node_provider(&caller(), req)
 }
 
+/// Return the NodeProvider record where NodeProvider.id == caller(), if such a
+/// NodeProvider record exists.
+#[export_name = "canister_query get_node_provider_by_caller"]
+fn get_node_provider_by_caller() {
+    println!("{}get_node_provider_by_caller", LOG_PREFIX);
+    over(candid_one, get_node_provider_by_caller_)
+}
+
+#[candid_method(query, rename = "get_node_provider_by_caller")]
+fn get_node_provider_by_caller_(_: ()) -> Result<NodeProvider, GovernanceError> {
+    governance().get_node_provider(&caller())
+}
+
+#[export_name = "canister_query list_node_providers"]
+fn list_node_providers() {
+    println!("{}list_node_providers", LOG_PREFIX);
+    over(candid, |()| list_node_providers_());
+}
+
+#[candid_method(query, rename = "list_node_providers")]
+fn list_node_providers_() -> ListNodeProvidersResponse {
+    let node_providers = governance().get_node_providers().to_vec();
+    ListNodeProvidersResponse { node_providers }
+}
+
 /// Encodes
-fn encode_metrics(w: &mut metrics_encoder::MetricsEncoder<Vec<u8>>) -> std::io::Result<()> {
+fn encode_metrics(w: &mut ic_metrics_encoder::MetricsEncoder<Vec<u8>>) -> std::io::Result<()> {
     let governance = governance();
 
     w.encode_gauge(
@@ -900,7 +918,7 @@ fn encode_metrics(w: &mut metrics_encoder::MetricsEncoder<Vec<u8>>) -> std::io::
 
 #[export_name = "canister_query http_request"]
 fn http_request() {
-    ledger_canister::http_request::serve_metrics(encode_metrics);
+    dfn_http_metrics::serve_metrics(encode_metrics);
 }
 
 // This makes this Candid service self-describing, so that for example Candid
@@ -952,4 +970,16 @@ fn check_governance_candid_file() {
             rs/nns/governance to update canister/governance.did."
         )
     }
+}
+
+#[test]
+fn test_set_time_warp() {
+    let mut environment = CanisterEnv::new();
+
+    let start = environment.now();
+    environment.set_time_warp(TimeWarp { delta_s: 1_000 });
+    let delta_s = environment.now() - start;
+
+    assert!(delta_s >= 1000, "delta_s = {}", delta_s);
+    assert!(delta_s < 1005, "delta_s = {}", delta_s);
 }

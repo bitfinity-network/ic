@@ -5,7 +5,7 @@ use strum::IntoEnumIterator;
 #[test]
 fn should_correctly_convert_i32_to_algorithm_id() {
     // ensure _all_ algorithm IDs are compared (i.e., no algorithm was forgotten)
-    assert_eq!(AlgorithmId::iter().count(), 16);
+    assert_eq!(AlgorithmId::iter().count(), 17);
 
     assert_eq!(AlgorithmId::from(0), AlgorithmId::Placeholder);
     assert_eq!(AlgorithmId::from(1), AlgorithmId::MultiBls12_381);
@@ -23,6 +23,7 @@ fn should_correctly_convert_i32_to_algorithm_id() {
     assert_eq!(AlgorithmId::from(13), AlgorithmId::IcCanisterSignature);
     assert_eq!(AlgorithmId::from(14), AlgorithmId::RsaSha256);
     assert_eq!(AlgorithmId::from(15), AlgorithmId::ThresholdEcdsaSecp256k1);
+    assert_eq!(AlgorithmId::from(16), AlgorithmId::MegaSecp256k1);
 
     // Verify that an unknown i32 maps onto Placeholder
     assert_eq!(AlgorithmId::from(42), AlgorithmId::Placeholder);
@@ -31,7 +32,7 @@ fn should_correctly_convert_i32_to_algorithm_id() {
 #[test]
 fn should_correctly_convert_algorithm_id_to_i32() {
     // ensure _all_ algorithm IDs are compared (i.e., no algorithm was forgotten)
-    assert_eq!(AlgorithmId::iter().count(), 16);
+    assert_eq!(AlgorithmId::iter().count(), 17);
 
     assert_eq!(AlgorithmId::Placeholder as i32, 0);
     assert_eq!(AlgorithmId::MultiBls12_381 as i32, 1);
@@ -49,6 +50,52 @@ fn should_correctly_convert_algorithm_id_to_i32() {
     assert_eq!(AlgorithmId::IcCanisterSignature as i32, 13);
     assert_eq!(AlgorithmId::RsaSha256 as i32, 14);
     assert_eq!(AlgorithmId::ThresholdEcdsaSecp256k1 as i32, 15);
+    assert_eq!(AlgorithmId::MegaSecp256k1 as i32, 16)
+}
+
+#[test]
+fn should_correctly_convert_usize_to_key_purpose() {
+    // ensure _all_ key purposes are compared (i.e., no key purpose was forgotten)
+    assert_eq!(KeyPurpose::iter().count(), 6);
+
+    assert_eq!(KeyPurpose::from(0), KeyPurpose::Placeholder);
+    assert_eq!(KeyPurpose::from(1), KeyPurpose::NodeSigning);
+    assert_eq!(KeyPurpose::from(2), KeyPurpose::QueryResponseSigning);
+    assert_eq!(KeyPurpose::from(3), KeyPurpose::DkgDealingEncryption);
+    assert_eq!(KeyPurpose::from(4), KeyPurpose::CommitteeSigning);
+    assert_eq!(KeyPurpose::from(5), KeyPurpose::IDkgMEGaEncryption);
+
+    // Verify that an unknown usize maps onto Placeholder
+    assert_eq!(AlgorithmId::from(42), AlgorithmId::Placeholder);
+}
+
+#[cfg(test)]
+impl KeyPurpose {
+    fn as_str(&self) -> &'static str {
+        match self {
+            KeyPurpose::Placeholder => "",
+            KeyPurpose::NodeSigning => "node_signing",
+            KeyPurpose::QueryResponseSigning => "query_response_signing",
+            KeyPurpose::DkgDealingEncryption => "dkg_dealing_encryption",
+            KeyPurpose::CommitteeSigning => "committee_signing",
+            KeyPurpose::IDkgMEGaEncryption => "idkg_mega_encryption",
+        }
+    }
+}
+
+#[test]
+fn should_correctly_convert_between_enum_and_string() {
+    for i in 0..KeyPurpose::iter().count() {
+        if i == 0 {
+            continue;
+        }
+        let key_purpose = KeyPurpose::from(i);
+        let converted_key_purpose = key_purpose.as_str();
+        assert_eq!(
+            KeyPurpose::from_str(converted_key_purpose).unwrap(),
+            key_purpose
+        );
+    }
 }
 
 pub fn set_of(node_ids: &[NodeId]) -> BTreeSet<NodeId> {

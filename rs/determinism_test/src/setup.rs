@@ -3,7 +3,7 @@ use ic_config::{
     Config,
 };
 use ic_cycles_account_manager::CyclesAccountManager;
-use ic_execution_environment::setup_execution;
+use ic_execution_environment::ExecutionServices;
 use ic_interfaces::execution_environment::IngressHistoryReader;
 use ic_messaging::MessageRoutingImpl;
 use ic_metrics::MetricsRegistry;
@@ -15,21 +15,20 @@ use ic_protobuf::registry::{
 use ic_protobuf::types::v1::PrincipalId as PrincipalIdIdProto;
 use ic_protobuf::types::v1::SubnetId as SubnetIdProto;
 use ic_registry_client::client::RegistryClientImpl;
-use ic_registry_common::proto_registry_data_provider::ProtoRegistryDataProvider;
 use ic_registry_keys::{
     make_provisional_whitelist_record_key, make_routing_table_record_key, ROOT_SUBNET_ID_KEY,
 };
+use ic_registry_proto_data_provider::ProtoRegistryDataProvider;
 use ic_registry_provisional_whitelist::ProvisionalWhitelist;
 use ic_registry_routing_table::{routing_table_insert_subnet, RoutingTable};
 use ic_registry_subnet_type::SubnetType;
 use ic_state_manager::StateManagerImpl;
-use ic_test_utilities::{
-    consensus::fake::FakeVerifier,
-    registry::{add_subnet_record, insert_initial_dkg_transcript, SubnetRecordBuilder},
-    types::ids::subnet_test_id,
+use ic_test_utilities::{consensus::fake::FakeVerifier, types::ids::subnet_test_id};
+use ic_test_utilities_registry::{
+    add_subnet_record, insert_initial_dkg_transcript, SubnetRecordBuilder,
 };
 use ic_types::{replica_config::ReplicaConfig, NodeId, PrincipalId, RegistryVersion, SubnetId};
-use std::{collections::BTreeMap, sync::Arc};
+use std::sync::Arc;
 
 fn get_registry(
     metrics_registry: &MetricsRegistry,
@@ -53,7 +52,7 @@ fn get_registry(
             Some(root_subnet_id_proto),
         )
         .unwrap();
-    let mut routing_table = RoutingTable::new(BTreeMap::new());
+    let mut routing_table = RoutingTable::new();
     routing_table_insert_subnet(&mut routing_table, subnet_id).unwrap();
     let pb_routing_table = PbRoutingTable::from(routing_table);
     data_provider
@@ -116,7 +115,6 @@ pub(crate) fn setup() -> (
 
     let cycles_account_manager = Arc::new(CyclesAccountManager::new(
         subnet_config.scheduler_config.max_instructions_per_message,
-        config.hypervisor.max_cycles_per_canister,
         subnet_type,
         subnet_id,
         subnet_config.cycles_account_manager_config,
@@ -128,10 +126,11 @@ pub(crate) fn setup() -> (
         log.clone().into(),
         &metrics_registry,
         &config.state_manager,
+        None,
         ic_types::malicious_flags::MaliciousFlags::default(),
     ));
 
-    let (_, ingress_history_writer, ingress_history_reader, _, _, scheduler) = setup_execution(
+    let execution_services = ExecutionServices::setup_execution(
         log.clone().into(),
         &metrics_registry,
         replica_config.subnet_id,
@@ -151,8 +150,8 @@ pub(crate) fn setup() -> (
     let message_routing = MessageRoutingImpl::new(
         Arc::clone(&state_manager) as _,
         Arc::clone(&state_manager) as _,
-        Arc::clone(&ingress_history_writer) as _,
-        scheduler,
+        Arc::clone(&execution_services.ingress_history_writer) as _,
+        execution_services.scheduler,
         config.hypervisor.clone(),
         cycles_account_manager,
         replica_config.subnet_id,
@@ -164,7 +163,7 @@ pub(crate) fn setup() -> (
     (
         message_routing,
         state_manager,
-        ingress_history_reader,
+        execution_services.ingress_history_reader,
         config,
         subnet_config,
     )

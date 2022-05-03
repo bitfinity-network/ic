@@ -10,9 +10,9 @@ fn test() {
         ///////////////////////////////////////////////////////
         // Create a new instance of pmap
         ///////////////////////////////////////////////////////
-        let proj = Project::new(env!("CARGO_MANIFEST_DIR"));
+        let proj = Project::new(std::env::var("CARGO_MANIFEST_DIR").unwrap());
 
-        let create_canister = |c| proj.cargo_bin(c).install(&runtime).bytes(Vec::new());
+        let create_canister = |c| proj.cargo_bin(c, &[]).install(&runtime).bytes(Vec::new());
 
         let canister = create_canister("pmap_canister").await?;
 

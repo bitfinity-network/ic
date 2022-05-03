@@ -23,7 +23,7 @@ Success::
 end::catalog[]
 DOC
 
-set -exuo pipefail
+set -euo pipefail
 export exit_code=0
 
 function exit_usage() {
@@ -52,13 +52,13 @@ experiment_dir="$results_dir/subnet_update_workload_test_${testnet}-rt_${exec_ti
 # shellcheck disable=SC1090
 source "${HELPERS:-$(dirname "${BASH_SOURCE[0]}")/include/helpers.sh}"
 
-SUBNET_TYPES=("normal" "large" "large_nns" "56_nns")
+SUBNET_TYPES=("normal" "large" "large_nns" "56_nns" "46_nns")
 if [[ ! " ${SUBNET_TYPES[*]} " =~ ${subnet_type} ]]; then
-    echo >&2 "Invalid subnet type specified, choose between normal, large, large_nns and 56_nns."
+    echo >&2 "Invalid subnet type specified, choose between normal, large, large_nns, 46_nns and 56_nns."
     exit_usage
 fi
-if ! printf '%s\n' "boundary_nodes" "replica_nodes" "dns" | grep -q "^$load_dest\$"; then
-    echo >&2 "Invalid load destination specified, choose between 'boundary_nodes | replica_nodes | dns'"
+if ! printf '%s\n' "boundary_nodes" "icos_boundary_nodes" "replica_nodes" "dns" | grep -q "^$load_dest\$"; then
+    echo >&2 "Invalid load destination specified, choose between 'boundary_nodes | icos_boundary_nodes | replica_nodes | dns'"
     exit_usage
 fi
 
@@ -84,17 +84,27 @@ if [[ "$subnet_type" == "56_nns" ]]; then
     HOSTS_INI_ARGUMENTS+=(--hosts-ini "$HOSTS_INI_FILENAME")
     subnet_index=0
 fi
+if [[ "$subnet_type" == "46_nns" ]]; then
+    # The test will run with a special hosts file creating a large nns subnet.
+    export HOSTS_INI_FILENAME=hosts_46_nns.ini
+    HOSTS_INI_ARGUMENTS+=(--hosts-ini "$HOSTS_INI_FILENAME")
+    subnet_index=0
+fi
 
 # These are the hosts that the workload generator will target.
 # We select all of them.
 install_endpoints=$(jq_hostvars 'map(select(.subnet_index=='"${subnet_index}"') | .api_listen_url) | join(",")')
 
+STATUS_CHECK=""
+http2_only=false
 if [[ "$load_dest" == "dns" ]]; then
     loadhosts="https://$testnet.dfinity.network/"
 elif [[ "$load_dest" == "replica_nodes" ]]; then
     loadhosts=$install_endpoints
-elif [[ "$load_dest" == "boundary_nodes" ]]; then
+elif [[ "$load_dest" == "boundary_nodes" || "$load_dest" == "icos_boundary_nodes" ]]; then
     loadhosts=$(jq_hostvars 'map(select(.subnet_index=="boundary") | .api_listen_url) | join(",")')
+    http2_only=true
+    STATUS_CHECK="--no-status-check"
 else
     exit_usage
 fi
@@ -131,8 +141,14 @@ calltime="$(date '+%s')"
 echo "Testcase Start time: $(dateFromEpoch "$calltime")"
 
 # re-deploy the testnet
-deploy_with_timeout "$testnet" \
-    --git-revision "$GIT_REVISION" "${HOSTS_INI_ARGUMENTS[@]}"
+# For new ICOS boundary nodes, specify --icos-boundary-nodes paramter while deploying
+if [[ "$load_dest" == "icos_boundary_nodes" ]]; then
+    deploy_with_timeout "$testnet" \
+        --git-revision "$GIT_REVISION" --icos-boundary-nodes "${HOSTS_INI_ARGUMENTS[@]}"
+else
+    deploy_with_timeout "$testnet" \
+        --git-revision "$GIT_REVISION" "${HOSTS_INI_ARGUMENTS[@]}"
+fi
 
 echo "Testnet deployment successful. Test starts now."
 
@@ -167,7 +183,8 @@ wg_status_file="$experiment_dir/wg_exit_status"
             -r "$rate" \
             --payload-size="$payload_size" \
             -n "$exec_time" \
-            --periodic-output \
+            --periodic-output $STATUS_CHECK \
+            --http2-only "$http2_only" \
             --install-endpoint="$install_endpoints" \
             --summary-file "$experiment_dir/workload-summary.json" 2>"$wg_err_log" \
             || local_wg_status=$?
@@ -281,6 +298,12 @@ if [[ $status_202_good == "0" ]]; then
     failure "There were no good requests, check '$experiment_dir/workload-summary.json'"
 elif [[ $bad_percentage -le "5" ]]; then
     success "No more than 5% of requests failed."
+elif [[ "$subnet_type" == "56_nns" ]]; then
+    if [[ $bad_percentage -le "20" ]]; then
+        success "At most 20% of the requests failed."
+    else
+        failure "More than 20% of the requests failed, check '$experiment_dir/workload-summary.json'"
+    fi
 else
     failure "More than 5% of requests failed, check '$experiment_dir/workload-summary.json'"
 fi

@@ -25,10 +25,9 @@ use ic_protobuf::crypto::v1::NodePublicKeys;
 use ic_protobuf::registry::crypto::v1::PublicKey as PublicKeyProto;
 use ic_types::crypto::canister_threshold_sig::error::{
     IDkgCreateDealingError, IDkgCreateTranscriptError, IDkgLoadTranscriptError,
-    IDkgLoadTranscriptWithOpeningsError, IDkgOpenTranscriptError, IDkgVerifyComplaintError,
-    IDkgVerifyDealingPrivateError, IDkgVerifyDealingPublicError, IDkgVerifyOpeningError,
-    IDkgVerifyTranscriptError, ThresholdEcdsaCombineSigSharesError,
-    ThresholdEcdsaGetPublicKeyError, ThresholdEcdsaSignShareError,
+    IDkgOpenTranscriptError, IDkgVerifyComplaintError, IDkgVerifyDealingPrivateError,
+    IDkgVerifyDealingPublicError, IDkgVerifyOpeningError, IDkgVerifyTranscriptError,
+    ThresholdEcdsaCombineSigSharesError, ThresholdEcdsaSignShareError,
     ThresholdEcdsaVerifyCombinedSignatureError, ThresholdEcdsaVerifySigShareError,
 };
 use ic_types::crypto::canister_threshold_sig::idkg::{
@@ -36,15 +35,14 @@ use ic_types::crypto::canister_threshold_sig::idkg::{
     IDkgTranscriptParams,
 };
 use ic_types::crypto::canister_threshold_sig::{
-    EcdsaPublicKey, ThresholdEcdsaCombinedSignature, ThresholdEcdsaSigInputs,
-    ThresholdEcdsaSigShare,
+    ThresholdEcdsaCombinedSignature, ThresholdEcdsaSigInputs, ThresholdEcdsaSigShare,
 };
 use ic_types::crypto::threshold_sig::ni_dkg::DkgId;
 use ic_types::crypto::{
     BasicSigOf, CanisterSigOf, CombinedMultiSigOf, CombinedThresholdSigOf, CryptoResult,
     IndividualMultiSigOf, ThresholdSigShareOf, UserPublicKey,
 };
-use ic_types::{NodeId, PrincipalId, Randomness, RegistryVersion, SubnetId};
+use ic_types::{NodeId, Randomness, RegistryVersion, SubnetId};
 use rand::rngs::OsRng;
 use rand::SeedableRng;
 use rand_chacha::ChaChaRng;
@@ -180,7 +178,7 @@ impl TempCryptoComponent {
         node_id: NodeId,
     ) -> (Self, TlsPublicKeyCert) {
         let (config, temp_dir) = CryptoConfig::new_in_temp_dir();
-        let tls_pubkey = generate_tls_keys(&temp_dir.path().to_path_buf(), node_id);
+        let tls_pubkey = generate_tls_keys(temp_dir.path(), node_id);
 
         let temp_crypto =
             TempCryptoComponent::new_with(registry_client, node_id, &config, temp_dir);
@@ -220,18 +218,25 @@ impl TempCryptoComponent {
             )),
             false => None,
         };
+        let idkg_dealing_encryption_pk = match selector.generate_idkg_dealing_encryption_keys {
+            true => Some(generate_idkg_dealing_encryption_keys(&temp_dir_path)),
+            false => None,
+        };
         let tls_certificate = match selector.generate_tls_keys_and_certificate {
             true => Some(generate_tls_keys(&temp_dir_path, node_id).to_proto()),
             false => None,
         };
 
         let node_pubkeys = NodePublicKeys {
-            version: 0,
+            version: 1,
             node_signing_pk,
             committee_signing_pk,
             dkg_dealing_encryption_pk,
+            idkg_dealing_encryption_pk,
             tls_certificate,
         };
+        public_key_store::store_node_public_keys(&config.crypto_root, &node_pubkeys)
+            .unwrap_or_else(|_| panic!("Failed to store public key material"));
 
         let temp_crypto =
             TempCryptoComponent::new_with(registry_client, node_id, &config, temp_dir);
@@ -288,6 +293,7 @@ pub struct NodeKeysToGenerate {
     pub generate_node_signing_keys: bool,
     pub generate_committee_signing_keys: bool,
     pub generate_dkg_dealing_encryption_keys: bool,
+    pub generate_idkg_dealing_encryption_keys: bool,
     pub generate_tls_keys_and_certificate: bool,
 }
 
@@ -297,6 +303,7 @@ impl NodeKeysToGenerate {
             generate_node_signing_keys: true,
             generate_committee_signing_keys: true,
             generate_dkg_dealing_encryption_keys: true,
+            generate_idkg_dealing_encryption_keys: true,
             generate_tls_keys_and_certificate: true,
         }
     }
@@ -306,6 +313,7 @@ impl NodeKeysToGenerate {
             generate_node_signing_keys: false,
             generate_committee_signing_keys: false,
             generate_dkg_dealing_encryption_keys: false,
+            generate_idkg_dealing_encryption_keys: false,
             generate_tls_keys_and_certificate: false,
         }
     }
@@ -313,6 +321,13 @@ impl NodeKeysToGenerate {
     pub fn all_except_dkg_dealing_encryption_key() -> Self {
         NodeKeysToGenerate {
             generate_dkg_dealing_encryption_keys: false,
+            ..Self::all()
+        }
+    }
+
+    pub fn all_except_idkg_dealing_encryption_key() -> Self {
+        NodeKeysToGenerate {
+            generate_idkg_dealing_encryption_keys: false,
             ..Self::all()
         }
     }
@@ -327,6 +342,27 @@ impl NodeKeysToGenerate {
     pub fn only_committee_signing_key() -> Self {
         NodeKeysToGenerate {
             generate_committee_signing_keys: true,
+            ..Self::none()
+        }
+    }
+
+    pub fn only_dkg_dealing_encryption_key() -> Self {
+        NodeKeysToGenerate {
+            generate_dkg_dealing_encryption_keys: true,
+            ..Self::none()
+        }
+    }
+
+    pub fn only_idkg_dealing_encryption_key() -> Self {
+        NodeKeysToGenerate {
+            generate_idkg_dealing_encryption_keys: true,
+            ..Self::none()
+        }
+    }
+
+    pub fn only_tls_key_and_cert() -> Self {
+        NodeKeysToGenerate {
+            generate_tls_keys_and_certificate: true,
             ..Self::none()
         }
     }
@@ -399,18 +435,21 @@ impl<C: CryptoServiceProvider> IDkgProtocol for TempCryptoComponentGeneric<C> {
     fn verify_dealing_public(
         &self,
         params: &IDkgTranscriptParams,
+        dealing_id: NodeId,
         dealing: &IDkgDealing,
     ) -> Result<(), IDkgVerifyDealingPublicError> {
-        self.crypto_component.verify_dealing_public(params, dealing)
+        self.crypto_component
+            .verify_dealing_public(params, dealing_id, dealing)
     }
 
     fn verify_dealing_private(
         &self,
         params: &IDkgTranscriptParams,
+        dealer_id: NodeId,
         dealing: &IDkgDealing,
     ) -> Result<(), IDkgVerifyDealingPrivateError> {
         self.crypto_component
-            .verify_dealing_private(params, dealing)
+            .verify_dealing_private(params, dealer_id, dealing)
     }
 
     fn create_transcript(
@@ -439,19 +478,21 @@ impl<C: CryptoServiceProvider> IDkgProtocol for TempCryptoComponentGeneric<C> {
     fn verify_complaint(
         &self,
         transcript: &IDkgTranscript,
-        complainer: NodeId,
+        complainer_id: NodeId,
         complaint: &IDkgComplaint,
     ) -> Result<(), IDkgVerifyComplaintError> {
         self.crypto_component
-            .verify_complaint(transcript, complainer, complaint)
+            .verify_complaint(transcript, complainer_id, complaint)
     }
 
     fn open_transcript(
         &self,
         transcript: &IDkgTranscript,
+        complainer_id: NodeId,
         complaint: &IDkgComplaint,
     ) -> Result<IDkgOpening, IDkgOpenTranscriptError> {
-        self.crypto_component.open_transcript(transcript, complaint)
+        self.crypto_component
+            .open_transcript(transcript, complainer_id, complaint)
     }
 
     fn verify_opening(
@@ -467,9 +508,9 @@ impl<C: CryptoServiceProvider> IDkgProtocol for TempCryptoComponentGeneric<C> {
 
     fn load_transcript_with_openings(
         &self,
-        transcript: IDkgTranscript,
-        openings: BTreeMap<IDkgComplaint, BTreeMap<NodeId, IDkgOpening>>,
-    ) -> Result<(), IDkgLoadTranscriptWithOpeningsError> {
+        transcript: &IDkgTranscript,
+        openings: &BTreeMap<IDkgComplaint, BTreeMap<NodeId, IDkgOpening>>,
+    ) -> Result<(), IDkgLoadTranscriptError> {
         self.crypto_component
             .load_transcript_with_openings(transcript, openings)
     }
@@ -503,7 +544,7 @@ impl<C: CryptoServiceProvider> ThresholdEcdsaSigVerifier for TempCryptoComponent
     fn combine_sig_shares(
         &self,
         inputs: &ThresholdEcdsaSigInputs,
-        shares: &[ThresholdEcdsaSigShare],
+        shares: &BTreeMap<NodeId, ThresholdEcdsaSigShare>,
     ) -> Result<ThresholdEcdsaCombinedSignature, ThresholdEcdsaCombineSigSharesError> {
         self.crypto_component.combine_sig_shares(inputs, shares)
     }
@@ -514,15 +555,6 @@ impl<C: CryptoServiceProvider> ThresholdEcdsaSigVerifier for TempCryptoComponent
         signature: &ThresholdEcdsaCombinedSignature,
     ) -> Result<(), ThresholdEcdsaVerifyCombinedSignatureError> {
         self.crypto_component.verify_combined_sig(inputs, signature)
-    }
-
-    fn get_public_key(
-        &self,
-        canister_id: PrincipalId,
-        key_transcript: IDkgTranscript,
-    ) -> Result<EcdsaPublicKey, ThresholdEcdsaGetPublicKeyError> {
-        self.crypto_component
-            .get_public_key(canister_id, key_transcript)
     }
 }
 

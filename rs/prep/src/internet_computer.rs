@@ -33,21 +33,17 @@ use ic_protobuf::registry::{
 };
 use ic_protobuf::types::v1::{PrincipalId as PrincipalIdProto, SubnetId as SubnetIdProto};
 use ic_registry_client::client::RegistryDataProviderError;
-use ic_registry_common::{
-    local_store::{Changelog, KeyMutation, LocalStoreImpl, LocalStoreWriter},
-    proto_registry_data_provider::ProtoRegistryDataProvider,
-};
+use ic_registry_common::local_store::{Changelog, KeyMutation, LocalStoreImpl, LocalStoreWriter};
 use ic_registry_keys::{
     make_blessed_replica_version_key, make_node_operator_record_key,
     make_provisional_whitelist_record_key, make_replica_version_key, make_routing_table_record_key,
     make_subnet_list_record_key, make_unassigned_nodes_config_record_key, ROOT_SUBNET_ID_KEY,
 };
+use ic_registry_proto_data_provider::ProtoRegistryDataProvider;
 use ic_registry_provisional_whitelist::ProvisionalWhitelist;
 use ic_registry_routing_table::{routing_table_insert_subnet, RoutingTable};
 use ic_registry_transport::pb::v1::RegistryMutation;
-use ic_types::{
-    NodeId, PrincipalId, PrincipalIdParseError, RegistryVersion, ReplicaVersion, SubnetId,
-};
+use ic_types::{PrincipalId, PrincipalIdParseError, RegistryVersion, ReplicaVersion, SubnetId};
 
 use crate::subnet_configuration::{SubnetConfig, SubnetIndex};
 use crate::util::write_registry_entry;
@@ -85,6 +81,10 @@ impl TopologyConfig {
     pub fn insert_subnet(&mut self, subnet_index: SubnetIndex, config: SubnetConfig) {
         assert_eq!(subnet_index, config.subnet_index);
         self.subnets.insert(subnet_index, config);
+    }
+
+    pub fn get_subnet(&self, subnet_index: SubnetIndex) -> Option<SubnetConfig> {
+        self.subnets.get(&subnet_index).cloned()
     }
 
     /// Based on the setting of `self.subnets` generate a suitable
@@ -149,7 +149,7 @@ impl fmt::Debug for NodeOperatorPublicKey {
 
 #[derive(Clone, Debug)]
 pub struct NodeOperatorEntry {
-    name: String,
+    _name: String,
     principal_id: PrincipalId,
     node_provider_principal_id: Option<PrincipalId>,
     node_allowance: u64,
@@ -174,14 +174,14 @@ impl From<NodeOperatorEntry> for NodeOperatorRecord {
     }
 }
 
-pub type InitializedTopology = BTreeMap<NodeIndex, InitializedSubnet>;
-pub type UnassignedNodes = BTreeMap<NodeId, InitializedNode>;
+pub type InitializedTopology = BTreeMap<SubnetIndex, InitializedSubnet>;
+pub type UnassignedNodes = BTreeMap<NodeIndex, InitializedNode>;
 
 #[derive(Clone, Debug)]
 pub struct IcConfig {
     target_dir: PathBuf,
-    topology_config: TopologyConfig,
-    /// When a node starts up, the node manager fetches the replica binary found
+    pub topology_config: TopologyConfig,
+    /// When a node starts up, the orchestrator fetches the replica binary found
     /// at the URL in the blessed version record that carries the version
     /// id referred to in the subnet record that the node belongs to.
     ///
@@ -190,14 +190,6 @@ pub struct IcConfig {
     ///
     /// The version id of the initial replica.
     initial_replica_version_id: ReplicaVersion,
-    /// The URL of the initial replica version.
-    initial_replica_download_url: Url,
-    /// The hash of the initial replica version.
-    initial_replica_hash: Option<String>,
-    /// The URL of the initial nodemanager version.
-    initial_nodemanager_url: Option<Url>,
-    /// The hash of the initial nodemanager version.
-    initial_nodemanager_sha256_hex: Option<String>,
     /// The URL of the initial release package.
     initial_release_package_url: Option<Url>,
     /// The hash of the initial release package.
@@ -231,6 +223,9 @@ pub struct IcConfig {
     /// The initial set of SSH public keys to populate the registry with, to
     /// give "readonly" access to all unassigned nodes.
     pub ssh_readonly_access_to_unassigned_nodes: Vec<String>,
+
+    /// Disables the setup of iDKG keys for the nodes of the network
+    pub no_idkg_key: bool,
 }
 
 #[derive(Error, Debug)]
@@ -300,12 +295,8 @@ impl IcConfig {
         target_dir: P,
         topology_config: TopologyConfig,
         replica_version_id: Option<ReplicaVersion>,
-        replica_download_url: Option<Url>,
-        replica_hash: Option<String>,
         generate_subnet_records: bool,
         nns_subnet_index: Option<u64>,
-        nodemanager_url: Option<Url>,
-        nodemanager_sha256_hex: Option<String>,
         release_package_url: Option<Url>,
         release_package_sha256_hex: Option<String>,
         provisional_whitelist: Option<ProvisionalWhitelist>,
@@ -316,14 +307,9 @@ impl IcConfig {
         Self {
             target_dir: PathBuf::from(target_dir.as_ref()),
             topology_config,
-            initial_replica_version_id: replica_version_id.unwrap_or_else(ReplicaVersion::default),
-            initial_replica_download_url: replica_download_url
-                .unwrap_or_else(|| Url::parse("http://example.internetcomputer.org").unwrap()),
-            initial_replica_hash: replica_hash,
+            initial_replica_version_id: replica_version_id.unwrap_or_default(),
             generate_subnet_records,
             nns_subnet_index,
-            initial_nodemanager_url: nodemanager_url,
-            initial_nodemanager_sha256_hex: nodemanager_sha256_hex,
             initial_release_package_url: release_package_url,
             initial_release_package_sha256_hex: release_package_sha256_hex,
             initial_registry_node_operator_entries: Vec::new(),
@@ -332,6 +318,7 @@ impl IcConfig {
             initial_node_operator,
             initial_node_provider,
             ssh_readonly_access_to_unassigned_nodes,
+            no_idkg_key: false,
         }
     }
 
@@ -361,7 +348,7 @@ impl IcConfig {
                 .with_initial_node_operator(node_operator_id);
             self.initial_registry_node_operator_entries
                 .push(NodeOperatorEntry {
-                    name: "initial".into(),
+                    _name: "initial".into(),
                     node_allowance,
                     principal_id: node_operator_id,
                     node_provider_principal_id: self.initial_node_provider,
@@ -390,7 +377,7 @@ impl IcConfig {
             let node_path = InitializedSubnet::build_node_path(self.target_dir.as_path(), *n_idx);
             let init_node = nc.clone().initialize(node_path)?;
             init_node.write_registry_entries(&data_provider, version)?;
-            unassigned_nodes.insert(init_node.node_id, init_node);
+            unassigned_nodes.insert(*n_idx, init_node);
         }
 
         // Set the routing table after initializing the subnet ids
@@ -452,13 +439,6 @@ impl IcConfig {
         );
 
         let replica_version_record = ReplicaVersionRecord {
-            binary_url: self.initial_replica_download_url.to_string(),
-            sha256_hex: self.initial_replica_hash.unwrap_or_default(),
-            node_manager_binary_url: self
-                .initial_nodemanager_url
-                .map(|url| url.to_string())
-                .unwrap_or_default(),
-            node_manager_sha256_hex: self.initial_nodemanager_sha256_hex.unwrap_or_default(),
             release_package_url: self
                 .initial_release_package_url
                 .map(|url| url.to_string())
@@ -473,7 +453,7 @@ impl IcConfig {
         write_registry_entry(
             &data_provider,
             self.target_dir.as_path(),
-            make_replica_version_key(self.initial_replica_version_id).as_ref(),
+            make_replica_version_key(self.initial_replica_version_id.clone()).as_ref(),
             version,
             replica_version_record,
         );
@@ -519,7 +499,7 @@ impl IcConfig {
         }
 
         let unassigned_nodes_config = UnassignedNodesConfigRecord {
-            replica_version: String::new(),
+            replica_version: self.initial_replica_version_id.to_string(),
             ssh_readonly_access: self.ssh_readonly_access_to_unassigned_nodes,
         };
 
@@ -716,7 +696,7 @@ impl IcConfig {
             };
 
             node_operator_entries.push(NodeOperatorEntry {
-                name: String::from(name),
+                _name: String::from(name),
                 principal_id: PrincipalId::new_self_authenticating(&operator_buf),
                 node_provider_principal_id,
                 node_allowance,

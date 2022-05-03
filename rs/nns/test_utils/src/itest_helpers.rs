@@ -11,10 +11,10 @@ use crate::{
 };
 
 use std::{
-    collections::HashMap,
     convert::TryInto,
     future::Future,
     path::Path,
+    thread,
     time::{Duration, SystemTime},
 };
 
@@ -28,15 +28,18 @@ use canister_test::{
 };
 use cycles_minting_canister::CyclesCanisterInitPayload;
 use dfn_candid::{candid_one, CandidOne};
-use ic_base_types::{CanisterId, CanisterInstallMode};
+use ic_base_types::CanisterId;
 use ic_canister_client::Sender;
 use ic_config::{subnet_config::SubnetConfig, Config};
-use ic_nns_common::registry::encode_or_panic;
+use ic_ic00_types::CanisterInstallMode;
+use ic_nervous_system_common_test_keys::TEST_NEURON_1_OWNER_KEYPAIR;
+use ic_nervous_system_root::{
+    CanisterIdRecord, CanisterStatusResult, CanisterStatusType::Running, ChangeCanisterProposal,
+};
 use ic_nns_common::{
     init::{LifelineCanisterInitPayload, LifelineCanisterInitPayloadBuilder},
     types::NeuronId,
 };
-use ic_nns_constants::ids::TEST_NEURON_1_OWNER_KEYPAIR;
 use ic_nns_constants::*;
 use ic_nns_governance::{
     init::GovernanceCanisterInitPayloadBuilder,
@@ -44,22 +47,13 @@ use ic_nns_governance::{
 };
 use ic_nns_gtc::{init::GenesisTokenCanisterInitPayloadBuilder, pb::v1::Gtc};
 use ic_nns_gtc_accounts::{ECT_ACCOUNTS, SEED_ROUND_ACCOUNTS};
-use ic_nns_handler_root::{
-    common::{
-        CanisterIdRecord, CanisterStatusResult, CanisterStatusType::Running,
-        ChangeNnsCanisterProposalPayload,
-    },
-    init::{RootCanisterInitPayload, RootCanisterInitPayloadBuilder},
-};
-use ic_protobuf::registry::conversion_rate::v1::IcpXdrConversionRateRecord;
-use ic_registry_keys::make_icp_xdr_conversion_rate_record_key;
-use ic_registry_transport::insert;
+use ic_nns_handler_root::init::{RootCanisterInitPayload, RootCanisterInitPayloadBuilder};
 use ic_registry_transport::pb::v1::{RegistryAtomicMutateRequest, RegistryMutation};
 use ic_test_utilities::universal_canister::{
     call_args, wasm as universal_canister_argument_builder, UNIVERSAL_CANISTER_WASM,
 };
 use ic_utils::byte_slice_fmt::truncate_and_format;
-use ledger::{LedgerCanisterInitPayload, Subaccount, Tokens};
+use ledger::{LedgerCanisterInitPayload, Subaccount, Tokens, DEFAULT_TRANSFER_FEE};
 use ledger_canister as ledger;
 use ledger_canister::AccountIdentifier;
 use lifeline::LIFELINE_CANISTER_WASM;
@@ -110,10 +104,9 @@ impl NnsInitPayloadsBuilder {
         NnsInitPayloadsBuilder {
             registry: RegistryCanisterInitPayloadBuilder::new(),
             governance: GovernanceCanisterInitPayloadBuilder::new(),
-            ledger: LedgerCanisterInitPayload {
-                minting_account: GOVERNANCE_CANISTER_ID.get().into(),
-                initial_values: HashMap::new(),
-                archive_options: Some(ledger::ArchiveOptions {
+            ledger: LedgerCanisterInitPayload::builder()
+                .minting_account(GOVERNANCE_CANISTER_ID.get().into())
+                .archive_options(ledger::ArchiveOptions {
                     trigger_threshold: 2000,
                     num_blocks_to_archive: 1000,
                     // 1 GB, which gives us 3 GB space when upgrading
@@ -121,17 +114,21 @@ impl NnsInitPayloadsBuilder {
                     // 128kb
                     max_message_size_bytes: Some(128 * 1024),
                     controller_id: ROOT_CANISTER_ID,
-                }),
-                max_message_size_bytes: Some(128 * 1024),
+                    cycles_for_archive_creation: Some(0),
+                })
+                .max_message_size_bytes(128 * 1024)
                 // 24 hour transaction window
-                transaction_window: Some(Duration::from_secs(24 * 60 * 60)),
-                send_whitelist: ALL_NNS_CANISTER_IDS.iter().map(|&x| *x).collect(),
-            },
+                .transaction_window(Duration::from_secs(24 * 60 * 60))
+                .send_whitelist(ALL_NNS_CANISTER_IDS.iter().map(|&x| *x).collect())
+                .transfer_fee(DEFAULT_TRANSFER_FEE)
+                .build()
+                .unwrap(),
             root: RootCanisterInitPayloadBuilder::new(),
             cycles_minting: CyclesCanisterInitPayload {
                 ledger_canister_id: LEDGER_CANISTER_ID,
                 governance_canister_id: GOVERNANCE_CANISTER_ID,
                 minting_account_id: Some(GOVERNANCE_CANISTER_ID.get().into()),
+                last_purged_notification: Some(1),
             },
             lifeline: LifelineCanisterInitPayloadBuilder::new(),
             genesis_token: GenesisTokenCanisterInitPayloadBuilder::new(),
@@ -185,24 +182,6 @@ impl NnsInitPayloadsBuilder {
         self.registry
             .push_init_mutate_request(RegistryAtomicMutateRequest {
                 mutations: invariant_compliant_mutation(),
-                preconditions: vec![],
-            });
-        self
-    }
-
-    /// Add an `IcpXdrConversionRateRecord` to the Registry
-    pub fn with_registry_icp_xdr_conversion_rate(
-        &mut self,
-        icp_xdr_conversion_rate: &IcpXdrConversionRateRecord,
-    ) -> &mut Self {
-        self.registry
-            .push_init_mutate_request(RegistryAtomicMutateRequest {
-                mutations: vec![insert(
-                    make_icp_xdr_conversion_rate_record_key()
-                        .as_bytes()
-                        .to_vec(),
-                    encode_or_panic(icp_xdr_conversion_rate),
-                )],
                 preconditions: vec![],
             });
         self
@@ -298,11 +277,15 @@ impl NnsCanisters<'_> {
         let identity = Canister::new(runtime, IDENTITY_CANISTER_ID);
         let nns_ui = Canister::new(runtime, NNS_UI_CANISTER_ID);
 
-        // Install canisters
+        // Install all the canisters
+        // Registry and Governance need to first or the process hangs,
+        // Ledger is just added as to avoid Governance spamming the logs.
         futures::join!(
             install_registry_canister(&mut registry, init_payloads.registry.clone()),
             install_governance_canister(&mut governance, init_payloads.governance.clone()),
-            install_ledger_canister(&mut ledger, init_payloads.ledger),
+            install_ledger_canister(&mut ledger, init_payloads.ledger.clone()),
+        );
+        futures::join!(
             install_root_canister(&mut root, init_payloads.root.clone()),
             install_cycles_minting_canister(
                 &mut cycles_minting,
@@ -362,19 +345,42 @@ impl NnsCanisters<'_> {
 
 /// Installs a rust canister with the provided memory allocation.
 pub async fn install_rust_canister_with_memory_allocation(
-    mut canister: &mut Canister<'_>,
+    canister: &mut Canister<'_>,
     relative_path_from_rs: impl AsRef<Path>,
     binary_name: impl AsRef<str>,
+    cargo_features: &[&str],
     canister_init_payload: Option<Vec<u8>>,
     memory_allocation: u64, // in bytes
 ) {
-    let wasm = Project::cargo_bin_maybe_use_path_relative_to_rs(
-        relative_path_from_rs,
-        binary_name.as_ref(),
-    );
+    // Some ugly code to allow copying AsRef<Path> and features (an array slice) into new thread
+    // neither of these implement Send or have a way to clone the whole structure's data
+    let path_string = relative_path_from_rs.as_ref().to_str().unwrap().to_owned();
+    let binary_name_ = binary_name.as_ref().to_string();
+    let features = cargo_features
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Box<[String]>>();
+
+    // Wrapping call to cargo_bin_* to avoid blocking current thread
+    let wasm: Wasm = tokio::runtime::Handle::current()
+        .spawn_blocking(move || {
+            println!(
+                "Compiling Wasm for {} in task on thread: {:?}",
+                binary_name_,
+                thread::current().id()
+            );
+            // Second half of moving data had to be done in-thread to avoid lifetime/ownership issues
+            let features = features.iter().map(|s| s.as_str()).collect::<Box<[&str]>>();
+            let path = Path::new(&path_string);
+            Project::cargo_bin_maybe_use_path_relative_to_rs(path, &binary_name_, &features)
+        })
+        .await
+        .unwrap();
+
+    println!("Done compiling the wasm for {}", binary_name.as_ref());
 
     wasm.install_with_retries_onto_canister(
-        &mut canister,
+        canister,
         canister_init_payload,
         Some(memory_allocation),
     )
@@ -392,12 +398,14 @@ pub async fn install_rust_canister(
     canister: &mut Canister<'_>,
     relative_path_from_rs: impl AsRef<Path>,
     binary_name: impl AsRef<str>,
+    cargo_features: &[&str],
     canister_init_payload: Option<Vec<u8>>,
 ) {
     install_rust_canister_with_memory_allocation(
         canister,
         relative_path_from_rs,
         binary_name,
+        cargo_features,
         canister_init_payload,
         memory_allocation_of(canister.canister_id()),
     )
@@ -415,6 +423,7 @@ pub async fn install_governance_canister(canister: &mut Canister<'_>, init_paylo
         canister,
         "nns/governance",
         "governance-canister",
+        &["test"],
         Some(serialized),
     )
     .await;
@@ -440,6 +449,7 @@ pub async fn install_registry_canister(
         canister,
         "registry/canister",
         "registry-canister",
+        &[],
         Some(encoded),
     )
     .await;
@@ -466,6 +476,7 @@ pub async fn install_genesis_token_canister(canister: &mut Canister<'_>, init_pa
         canister,
         "nns/gtc",
         "genesis-token-canister",
+        &[],
         Some(serialized),
     )
     .await
@@ -490,6 +501,7 @@ pub async fn install_ledger_canister<'runtime, 'a>(
         canister,
         "rosetta-api/ledger_canister",
         "ledger-canister",
+        &["notify-method"],
         Some(CandidOne(args).into_bytes().unwrap()),
     )
     .await
@@ -515,6 +527,7 @@ pub async fn install_root_canister(
         canister,
         "nns/handlers/root",
         "root-canister",
+        &[],
         Some(encoded),
     )
     .await;
@@ -540,6 +553,7 @@ pub async fn install_cycles_minting_canister(
         canister,
         "nns/cmc",
         "cycles-minting-canister",
+        &[],
         Some(CandidOne(init_payload).into_bytes().unwrap()),
     )
     .await;
@@ -561,7 +575,7 @@ pub async fn install_lifeline_canister(
     _init_payload: LifelineCanisterInitPayload,
 ) {
     // Use the env var if we have one, otherwise use the embedded binary.
-    Wasm::from_location_specified_by_env_var("lifeline")
+    Wasm::from_location_specified_by_env_var("lifeline", &[])
         .unwrap_or_else(|| Wasm::from_bytes(LIFELINE_CANISTER_WASM))
         .install_with_retries_onto_canister(
             canister,
@@ -739,13 +753,13 @@ async fn change_nns_canister_by_proposal(
     let old_module_hash = status.module_hash.unwrap();
     assert_ne!(old_module_hash.as_slice(), new_module_hash, "change_nns_canister_by_proposal: both module hashes prev, cur are the same {:?}, but they should be different for upgrade", old_module_hash);
 
-    let proposal_payload =
-        ChangeNnsCanisterProposalPayload::new(stop_before_installing, how, canister_id)
-            .with_wasm(wasm);
-    let proposal_payload = if let Some(arg) = arg {
-        proposal_payload.with_arg(arg)
+    let proposal = ChangeCanisterProposal::new(stop_before_installing, how, canister_id)
+        .with_memory_allocation(ic_nns_constants::memory_allocation_of(canister_id))
+        .with_wasm(wasm);
+    let proposal = if let Some(arg) = arg {
+        proposal.with_arg(arg)
     } else {
-        proposal_payload
+        proposal
     };
 
     // Submitting a proposal also implicitly records a vote from the proposer,
@@ -755,7 +769,7 @@ async fn change_nns_canister_by_proposal(
         Sender::from_keypair(&TEST_NEURON_1_OWNER_KEYPAIR),
         NeuronId(TEST_NEURON_1_ID),
         NnsFunction::NnsCanisterUpgrade,
-        proposal_payload,
+        proposal,
         "Upgrade NNS Canister".to_string(),
         "<proposal created by change_nns_canister_by_proposal>".to_string(),
     )
@@ -930,4 +944,40 @@ pub async fn forward_call_via_universal_canister(
             other
         ),
     }
+}
+
+/// Makes the `sender` call the given method of the
+/// `receiver` handler. It is assumed that `sender` is a universal
+/// canister.
+///
+/// Return the response bytes if the receiver replied, and reject message if the
+/// call failed.
+pub async fn try_call_via_universal_canister(
+    sender: &Canister<'_>,
+    receiver: &Canister<'_>,
+    method: &str,
+    payload: Vec<u8>,
+) -> Result<Vec<u8>, String> {
+    let universal_canister_payload = universal_canister_argument_builder()
+        .call_simple(
+            receiver.canister_id(),
+            method,
+            call_args()
+                .other_side(payload)
+                .on_reply(
+                    universal_canister_argument_builder()
+                        .message_payload()
+                        .reply_data_append()
+                        .reply(),
+                )
+                .on_reject(
+                    universal_canister_argument_builder()
+                        .reject_message()
+                        .reject(),
+                ),
+        )
+        .build();
+    sender
+        .update_("update", bytes, universal_canister_payload)
+        .await
 }

@@ -1,9 +1,11 @@
+use crate::convert::principal_id_from_public_key_or_principal;
 use crate::{
     convert::{
         self, amount_, principal_id_from_public_key, signed_amount, to_model_account_identifier,
     },
+    errors,
     errors::ApiError,
-    models::{self, Object, Operation, OperationIdentifier},
+    models::{self, Object, Operation, OperationIdentifier, OperationType},
     time::Seconds,
     transaction_id::TransactionIdentifier,
 };
@@ -20,7 +22,6 @@ use std::convert::{TryFrom, TryInto};
 // single value
 pub const STATUS_COMPLETED: &str = "COMPLETED";
 
-/// The operation associated with `Request::Transfer`.
 pub const TRANSACTION: &str = "TRANSACTION";
 pub const MINT: &str = "MINT";
 pub const BURN: &str = "BURN";
@@ -32,11 +33,16 @@ pub const SET_DISSOLVE_TIMESTAMP: &str = "SET_DISSOLVE_TIMESTAMP";
 pub const DISBURSE: &str = "DISBURSE";
 pub const DISSOLVE_TIME_UTC_SECONDS: &str = "dissolve_time_utc_seconds";
 pub const ADD_HOT_KEY: &str = "ADD_HOT_KEY";
+pub const REMOVE_HOTKEY: &str = "REMOVE_HOTKEY";
+pub const SPAWN: &str = "SPAWN";
+pub const MERGE_MATURITY: &str = "MERGE_MATURITY";
+pub const NEURON_INFO: &str = "NEURON_INFO";
+pub const FOLLOW: &str = "FOLLOW";
 
 /// `RequestType` contains all supported values of `Operation.type`.
-/// Extra information, such as `neuron_identifier` should only be included
+/// Extra information, such as `neuron_index` should only be included
 /// if it cannot be parsed from the submit payload.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub enum RequestType {
     // Aliases for backwards compatibility
     #[serde(rename = "TRANSACTION")]
@@ -44,26 +50,47 @@ pub enum RequestType {
     Send,
     #[serde(rename = "STAKE")]
     #[serde(alias = "Stake")]
-    Stake { neuron_identifier: u64 },
+    Stake { neuron_index: u64 },
     #[serde(rename = "SET_DISSOLVE_TIMESTAMP")]
     #[serde(alias = "SetDissolveTimestamp")]
-    SetDissolveTimestamp { neuron_identifier: u64 },
+    SetDissolveTimestamp { neuron_index: u64 },
     #[serde(rename = "START_DISSOLVE")]
     #[serde(alias = "StartDissolve")]
-    StartDissolve { neuron_identifier: u64 },
+    StartDissolve { neuron_index: u64 },
     #[serde(rename = "STOP_DISSOLVE")]
     #[serde(alias = "StopDissolve")]
-    StopDissolve { neuron_identifier: u64 },
+    StopDissolve { neuron_index: u64 },
     #[serde(rename = "DISBURSE")]
     #[serde(alias = "Disperse")]
-    Disburse { neuron_identifier: u64 },
+    Disburse { neuron_index: u64 },
     #[serde(rename = "ADD_HOT_KEY")]
     #[serde(alias = "AddHotKey")]
-    AddHotKey { neuron_identifier: u64 },
+    AddHotKey { neuron_index: u64 },
+    #[serde(rename = "REMOVE_HOTKEY")]
+    #[serde(alias = "RemoveHotKey")]
+    RemoveHotKey { neuron_index: u64 },
+    #[serde(rename = "SPAWN")]
+    #[serde(alias = "Spawn")]
+    Spawn { neuron_index: u64 },
+    #[serde(rename = "MERGE_MATURITY")]
+    #[serde(alias = "MergeMaturity")]
+    MergeMaturity { neuron_index: u64 },
+    #[serde(rename = "NEURON_INFO")]
+    #[serde(alias = "NeuronInfo")]
+    NeuronInfo {
+        neuron_index: u64,
+        controller: Option<PublicKeyOrPrincipal>,
+    },
+    #[serde(rename = "FOLLOW")]
+    #[serde(alias = "Follow")]
+    Follow {
+        neuron_index: u64,
+        controller: Option<PublicKeyOrPrincipal>,
+    },
 }
 
 impl RequestType {
-    pub const fn into_str(self) -> &'static str {
+    pub fn into_str(self) -> &'static str {
         match self {
             RequestType::Send { .. } => TRANSACTION,
             RequestType::Stake { .. } => STAKE,
@@ -72,6 +99,11 @@ impl RequestType {
             RequestType::StopDissolve { .. } => STOP_DISSOLVE,
             RequestType::Disburse { .. } => DISBURSE,
             RequestType::AddHotKey { .. } => ADD_HOT_KEY,
+            RequestType::RemoveHotKey { .. } => REMOVE_HOTKEY,
+            RequestType::Spawn { .. } => SPAWN,
+            RequestType::MergeMaturity { .. } => MERGE_MATURITY,
+            RequestType::NeuronInfo { .. } => NEURON_INFO,
+            RequestType::Follow { .. } => FOLLOW,
         }
     }
 
@@ -88,7 +120,126 @@ impl RequestType {
                 | RequestType::StopDissolve { .. }
                 | RequestType::Disburse { .. }
                 | RequestType::AddHotKey { .. }
+                | RequestType::RemoveHotKey { .. }
+                | RequestType::Spawn { .. }
+                | RequestType::MergeMaturity { .. }
+                | RequestType::NeuronInfo { .. }
+                | RequestType::Follow { .. }
         )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct TransactionOperationResults {
+    pub operations: Vec<Operation>,
+}
+
+impl TransactionOperationResults {
+    /// Parse a TransactionOperationResults from a Json object.
+    pub fn parse(json: Object) -> Result<Self, ApiError> {
+        serde_json::from_value(serde_json::Value::Object(json)).map_err(|e| {
+            ApiError::internal_error(format!(
+                "Could not parse TransactionOperationResults from Object: {}",
+                e
+            ))
+        })
+    }
+
+    /// Convert TransactionResults to TransactionOperationResults.
+    pub fn from_transaction_results(
+        tr: TransactionResults,
+        token_name: &str,
+    ) -> Result<Self, ApiError> {
+        let mut operations = Request::requests_to_operations(
+            tr.operations
+                .iter()
+                .map(|rr| rr._type.clone())
+                .collect::<Vec<_>>()
+                .as_slice(),
+            token_name,
+        )?;
+
+        let merge_metadata = |o: &mut Operation, rr: &RequestResult| {
+            let mut metadata = o.metadata.take().unwrap_or_default();
+            let rrmd = convert_to_request_result_metadata(rr);
+            let rrmd = Object::from(rrmd);
+            for (k, v) in rrmd {
+                metadata.insert(k, v);
+            }
+            // Add optional response data (may contains content from client).
+            if let Some(data) = rr.response.clone() {
+                for (k, v) in data.into_iter() {
+                    metadata.insert(k, v);
+                }
+            }
+            o.metadata = if metadata.is_empty() {
+                None
+            } else {
+                Some(metadata)
+            };
+            o.status = Some(rr.status.name().to_owned());
+        };
+
+        let mut op_idx = 0;
+        for rr in tr.operations.iter() {
+            match (rr, &mut operations[op_idx..]) {
+                (
+                    RequestResult {
+                        _type: Request::Transfer(LedgerOperation::Transfer { .. }),
+                        ..
+                    },
+                    [withdraw, deposit, fee, ..],
+                ) if withdraw._type == OperationType::Transaction
+                    && deposit._type == OperationType::Transaction
+                    && fee._type == OperationType::Fee =>
+                {
+                    merge_metadata(withdraw, rr);
+                    merge_metadata(deposit, rr);
+                    merge_metadata(fee, rr);
+                    op_idx += 3;
+                }
+                (rr, [o, ..]) => {
+                    merge_metadata(o, rr);
+                    op_idx += 1
+                }
+                _ => {
+                    return Err(ApiError::internal_error(format!(
+                        "Too few Operations, could not match requests with operations.\n{}\n\n{}",
+                        serde_json::to_string(&tr.operations).unwrap(),
+                        serde_json::to_string(&operations).unwrap()
+                    )))
+                }
+            };
+        }
+
+        Ok(TransactionOperationResults { operations })
+    }
+}
+
+impl From<RequestResultMetadata> for Object {
+    fn from(d: RequestResultMetadata) -> Self {
+        match serde_json::to_value(d) {
+            Ok(Value::Object(o)) => o,
+            _ => Object::default(),
+        }
+    }
+}
+
+impl From<TransactionOperationResults> for Object {
+    fn from(d: TransactionOperationResults) -> Self {
+        match serde_json::to_value(d) {
+            Ok(Value::Object(o)) => o,
+            _ => Object::default(),
+        }
+    }
+}
+
+impl From<&TransactionOperationResults> for Object {
+    fn from(d: &TransactionOperationResults) -> Self {
+        match serde_json::to_value(d) {
+            Ok(Value::Object(o)) => o,
+            _ => Object::default(),
+        }
     }
 }
 
@@ -124,15 +275,6 @@ impl TransactionResults {
     }
 }
 
-impl From<TransactionResults> for Object {
-    fn from(d: TransactionResults) -> Self {
-        match serde_json::to_value(d) {
-            Ok(Value::Object(o)) => o,
-            _ => Object::default(),
-        }
-    }
-}
-
 impl From<&TransactionResults> for Object {
     fn from(d: &TransactionResults) -> Self {
         match serde_json::to_value(d) {
@@ -147,7 +289,7 @@ impl TryFrom<Object> for TransactionResults {
     fn try_from(o: Object) -> Result<Self, ApiError> {
         serde_json::from_value(serde_json::Value::Object(o)).map_err(|e| {
             ApiError::internal_error(format!(
-                "Could not parse RequestsResults from Object: {}",
+                "Could not parse TransactionResults from Object: {}",
                 e
             ))
         })
@@ -166,94 +308,61 @@ impl From<TransactionResults> for Vec<RequestResult> {
     }
 }
 
-impl From<TransactionResults> for ApiError {
-    fn from(e: TransactionResults) -> Self {
-        ApiError::OperationsErrors(e)
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct RequestResultMetadata {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub block_index: Option<BlockHeight>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub neuron_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub transaction_identifier: Option<TransactionIdentifier>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub response: Option<models::Error>,
+}
+
+impl TryFrom<Option<Object>> for RequestResultMetadata {
+    type Error = ApiError;
+    fn try_from(o: Option<Object>) -> Result<Self, Self::Error> {
+        serde_json::from_value(serde_json::Value::Object(o.unwrap_or_default())).map_err(|e| {
+            ApiError::internal_error(format!(
+                "Could not parse a `neuron_identifier` from metadata JSON object: {}",
+                e
+            ))
+        })
+    }
+}
+
+pub fn convert_to_request_result_metadata(rr: &RequestResult) -> RequestResultMetadata {
+    RequestResultMetadata {
+        block_index: rr.block_index,
+        neuron_id: rr.neuron_id,
+        transaction_identifier: rr.transaction_identifier.clone(),
+        response: rr.status.failed().map(errors::convert_to_error),
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct RequestResult {
     #[serde(rename = "type")]
-    #[serde(flatten)]
     pub _type: Request,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
     pub block_index: Option<BlockHeight>,
-
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
     pub neuron_id: Option<u64>,
-
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
     pub transaction_identifier: Option<TransactionIdentifier>,
     #[serde(flatten)]
     pub status: Status,
-}
-
-#[test]
-fn request_result_serialization_test() {
-    let account = AccountIdentifier::from(ic_types::PrincipalId::default());
-
-    let neuron_identifier = 0;
-
-    let rr = RequestResult {
-        _type: Request::Stake(Stake {
-            account,
-            neuron_identifier,
-        }),
-        block_index: None,
-        neuron_id: None,
-        transaction_identifier: None,
-        status: Status::Failed(ApiError::internal_error("foo")),
-    };
-
-    let se = serde_json::to_string(&rr).unwrap();
-    let de: RequestResult = serde_json::from_str(&se).unwrap();
-    let s = serde_json::from_str(
-        r#"{
-        "type":"STAKE",
-        "account":"2d0e897f7e862d2b57d9bc9ea5c65f9a24ac6c074575f47898314b8d6cb0929d",
-        "status":"FAILED",
-        "response":{
-            "code":700,
-            "message":"Internal server error",
-            "retriable":false,
-            "details":{"error_message":"foo"}
-        }
-    }"#,
-    )
-    .unwrap();
-
-    assert_eq!(rr, de);
-    assert_eq!(rr, s);
-
-    let rr = RequestResult {
-        _type: Request::Stake(Stake {
-            account,
-            neuron_identifier,
-        }),
-        block_index: None,
-        neuron_id: Some(5757483),
-        transaction_identifier: None,
-        status: Status::Completed,
-    };
-
-    let se = serde_json::to_string(&rr).unwrap();
-    let de: RequestResult = serde_json::from_str(&se).unwrap();
-    let s = serde_json::from_str(
-        r#"{
-        "type":"STAKE",
-        "account":"2d0e897f7e862d2b57d9bc9ea5c65f9a24ac6c074575f47898314b8d6cb0929d",
-        "neuron_id":5757483,
-        "status":"COMPLETED"
-    }"#,
-    )
-    .unwrap();
-
-    assert_eq!(rr, de);
-    assert_eq!(rr, s);
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub response: Option<Object>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -271,6 +380,24 @@ impl Status {
     pub fn failed(&self) -> Option<&ApiError> {
         match self {
             Status::Failed(e) => Some(e),
+            _ => None,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        match self {
+            Status::Completed => "COMPLETED",
+            Status::AlreadyApplied => "ALREADY_APPLIED",
+            Status::Failed(_) => "FAILED",
+            Status::NotAttempted => "NOT_ATTEMPTED",
+        }
+    }
+
+    pub fn from_name(n: &str) -> Option<Self> {
+        match n {
+            "COMPLETED" => Some(Status::Completed),
+            "ALREADY_APPLIED" => Some(Status::AlreadyApplied),
+            "NOT_ATTEMPTED" => Some(Status::NotAttempted),
             _ => None,
         }
     }
@@ -300,41 +427,50 @@ pub enum Request {
     Disburse(Disburse),
     #[serde(rename = "ADD_HOT_KEY")]
     AddHotKey(AddHotKey),
+    #[serde(rename = "REMOVE_HOTKEY")]
+    RemoveHotKey(RemoveHotKey),
+    #[serde(rename = "SPAWN")]
+    Spawn(Spawn),
+    #[serde(rename = "MERGE_MATURITY")]
+    MergeMaturity(MergeMaturity),
+    #[serde(rename = "NEURON_INFO")]
+    NeuronInfo(NeuronInfo),
+    #[serde(rename = "FOLLOW")]
+    Follow(Follow),
 }
 
 impl Request {
     pub fn request_type(&self) -> Result<RequestType, ApiError> {
         match self {
-            Request::Stake(Stake {
-                neuron_identifier, ..
-            }) => Ok(RequestType::Stake {
-                neuron_identifier: *neuron_identifier,
+            Request::Stake(Stake { neuron_index, .. }) => Ok(RequestType::Stake {
+                neuron_index: *neuron_index,
             }),
-            Request::SetDissolveTimestamp(SetDissolveTimestamp {
-                neuron_identifier, ..
-            }) => Ok(RequestType::SetDissolveTimestamp {
-                neuron_identifier: *neuron_identifier,
+            Request::SetDissolveTimestamp(SetDissolveTimestamp { neuron_index, .. }) => {
+                Ok(RequestType::SetDissolveTimestamp {
+                    neuron_index: *neuron_index,
+                })
+            }
+            Request::StartDissolve(StartDissolve { neuron_index, .. }) => {
+                Ok(RequestType::StartDissolve {
+                    neuron_index: *neuron_index,
+                })
+            }
+            Request::StopDissolve(StopDissolve { neuron_index, .. }) => {
+                Ok(RequestType::StopDissolve {
+                    neuron_index: *neuron_index,
+                })
+            }
+            Request::Disburse(Disburse { neuron_index, .. }) => Ok(RequestType::Disburse {
+                neuron_index: *neuron_index,
             }),
-            Request::StartDissolve(StartDissolve {
-                neuron_identifier, ..
-            }) => Ok(RequestType::StartDissolve {
-                neuron_identifier: *neuron_identifier,
+            Request::AddHotKey(AddHotKey { neuron_index, .. }) => Ok(RequestType::AddHotKey {
+                neuron_index: *neuron_index,
             }),
-            Request::StopDissolve(StopDissolve {
-                neuron_identifier, ..
-            }) => Ok(RequestType::StopDissolve {
-                neuron_identifier: *neuron_identifier,
-            }),
-            Request::Disburse(Disburse {
-                neuron_identifier, ..
-            }) => Ok(RequestType::Disburse {
-                neuron_identifier: *neuron_identifier,
-            }),
-            Request::AddHotKey(AddHotKey {
-                neuron_identifier, ..
-            }) => Ok(RequestType::AddHotKey {
-                neuron_identifier: *neuron_identifier,
-            }),
+            Request::RemoveHotKey(RemoveHotKey { neuron_index, .. }) => {
+                Ok(RequestType::RemoveHotKey {
+                    neuron_index: *neuron_index,
+                })
+            }
             Request::Transfer(LedgerOperation::Transfer { .. }) => Ok(RequestType::Send),
             Request::Transfer(LedgerOperation::Burn { .. }) => Err(ApiError::invalid_request(
                 "Burn operations are not supported through rosetta",
@@ -342,6 +478,30 @@ impl Request {
             Request::Transfer(LedgerOperation::Mint { .. }) => Err(ApiError::invalid_request(
                 "Mint operations are not supported through rosetta",
             )),
+            Request::Spawn(Spawn { neuron_index, .. }) => Ok(RequestType::Spawn {
+                neuron_index: *neuron_index,
+            }),
+            Request::MergeMaturity(MergeMaturity { neuron_index, .. }) => {
+                Ok(RequestType::MergeMaturity {
+                    neuron_index: *neuron_index,
+                })
+            }
+            Request::NeuronInfo(NeuronInfo {
+                neuron_index,
+                controller,
+                ..
+            }) => Ok(RequestType::NeuronInfo {
+                neuron_index: *neuron_index,
+                controller: controller.map(PublicKeyOrPrincipal::Principal),
+            }),
+            Request::Follow(Follow {
+                neuron_index,
+                controller,
+                ..
+            }) => Ok(RequestType::Follow {
+                neuron_index: *neuron_index,
+                controller: controller.map(PublicKeyOrPrincipal::Principal),
+            }),
         }
     }
 
@@ -349,17 +509,25 @@ impl Request {
     /// This is a thin wrapper over the `TransactionBuilder`.
     ///
     /// TODO We should capture the concept of a Transaction in a type.
-    pub fn requests_to_operations(requests: &[Request]) -> Result<Vec<Operation>, ApiError> {
+    pub fn requests_to_operations(
+        requests: &[Request],
+        token_name: &str,
+    ) -> Result<Vec<Operation>, ApiError> {
         let mut builder = TransactionBuilder::default();
         for request in requests {
             match request {
-                Request::Transfer(o) => builder.transfer(o)?,
+                Request::Transfer(o) => builder.transfer(o, token_name)?,
                 Request::Stake(o) => builder.stake(o),
                 Request::SetDissolveTimestamp(o) => builder.set_dissolve_timestamp(o),
                 Request::StartDissolve(o) => builder.start_dissolve(o),
                 Request::StopDissolve(o) => builder.stop_dissolve(o),
-                Request::Disburse(o) => builder.disburse(o),
+                Request::Disburse(o) => builder.disburse(o, token_name),
                 Request::AddHotKey(o) => builder.add_hot_key(o),
+                Request::RemoveHotKey(o) => builder.remove_hotkey(o),
+                Request::Spawn(o) => builder.spawn(o),
+                Request::MergeMaturity(o) => builder.merge_maturity(o),
+                Request::NeuronInfo(o) => builder.neuron_info(o),
+                Request::Follow(o) => builder.follow(o),
             };
         }
         Ok(builder.build())
@@ -378,6 +546,11 @@ impl Request {
                 | Request::StopDissolve(_)
                 | Request::Disburse(_)
                 | Request::AddHotKey(_)
+                | Request::RemoveHotKey(_)
+                | Request::Spawn(_)
+                | Request::MergeMaturity(_)
+                | Request::NeuronInfo(_) // not neuron management but we need it signed.
+                | Request::Follow(_)
         )
     }
 }
@@ -426,11 +599,11 @@ impl TryFrom<&models::Request> for Request {
                     fee,
                 }))
             }
-            RequestType::Stake { neuron_identifier } => Ok(Request::Stake(Stake {
+            RequestType::Stake { neuron_index } => Ok(Request::Stake(Stake {
                 account,
-                neuron_identifier: *neuron_identifier,
+                neuron_index: *neuron_index,
             })),
-            RequestType::SetDissolveTimestamp { neuron_identifier } => {
+            RequestType::SetDissolveTimestamp { neuron_index } => {
                 let command = manage_neuron()?;
                 if let Some(Command::Configure(Configure {
                     operation:
@@ -444,7 +617,7 @@ impl TryFrom<&models::Request> for Request {
                 {
                     Ok(Request::SetDissolveTimestamp(SetDissolveTimestamp {
                         account,
-                        neuron_identifier: *neuron_identifier,
+                        neuron_index: *neuron_index,
                         timestamp: Seconds(dissolve_timestamp_seconds),
                     }))
                 } else {
@@ -453,19 +626,17 @@ impl TryFrom<&models::Request> for Request {
                     ))
                 }
             }
-            RequestType::StartDissolve { neuron_identifier } => {
+            RequestType::StartDissolve { neuron_index } => {
                 Ok(Request::StartDissolve(StartDissolve {
                     account,
-                    neuron_identifier: *neuron_identifier,
+                    neuron_index: *neuron_index,
                 }))
             }
-            RequestType::StopDissolve { neuron_identifier } => {
-                Ok(Request::StopDissolve(StopDissolve {
-                    account,
-                    neuron_identifier: *neuron_identifier,
-                }))
-            }
-            RequestType::Disburse { neuron_identifier } => {
+            RequestType::StopDissolve { neuron_index } => Ok(Request::StopDissolve(StopDissolve {
+                account,
+                neuron_index: *neuron_index,
+            })),
+            RequestType::Disburse { neuron_index } => {
                 let command = manage_neuron()?;
                 if let Some(Command::Disburse(manage_neuron::Disburse { to_account, amount })) =
                     command
@@ -485,14 +656,13 @@ impl TryFrom<&models::Request> for Request {
                         account,
                         amount: amount.map(|amount| Tokens::from_e8s(amount.e8s)),
                         recipient,
-                        neuron_identifier: *neuron_identifier,
+                        neuron_index: *neuron_index,
                     }))
                 } else {
                     Err(ApiError::invalid_request("Request is missing recipient"))
                 }
             }
-
-            RequestType::AddHotKey { neuron_identifier } => {
+            RequestType::AddHotKey { neuron_index } => {
                 if let Some(Command::Configure(Configure {
                     operation:
                         Some(configure::Operation::AddHotKey(manage_neuron::AddHotKey {
@@ -503,18 +673,130 @@ impl TryFrom<&models::Request> for Request {
                 {
                     Ok(Request::AddHotKey(AddHotKey {
                         account,
-                        neuron_identifier: *neuron_identifier,
+                        neuron_index: *neuron_index,
                         key: PublicKeyOrPrincipal::Principal(pid),
                     }))
                 } else {
                     Err(ApiError::invalid_request("Request is missing set hotkey."))
                 }
             }
+            RequestType::RemoveHotKey { neuron_index } => {
+                if let Some(Command::Configure(Configure {
+                    operation:
+                        Some(configure::Operation::RemoveHotKey(manage_neuron::RemoveHotKey {
+                            hot_key_to_remove: Some(pid),
+                            ..
+                        })),
+                })) = manage_neuron()?
+                {
+                    Ok(Request::RemoveHotKey(RemoveHotKey {
+                        account,
+                        neuron_index: *neuron_index,
+                        key: PublicKeyOrPrincipal::Principal(pid),
+                    }))
+                } else {
+                    Err(ApiError::invalid_request(
+                        "Request is missing hotkey to remove.",
+                    ))
+                }
+            }
+            RequestType::Spawn { neuron_index } => {
+                if let Some(Command::Spawn(manage_neuron::Spawn {
+                    new_controller,
+                    nonce,
+                    percentage_to_spawn,
+                })) = manage_neuron()?
+                {
+                    if let Some(spawned_neuron_index) = nonce {
+                        Ok(Request::Spawn(Spawn {
+                            account,
+                            spawned_neuron_index,
+                            controller: new_controller,
+                            percentage_to_spawn,
+                            neuron_index: *neuron_index,
+                        }))
+                    } else {
+                        Err(ApiError::invalid_request(
+                            "Spawned neuron index is required.",
+                        ))
+                    }
+                } else {
+                    Err(ApiError::invalid_request("Invalid spawn request."))
+                }
+            }
+            RequestType::MergeMaturity { neuron_index } => {
+                if let Some(Command::MergeMaturity(manage_neuron::MergeMaturity {
+                    percentage_to_merge,
+                })) = manage_neuron()?
+                {
+                    Ok(Request::MergeMaturity(MergeMaturity {
+                        account,
+                        percentage_to_merge,
+                        neuron_index: *neuron_index,
+                    }))
+                } else {
+                    Err(ApiError::invalid_request("Invalid merge maturity request."))
+                }
+            }
+            RequestType::NeuronInfo {
+                neuron_index,
+                controller,
+                ..
+            } => {
+                match controller
+                    .clone()
+                    .map(principal_id_from_public_key_or_principal)
+                {
+                    None => Ok(Request::NeuronInfo(NeuronInfo {
+                        account,
+                        controller: None,
+                        neuron_index: *neuron_index,
+                    })),
+                    Some(Ok(pid)) => Ok(Request::NeuronInfo(NeuronInfo {
+                        account,
+                        controller: Some(pid),
+                        neuron_index: *neuron_index,
+                    })),
+                    Some(Err(e)) => Err(e),
+                }
+            }
+            RequestType::Follow {
+                neuron_index,
+                controller,
+            } => {
+                if let Some(Command::Follow(manage_neuron::Follow { topic, followees })) =
+                    manage_neuron()?
+                {
+                    let ids = followees.iter().map(|n| n.id).collect();
+                    match controller
+                        .clone()
+                        .map(principal_id_from_public_key_or_principal)
+                    {
+                        None => Ok(Request::Follow(Follow {
+                            account,
+                            topic,
+                            followees: ids,
+                            controller: None,
+                            neuron_index: *neuron_index,
+                        })),
+                        Some(Ok(pid)) => Ok(Request::Follow(Follow {
+                            account,
+                            topic,
+                            followees: ids,
+                            controller: Some(pid),
+                            neuron_index: *neuron_index,
+                        })),
+                        Some(Err(e)) => Err(e),
+                    }
+                } else {
+                    Err(ApiError::invalid_request("Invalid follow request."))
+                }
+            }
         }
     }
 }
 
-/// A helper for serializing `RequestResults`
+/// A helper for serializing `TransactionResults`
 mod send {
     use super::*;
 
@@ -586,7 +868,7 @@ mod send {
 pub struct SetDissolveTimestamp {
     pub account: ledger_canister::AccountIdentifier,
     #[serde(default)]
-    pub neuron_identifier: u64,
+    pub neuron_index: u64,
     /// The number of seconds since Unix epoch.
     pub timestamp: Seconds,
 }
@@ -594,21 +876,21 @@ pub struct SetDissolveTimestamp {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct StartDissolve {
     pub account: ledger_canister::AccountIdentifier,
-    pub neuron_identifier: u64,
+    pub neuron_index: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct StopDissolve {
     pub account: ledger_canister::AccountIdentifier,
     #[serde(default)]
-    pub neuron_identifier: u64,
+    pub neuron_index: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Stake {
     pub account: ledger_canister::AccountIdentifier,
     #[serde(default)]
-    pub neuron_identifier: u64,
+    pub neuron_index: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -616,19 +898,64 @@ pub struct Disburse {
     pub account: ledger_canister::AccountIdentifier,
     pub amount: Option<Tokens>,
     pub recipient: Option<ledger_canister::AccountIdentifier>,
-    pub neuron_identifier: u64,
+    pub neuron_index: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 pub struct AddHotKey {
     pub account: ledger_canister::AccountIdentifier,
     #[serde(default)]
-    pub neuron_identifier: u64,
+    pub neuron_index: u64,
     pub key: PublicKeyOrPrincipal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+pub struct RemoveHotKey {
+    pub account: ledger_canister::AccountIdentifier,
+    #[serde(default)]
+    pub neuron_index: u64,
+    pub key: PublicKeyOrPrincipal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct Spawn {
+    pub account: ledger_canister::AccountIdentifier,
+    pub spawned_neuron_index: u64,
+    pub controller: Option<PrincipalId>,
+    pub percentage_to_spawn: Option<u32>,
+    #[serde(default)]
+    pub neuron_index: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct MergeMaturity {
+    pub account: ledger_canister::AccountIdentifier,
+    pub percentage_to_merge: u32,
+    #[serde(default)]
+    pub neuron_index: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct NeuronInfo {
+    pub account: ledger_canister::AccountIdentifier,
+    pub controller: Option<PrincipalId>,
+    #[serde(default)]
+    pub neuron_index: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct Follow {
+    pub account: ledger_canister::AccountIdentifier,
+    pub topic: i32,
+    pub followees: Vec<u64>,
+    pub controller: Option<PrincipalId>,
+    #[serde(default)]
+    pub neuron_index: u64,
 }
 
 #[derive(Debug, Clone, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
+// Externally tagged by default.
 pub enum PublicKeyOrPrincipal {
     PublicKey(models::PublicKey),
     Principal(PrincipalId),
@@ -660,7 +987,7 @@ impl PartialEq for PublicKeyOrPrincipal {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct SetDissolveTimestampMetadata {
     #[serde(default)]
-    pub neuron_identifier: u64,
+    pub neuron_index: u64,
     #[serde(rename = "dissolve_time_utc_seconds")]
     /// The number of seconds since Unix epoch.
     pub timestamp: Seconds,
@@ -677,7 +1004,6 @@ impl From<SetDissolveTimestampMetadata> for Object {
 
 impl TryFrom<Option<Object>> for SetDissolveTimestampMetadata {
     type Error = ApiError;
-
     fn try_from(o: Option<Object>) -> Result<Self, Self::Error> {
         serde_json::from_value(serde_json::Value::Object(o.unwrap_or_default())).map_err(|e| {
             ApiError::internal_error(format!(
@@ -685,8 +1011,8 @@ impl TryFrom<Option<Object>> for SetDissolveTimestampMetadata {
                  The timestamp is a number of seconds since the Unix epoch.
                  This is represented as an unsigned 64 bit integer and encoded as a JSON string.
 
-                 A Set Dissolve Timestamp operation may have a 'neuron_identifier' metadata field.
-                 The 'neuron_identifier` field differentiates between neurons controlled by the user.
+                 A Set Dissolve Timestamp operation may have a 'neuron_index' metadata field.
+                 The 'neuron_index` field differentiates between neurons controlled by the user.
 
                  Parse Error: {}",
                 e
@@ -698,16 +1024,15 @@ impl TryFrom<Option<Object>> for SetDissolveTimestampMetadata {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Default, Deserialize, Serialize)]
 pub struct NeuronIdentifierMetadata {
     #[serde(default)]
-    pub neuron_identifier: u64,
+    pub neuron_index: u64,
 }
 
 impl TryFrom<Option<Object>> for NeuronIdentifierMetadata {
     type Error = ApiError;
-
     fn try_from(o: Option<Object>) -> Result<Self, Self::Error> {
         serde_json::from_value(serde_json::Value::Object(o.unwrap_or_default())).map_err(|e| {
             ApiError::internal_error(format!(
-                "Could not parse a `neuron_identifier` from metadata JSON object: {}",
+                "Could not parse a `neuron_index` from metadata JSON object: {}",
                 e
             ))
         })
@@ -726,7 +1051,7 @@ impl From<NeuronIdentifierMetadata> for Object {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 pub struct DisburseMetadata {
     #[serde(default)]
-    pub neuron_identifier: u64,
+    pub neuron_index: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
     pub recipient: Option<AccountIdentifier>,
@@ -738,7 +1063,7 @@ impl TryFrom<Option<Object>> for DisburseMetadata {
     fn try_from(o: Option<Object>) -> Result<Self, Self::Error> {
         serde_json::from_value(serde_json::Value::Object(o.unwrap_or_default())).map_err(|e| {
             ApiError::internal_error(format!(
-                "Could not parse a `neuron_identifier` from metadata JSON object: {}",
+                "Could not parse DISBURSE operation metadata from a JSON object: {}",
                 e
             ))
         })
@@ -758,7 +1083,7 @@ pub struct KeyMetadata {
     #[serde(flatten)]
     pub key: PublicKeyOrPrincipal,
     #[serde(default)]
-    pub neuron_identifier: u64,
+    pub neuron_index: u64,
 }
 
 impl TryFrom<Option<Object>> for KeyMetadata {
@@ -767,7 +1092,7 @@ impl TryFrom<Option<Object>> for KeyMetadata {
     fn try_from(o: Option<Object>) -> Result<Self, Self::Error> {
         serde_json::from_value(serde_json::Value::Object(o.unwrap_or_default())).map_err(|e| {
             ApiError::internal_error(format!(
-                "Could not parse a `neuron_identifier` from metadata JSON object: {}",
+                "Could not parse hot key management operation metadata from a JSON object: {}",
                 e
             ))
         })
@@ -776,6 +1101,236 @@ impl TryFrom<Option<Object>> for KeyMetadata {
 
 impl From<KeyMetadata> for Object {
     fn from(m: KeyMetadata) -> Self {
+        match serde_json::to_value(&m) {
+            Ok(Value::Object(o)) => o,
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[test]
+fn test_parse_key_metadata() {
+    use std::str::FromStr;
+
+    let m1: KeyMetadata = serde_json::from_str(
+        r#"{ "principal" : "sp3em-jkiyw-tospm-2huim-jor4p-et4s7-ay35f-q7tnm-hi4k2-pyicb-xae" }"#,
+    )
+    .unwrap();
+    assert_eq!(
+        m1,
+        KeyMetadata {
+            neuron_index: 0,
+            key: PublicKeyOrPrincipal::Principal(
+                PrincipalId::from_str(
+                    "sp3em-jkiyw-tospm-2huim-jor4p-et4s7-ay35f-q7tnm-hi4k2-pyicb-xae"
+                )
+                .unwrap()
+            ),
+        }
+    );
+
+    let m2: KeyMetadata = serde_json::from_str(
+        r#"{ "public_key": {
+          "hex_bytes":  "1b400d60aaf34eaf6dcbab9bba46001a23497886cf11066f7846933d30e5ad3f",
+          "curve_type": "edwards25519"
+        } }"#,
+    )
+    .unwrap();
+    assert_eq!(
+        m2,
+        KeyMetadata {
+            neuron_index: 0,
+            key: PublicKeyOrPrincipal::PublicKey(models::PublicKey {
+                hex_bytes: "1b400d60aaf34eaf6dcbab9bba46001a23497886cf11066f7846933d30e5ad3f"
+                    .to_string(),
+                curve_type: models::CurveType::Edwards25519
+            }),
+        }
+    );
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+pub struct SpawnMetadata {
+    #[serde(default)]
+    #[serde(rename = "neuron_index")]
+    pub neuron_index: u64,
+
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub controller: Option<PrincipalId>,
+
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub percentage_to_spawn: Option<u32>,
+
+    #[serde(rename = "spawned_neuron_index")]
+    pub spawned_neuron_index: u64,
+}
+
+impl TryFrom<Option<Object>> for SpawnMetadata {
+    type Error = ApiError;
+
+    fn try_from(o: Option<Object>) -> Result<Self, Self::Error> {
+        serde_json::from_value(serde_json::Value::Object(o.unwrap_or_default())).map_err(|e| {
+            ApiError::internal_error(format!(
+                "Could not parse SPAWN operation metadata from a JSON object: {}",
+                e
+            ))
+        })
+    }
+}
+
+impl From<SpawnMetadata> for Object {
+    fn from(m: SpawnMetadata) -> Self {
+        match serde_json::to_value(m) {
+            Ok(Value::Object(o)) => o,
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+pub struct MergeMaturityMetadata {
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub percentage_to_merge: Option<u32>,
+    #[serde(default)]
+    pub neuron_index: u64,
+}
+
+impl TryFrom<Option<Object>> for MergeMaturityMetadata {
+    type Error = ApiError;
+    fn try_from(o: Option<Object>) -> Result<Self, Self::Error> {
+        serde_json::from_value(serde_json::Value::Object(o.unwrap_or_default())).map_err(|e| {
+            ApiError::internal_error(format!(
+                "Could not parse MERGE_MATURITY operation metadata from metadata JSON object: {}",
+                e
+            ))
+        })
+    }
+}
+
+impl From<MergeMaturityMetadata> for Object {
+    fn from(m: MergeMaturityMetadata) -> Self {
+        match serde_json::to_value(m) {
+            Ok(Value::Object(o)) => o,
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+pub struct NeuronInfoMetadata {
+    pub controller: Option<PublicKeyOrPrincipal>,
+    #[serde(default)]
+    pub neuron_index: u64,
+}
+
+impl From<PublicKeyOrPrincipal> for Object {
+    fn from(p: PublicKeyOrPrincipal) -> Self {
+        match serde_json::to_value(p) {
+            Ok(Value::Object(o)) => o,
+            _ => unreachable!(),
+        }
+    }
+}
+
+impl TryFrom<Option<Object>> for NeuronInfoMetadata {
+    type Error = ApiError;
+    fn try_from(o: Option<Object>) -> Result<Self, Self::Error> {
+        serde_json::from_value(serde_json::Value::Object(o.unwrap_or_default())).map_err(|e| {
+            ApiError::internal_error(format!(
+                "Could not parse NEURON_INFO operation metadata from metadata JSON object: {}",
+                e
+            ))
+        })
+    }
+}
+
+#[test]
+fn test_parse_neuron_info_metadata_public_key() {
+    let m1 = r#"
+            {
+                "controller": {
+                    "public_key": {
+                        "hex_bytes": "ba5242d02642aede88a5f9fe82482a9fd0b6dc25f38c729253116c6865384a9d",
+                        "curve_type": "edwards25519"
+                     }
+                },
+                "neuron_index": 123456
+            }
+        "#;
+    let m1: NeuronInfoMetadata = serde_json::from_str(m1).unwrap();
+    assert_eq!(
+        m1,
+        NeuronInfoMetadata {
+            neuron_index: 123456,
+            controller: Some(PublicKeyOrPrincipal::PublicKey(models::PublicKey::new(
+                "ba5242d02642aede88a5f9fe82482a9fd0b6dc25f38c729253116c6865384a9d"
+                    .parse()
+                    .unwrap(),
+                models::CurveType::Edwards25519
+            )))
+        }
+    );
+}
+
+#[test]
+fn test_parse_neuron_info_metadata_principal() {
+    use std::str::FromStr;
+    let m1 = r#"
+            {
+                "controller": {
+                    "principal": "4auul-2ca7l-khhsk-dcyds-qnj57-cc3ko-h3j6b-jcszz-nsjn4-ab2zb-oqe"
+                },
+                "neuron_index": 123456
+            }
+        "#;
+    let m1: NeuronInfoMetadata = serde_json::from_str(m1).unwrap();
+    let pid =
+        PrincipalId::from_str("4auul-2ca7l-khhsk-dcyds-qnj57-cc3ko-h3j6b-jcszz-nsjn4-ab2zb-oqe")
+            .expect("Invalid PrincipalId");
+    assert_eq!(
+        m1,
+        NeuronInfoMetadata {
+            neuron_index: 123456,
+            controller: Some(PublicKeyOrPrincipal::Principal(pid))
+        }
+    );
+}
+
+impl From<NeuronInfoMetadata> for Object {
+    fn from(m: NeuronInfoMetadata) -> Self {
+        match serde_json::to_value(m) {
+            Ok(Value::Object(o)) => o,
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+pub struct FollowMetadata {
+    pub topic: i32,
+    pub followees: Vec<u64>,
+    pub controller: Option<PublicKeyOrPrincipal>,
+    #[serde(default)]
+    pub neuron_index: u64,
+}
+
+impl TryFrom<Option<Object>> for FollowMetadata {
+    type Error = ApiError;
+    fn try_from(o: Option<Object>) -> Result<Self, Self::Error> {
+        serde_json::from_value(serde_json::Value::Object(o.unwrap_or_default())).map_err(|e| {
+            ApiError::internal_error(format!(
+                "Could not parse a FOLLOW operation metadata from metadata JSON object: {}",
+                e
+            ))
+        })
+    }
+}
+
+impl From<FollowMetadata> for Object {
+    fn from(m: FollowMetadata) -> Self {
         match serde_json::to_value(m) {
             Ok(Value::Object(o)) => o,
             _ => unreachable!(),
@@ -785,20 +1340,12 @@ impl From<KeyMetadata> for Object {
 
 /// Transaction is a bit of a misnomer, since operations can succeed or fail
 /// independently from a Transaction.
+#[derive(Default)]
 pub struct TransactionBuilder {
     /// The next `OperationIdentifier` `index`.
     /// TODO Why is `OperationIdentifier.index` a signed integer?
     op_index: i64,
     ops: Vec<Operation>,
-}
-
-impl Default for TransactionBuilder {
-    fn default() -> Self {
-        Self {
-            op_index: 0,
-            ops: Vec::default(),
-        }
-    }
 }
 
 impl TransactionBuilder {
@@ -818,16 +1365,20 @@ impl TransactionBuilder {
 
     /// Add a `Request::Transfer` to the Transaction.
     /// This handles `Send`, `Mint`, and `Burn`.
-    pub fn transfer(&mut self, operation: &LedgerOperation) -> Result<(), ApiError> {
+    pub fn transfer(
+        &mut self,
+        operation: &LedgerOperation,
+        token_name: &str,
+    ) -> Result<(), ApiError> {
         match operation {
             LedgerOperation::Burn { from, amount } => {
                 let operation_identifier = self.allocate_op_id();
                 self.ops.push(Operation {
                     operation_identifier,
-                    _type: BURN.to_string(),
+                    _type: OperationType::Burn,
                     status: None,
                     account: Some(to_model_account_identifier(from)),
-                    amount: Some(signed_amount(-i128::from(amount.get_e8s()))),
+                    amount: Some(signed_amount(-i128::from(amount.get_e8s()), token_name)),
                     related_operations: None,
                     coin_change: None,
                     metadata: None,
@@ -837,10 +1388,10 @@ impl TransactionBuilder {
                 let operation_identifier = self.allocate_op_id();
                 self.ops.push(Operation {
                     operation_identifier,
-                    _type: MINT.to_string(),
+                    _type: OperationType::Mint,
                     status: None,
                     account: Some(to_model_account_identifier(to)),
-                    amount: Some(amount_(*amount)?),
+                    amount: Some(amount_(*amount, token_name)?),
                     related_operations: None,
                     coin_change: None,
                     metadata: None,
@@ -858,10 +1409,10 @@ impl TransactionBuilder {
                 let operation_identifier = self.allocate_op_id();
                 self.ops.push(Operation {
                     operation_identifier,
-                    _type: TRANSACTION.to_string(),
+                    _type: OperationType::Transaction,
                     status: None,
                     account: from_account.clone(),
-                    amount: Some(signed_amount(-amount)),
+                    amount: Some(signed_amount(-amount, token_name)),
                     related_operations: None,
                     coin_change: None,
                     metadata: None,
@@ -869,10 +1420,10 @@ impl TransactionBuilder {
                 let operation_identifier = self.allocate_op_id();
                 self.ops.push(Operation {
                     operation_identifier,
-                    _type: TRANSACTION.to_string(),
+                    _type: OperationType::Transaction,
                     status: None,
                     account: Some(to_model_account_identifier(to)),
-                    amount: Some(signed_amount(amount)),
+                    amount: Some(signed_amount(amount, token_name)),
                     related_operations: None,
                     coin_change: None,
                     metadata: None,
@@ -880,10 +1431,10 @@ impl TransactionBuilder {
                 let operation_identifier = self.allocate_op_id();
                 self.ops.push(Operation {
                     operation_identifier,
-                    _type: FEE.to_string(),
+                    _type: OperationType::Fee,
                     status: None,
                     account: from_account,
-                    amount: Some(signed_amount(-(fee.get_e8s() as i128))),
+                    amount: Some(signed_amount(-(fee.get_e8s() as i128), token_name)),
                     related_operations: None,
                     coin_change: None,
                     metadata: None,
@@ -896,12 +1447,12 @@ impl TransactionBuilder {
     pub fn stake(&mut self, stake: &Stake) {
         let Stake {
             account,
-            neuron_identifier,
+            neuron_index,
         } = stake;
         let operation_identifier = self.allocate_op_id();
         self.ops.push(Operation {
             operation_identifier,
-            _type: STAKE.to_string(),
+            _type: OperationType::Stake,
             status: None,
             account: Some(to_model_account_identifier(account)),
             amount: None,
@@ -909,7 +1460,7 @@ impl TransactionBuilder {
             coin_change: None,
             metadata: Some(
                 NeuronIdentifierMetadata {
-                    neuron_identifier: *neuron_identifier,
+                    neuron_index: *neuron_index,
                 }
                 .into(),
             ),
@@ -919,13 +1470,13 @@ impl TransactionBuilder {
     pub fn set_dissolve_timestamp(&mut self, set_dissolve: &SetDissolveTimestamp) {
         let SetDissolveTimestamp {
             account,
-            neuron_identifier,
+            neuron_index,
             timestamp,
         } = set_dissolve;
         let operation_identifier = self.allocate_op_id();
         self.ops.push(Operation {
             operation_identifier,
-            _type: SET_DISSOLVE_TIMESTAMP.to_string(),
+            _type: OperationType::SetDissolveTimestamp,
             status: None,
             account: Some(to_model_account_identifier(account)),
             amount: None,
@@ -933,7 +1484,7 @@ impl TransactionBuilder {
             coin_change: None,
             metadata: Some(
                 SetDissolveTimestampMetadata {
-                    neuron_identifier: *neuron_identifier,
+                    neuron_index: *neuron_index,
                     timestamp: *timestamp,
                 }
                 .into(),
@@ -944,12 +1495,12 @@ impl TransactionBuilder {
     pub fn start_dissolve(&mut self, start_dissolve: &StartDissolve) {
         let StartDissolve {
             account,
-            neuron_identifier,
+            neuron_index,
         } = start_dissolve;
         let operation_identifier = self.allocate_op_id();
         self.ops.push(Operation {
             operation_identifier,
-            _type: START_DISSOLVE.to_string(),
+            _type: OperationType::StartDissolving,
             status: None,
             account: Some(to_model_account_identifier(account)),
             amount: None,
@@ -957,7 +1508,7 @@ impl TransactionBuilder {
             coin_change: None,
             metadata: Some(
                 NeuronIdentifierMetadata {
-                    neuron_identifier: *neuron_identifier,
+                    neuron_index: *neuron_index,
                 }
                 .into(),
             ),
@@ -967,12 +1518,12 @@ impl TransactionBuilder {
     pub fn stop_dissolve(&mut self, stop_dissolve: &StopDissolve) {
         let StopDissolve {
             account,
-            neuron_identifier,
+            neuron_index,
         } = stop_dissolve;
         let operation_identifier = self.allocate_op_id();
         self.ops.push(Operation {
             operation_identifier,
-            _type: STOP_DISSOLVE.to_string(),
+            _type: OperationType::StopDissolving,
             status: None,
             account: Some(to_model_account_identifier(account)),
             amount: None,
@@ -980,34 +1531,33 @@ impl TransactionBuilder {
             coin_change: None,
             metadata: Some(
                 NeuronIdentifierMetadata {
-                    neuron_identifier: *neuron_identifier,
+                    neuron_index: *neuron_index,
                 }
                 .into(),
             ),
         });
     }
 
-    pub fn disburse(&mut self, disburse: &Disburse) {
+    pub fn disburse(&mut self, disburse: &Disburse, token_name: &str) {
         let Disburse {
             account,
             amount,
             recipient,
-            neuron_identifier,
+            neuron_index,
         } = disburse;
         let operation_identifier = self.allocate_op_id();
         self.ops.push(Operation {
             operation_identifier,
-            _type: DISBURSE.to_string(),
+            _type: OperationType::Disburse,
             status: None,
             account: Some(to_model_account_identifier(account)),
-            amount: amount.map(|a| amount_(a).expect("failed to convert amount")),
+            amount: amount.map(|a| amount_(a, token_name).expect("failed to convert amount")),
             related_operations: None,
             coin_change: None,
             metadata: Some(
                 DisburseMetadata {
                     recipient: *recipient,
-
-                    neuron_identifier: *neuron_identifier,
+                    neuron_index: *neuron_index,
                 }
                 .into(),
             ),
@@ -1016,13 +1566,13 @@ impl TransactionBuilder {
     pub fn add_hot_key(&mut self, key: &AddHotKey) {
         let AddHotKey {
             account,
-            neuron_identifier,
+            neuron_index,
             key,
         } = key;
         let operation_identifier = self.allocate_op_id();
         self.ops.push(Operation {
             operation_identifier,
-            _type: ADD_HOT_KEY.to_string(),
+            _type: OperationType::AddHotkey,
             status: None,
             account: Some(to_model_account_identifier(account)),
             amount: None,
@@ -1031,10 +1581,146 @@ impl TransactionBuilder {
             metadata: Some(
                 KeyMetadata {
                     key: key.clone(),
-                    neuron_identifier: *neuron_identifier,
+                    neuron_index: *neuron_index,
                 }
                 .into(),
             ),
         });
     }
+    pub fn remove_hotkey(&mut self, key: &RemoveHotKey) {
+        let RemoveHotKey {
+            account,
+            neuron_index,
+            key,
+        } = key;
+        let operation_identifier = self.allocate_op_id();
+        self.ops.push(Operation {
+            operation_identifier,
+            _type: OperationType::RemoveHotkey,
+            status: None,
+            account: Some(to_model_account_identifier(account)),
+            amount: None,
+            related_operations: None,
+            coin_change: None,
+            metadata: Some(
+                KeyMetadata {
+                    key: key.clone(),
+                    neuron_index: *neuron_index,
+                }
+                .into(),
+            ),
+        });
+    }
+    pub fn spawn(&mut self, spawn: &Spawn) {
+        let Spawn {
+            account,
+            spawned_neuron_index,
+            controller,
+            percentage_to_spawn,
+            neuron_index,
+        } = spawn;
+        let operation_identifier = self.allocate_op_id();
+        self.ops.push(Operation {
+            operation_identifier,
+            _type: OperationType::Spawn,
+            status: None,
+            account: Some(to_model_account_identifier(account)),
+            amount: None,
+            related_operations: None,
+            coin_change: None,
+            metadata: Some(
+                SpawnMetadata {
+                    controller: *controller,
+                    neuron_index: *neuron_index,
+                    percentage_to_spawn: *percentage_to_spawn,
+                    spawned_neuron_index: *spawned_neuron_index,
+                }
+                .into(),
+            ),
+        });
+    }
+
+    pub fn merge_maturity(&mut self, merge: &MergeMaturity) {
+        let MergeMaturity {
+            account,
+            percentage_to_merge,
+            neuron_index,
+        } = merge;
+        let operation_identifier = self.allocate_op_id();
+        self.ops.push(Operation {
+            operation_identifier,
+            _type: OperationType::MergeMaturity,
+            status: None,
+            account: Some(to_model_account_identifier(account)),
+            amount: None,
+            related_operations: None,
+            coin_change: None,
+            metadata: Some(
+                MergeMaturityMetadata {
+                    percentage_to_merge: Option::from(*percentage_to_merge),
+                    neuron_index: *neuron_index,
+                }
+                .into(),
+            ),
+        });
+    }
+
+    pub fn neuron_info(&mut self, req: &NeuronInfo) {
+        let NeuronInfo {
+            account,
+            controller,
+            neuron_index,
+        } = req;
+        let operation_identifier = self.allocate_op_id();
+        self.ops.push(Operation {
+            operation_identifier,
+            _type: OperationType::NeuronInfo,
+            status: None,
+            account: Some(to_model_account_identifier(account)),
+            amount: None,
+            related_operations: None,
+            coin_change: None,
+            metadata: Some(
+                NeuronInfoMetadata {
+                    controller: pkp_from_principal(controller),
+                    neuron_index: *neuron_index,
+                }
+                .into(),
+            ),
+        });
+    }
+
+    pub fn follow(&mut self, follow: &Follow) {
+        let Follow {
+            account,
+            topic,
+            followees,
+            controller,
+            neuron_index,
+        } = follow;
+        let operation_identifier = self.allocate_op_id();
+        self.ops.push(Operation {
+            operation_identifier,
+            _type: OperationType::Follow,
+            status: None,
+            account: Some(to_model_account_identifier(account)),
+            amount: None,
+            related_operations: None,
+            coin_change: None,
+            metadata: Some(
+                FollowMetadata {
+                    topic: *topic,
+                    followees: followees.clone(),
+                    controller: pkp_from_principal(controller),
+                    neuron_index: *neuron_index,
+                }
+                .into(),
+            ),
+        });
+    }
+}
+
+/// Converts an optional PrincipalId to an optional PublicKeyOrPrincipal.
+fn pkp_from_principal(pid: &Option<PrincipalId>) -> Option<PublicKeyOrPrincipal> {
+    pid.as_ref().map(|p| PublicKeyOrPrincipal::Principal(*p))
 }

@@ -31,146 +31,127 @@ Coverage::
 
 end::catalog[] */
 
-use crate::util::*; // to use the universal canister
-use futures::future::join_all; // because we use concurrency
-use ic_agent::export::Principal; // we observe canister identifiers
-use ic_fondue::{
-    ic_manager::{IcEndpoint, IcHandle}, // we run the test on the IC
-    internet_computer::{InternetComputer, Subnet}, // which is declared through these types
-};
-use ic_registry_subnet_type::SubnetType;
-use itertools::Itertools; // for the function [unique_by]
-use url::Url; // to address the API endpoint of the IC
+use std::time::Duration;
 
-/// Every system test runs within a given IC configuration. Later on, the plan
-/// is to combine tests that request compatible environments to reduce startup
-/// time. Please keep this in mind when writing your tests by only requesting
-/// what is needed to satisfy the Goal of the test!
-pub fn config() -> InternetComputer {
+use crate::driver::ic::{InternetComputer, Subnet};
+use crate::driver::test_env::TestEnv;
+use crate::driver::test_env_api::*;
+use crate::util::*; // to use the universal canister
+use ic_registry_subnet_type::SubnetType;
+use slog::info;
+
+pub fn config_single_host(env: TestEnv) {
     InternetComputer::new()
         .add_subnet(Subnet::new(SubnetType::System).add_nodes(4))
-        .add_subnet(Subnet::new(SubnetType::System).add_nodes(4))
+        .add_subnet(Subnet::new(SubnetType::Application).add_nodes(4))
+        .setup_and_start(&env)
+        .expect("failed to setup IC under test")
 }
 
 const MSG: &[u8] = b"this beautiful prose should be persisted for future generations";
+const READ_RETRIES: u64 = 10;
+const RETRY_WAIT: Duration = Duration::from_secs(10);
 
 /// Here we define the test workflow, which should implement the Runbook given
 /// in the test catalog entry at the top of this file.
-///
-/// This particular test does not change the IC environment -- such as by
-/// adding or dropping nodes -- hence, it receives a [IcHandle] instead of a
-/// `IcManager`. This distinction makes it easier to safely run tests against
-/// the same setup. In addition to a handle, the test also receives a
-/// [fondue::pot::Context] which contains a number of auxiliary tools such as
-/// a logger, and a PRNG.
-pub fn basic_health_test(handle: IcHandle, ctx: &fondue::pot::Context) {
-    // Choose a random node URL from each subnet.
-    let mut rng = ctx.rng.clone();
-    let nodes: Vec<&IcEndpoint> = handle
-        .as_permutation(&mut rng)
-        .unique_by(|ep| ep.is_root_subnet)
+pub fn test(env: TestEnv) {
+    let log = env.logger();
+    // Assemble a list that contains one node per subnet.
+    let nodes: Vec<_> = env
+        .topology_snapshot()
+        .subnets()
+        .map(|s| s.nodes().next().unwrap())
         .collect();
-    assert_eq!(nodes.len(), 2);
-    // Check that all nodes are ready for interaction.
-    block_on(assert_all_ready(nodes.as_slice(), ctx));
 
-    let node_urls: Vec<&Url> = nodes.iter().map(|n| &n.url).collect();
-
-    // Define a local async function to install the universal canister on the subnet
-    // and check if we can send query and update calls to it. We do this because
-    // we'll be performing installations on both subnets concurrently.
-    async fn create_and_test(url: &&Url) -> Principal {
-        // Create an agent, which is the software that allows us to interact
-        // with an Internet Computer instance through its public HTTP API.
-        let agent = assert_create_agent(url.as_str()).await;
-        // The Universal Canister permits us to install a canister that allows
-        // for programmable responses to query and update calls, for the sake
-        // of testing. This avoids the need to build up a separate canister
-        // whose responses are compiled into its Wasm code.
-        let ucan = UniversalCanister::new(&agent).await;
-
-        // send a query call to it
-        assert_eq!(ucan.try_read_stable(0, 0).await, Vec::<u8>::new());
-
-        // send an update call to it
-        ucan.store_to_stable(0, MSG).await;
-
-        // query for mutated data
-        assert_eq!(
-            ucan.try_read_stable(0, MSG.len() as u32).await,
-            MSG.to_vec()
-        );
-
-        ucan.canister_id()
-    }
-
-    let canister_installations = node_urls.iter().map(create_and_test);
-
-    // Create a Tokio runtime we can execute async functions on. This way we
-    // can avoid using the global runtime, thus keeping use of asynchronicity
-    // to just the functions we know are safe to run in parallel.
-    let rt = tokio::runtime::Runtime::new().expect("Could not create tokio runtime.");
-
-    // Install the canisters and obtain the resulting container ids. We do not
-    // proceed with the test until all of the canister ids are received.
-    let canister_ids: Vec<_> = rt.block_on(join_all(canister_installations));
-
-    // Construct facts about what to do next. In particular this means pairing
-    // up the node URL with pairs of canister ids intended to match up
-    // different canisters. Thus, canisters 1,2,3,4 on subnet 1 will create
-    // the following list for that subnet: url,1,4 url,2,3 url,3,2 url,4,1.
-    // Since there are two subnets, the `canister_info` here will be a pair of
-    // such lists.
-    let canister_info = node_urls
+    info!(log, "Waiting for the nodes to become healthy ...");
+    nodes
         .iter()
-        .zip(canister_ids.iter().zip(canister_ids.iter().rev()));
+        .try_for_each(|n| n.await_status_is_healthy())
+        .unwrap();
 
+    info!(log, "Installing universal canisters on subnets (via all nodes), reading and storing messages ...");
+    let ucan_ids: Vec<_> = nodes
+        .iter()
+        .map(|node| {
+            node.with_default_agent(|agent| async move {
+                let ucan = UniversalCanister::new(&agent).await;
+
+                // send a query call to it
+                assert_eq!(ucan.try_read_stable(0, 0).await, Vec::<u8>::new());
+
+                // send an update call to it
+                ucan.store_to_stable(0, MSG).await;
+
+                // query for mutated data
+                assert_eq!(
+                    ucan.try_read_stable(0, MSG.len() as u32).await,
+                    MSG.to_vec()
+                );
+
+                ucan.canister_id()
+            })
+        })
+        .collect();
+
+    // Match up canisters with each other. The first canister of the pair will
+    // send an update to the second canister of the pair (see below).
+    let canister_info = ucan_ids
+        .clone()
+        .into_iter()
+        .zip(ucan_ids.clone().into_iter().rev())
+        .collect::<Vec<_>>();
     const XNET_MSG: &[u8] = b"just received a xnet message";
 
     // We expect to find these contents in stable memory.
-    let expected_memory_values = vec![MSG, XNET_MSG];
+    let expected_memory_values = vec![MSG, XNET_MSG].into_iter().map(|s| s.to_vec());
 
+    info!(log, "Sending xnet messages ...");
     // Again we execute functions to call each of the canisters on the
     // subnets, making sure that the memory contents we expect to see are
     // indeed set to the updated value. We want until all have succeeded.
     // Since interactions with the universal canister are `async`, we must
     // execute these within the context of the Tokio runtime, even though
     // there is no concurrency from this point forward.
-    for ((node_url, (from_canister_info, to_canister_info)), expect) in
-        canister_info.zip(expected_memory_values.iter())
-    {
-        assert_ne!(from_canister_info, to_canister_info);
-
-        rt.block_on(async move {
-            let agent = assert_create_agent(node_url.as_str()).await;
-            let ucan = UniversalCanister::from_canister_id(&agent, *from_canister_info);
+    for ((n, (from, to)), expect) in nodes.iter().zip(canister_info).zip(expected_memory_values) {
+        let log = log.clone();
+        n.with_default_agent(move |agent| async move {
+            // Note: `from` is the canister id of the univeral canister that was
+            // installed on `from`.
+            info!(log, "Initializing universal canister...");
+            let ucan = UniversalCanister::from_canister_id(&agent, from);
 
             // Send a cross-subnet update message.
-            ucan.forward_to(
-                to_canister_info,
-                "update",
-                UniversalCanister::stable_writer(0, XNET_MSG),
-            )
-            .await
-            .expect("failed to send update message");
+            info!(log, "Sending update message to the universal canister...");
+            ucan.forward_to(&to, "update", UniversalCanister::stable_writer(0, XNET_MSG))
+                .await
+                .expect("failed to send update message");
 
+            info!(log, "Assert correct read message from canister...");
             // Verify the originating canister now has the expected content.
             assert_eq!(
                 ucan.try_read_stable(0, expect.len() as u32).await,
                 expect.to_vec()
             );
-        })
+        });
     }
 
+    info!(log, "Assert that message has been stored ...");
     // Finally we query each of the canisters to ensure that the canister
     // memories have been updated as expected.
-    for (node_url, canister_id) in node_urls.iter().zip(canister_ids.iter()) {
-        rt.block_on(async move {
-            let agent = assert_create_agent(node_url.as_str()).await;
-            let ucan = UniversalCanister::from_canister_id(&agent, *canister_id);
-
+    for (node, ucan_id) in nodes.iter().zip(ucan_ids) {
+        let log = log.clone();
+        node.with_default_agent(move |agent| async move {
+            let ucan = UniversalCanister::from_canister_id(&agent, ucan_id);
+            // NOTE: retries are important here, 1/3 of the nodes might not observe changes immediately.
             assert_eq!(
-                ucan.try_read_stable(0, XNET_MSG.len() as u32).await,
+                ucan.try_read_stable_with_retries(
+                    &log,
+                    0,
+                    XNET_MSG.len() as u32,
+                    READ_RETRIES,
+                    RETRY_WAIT
+                )
+                .await,
                 XNET_MSG.to_vec()
             );
         })

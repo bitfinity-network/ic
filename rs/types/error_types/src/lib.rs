@@ -1,10 +1,13 @@
 //! A crate that groups user-facing and internal error types and codes produced
 //! by the Internet Computer.
-use candid::Error;
-use ic_protobuf::proxy::ProxyDecodeError;
 use serde::{Deserialize, Serialize};
 use std::{convert::TryFrom, fmt};
 use strum_macros::EnumIter;
+
+#[derive(Clone, Copy, Debug)]
+pub enum TryFromError {
+    ValueOutOfRange(u64),
+}
 
 /// Reject codes are integers that canisters should pass to msg.reject
 /// system API calls. These errors are designed for programmatic error
@@ -40,7 +43,7 @@ impl RejectCode {
 }
 
 impl TryFrom<u64> for RejectCode {
-    type Error = ProxyDecodeError;
+    type Error = TryFromError;
     fn try_from(code: u64) -> Result<Self, Self::Error> {
         match code {
             1 => Ok(RejectCode::SysFatal),
@@ -48,10 +51,7 @@ impl TryFrom<u64> for RejectCode {
             3 => Ok(RejectCode::DestinationInvalid),
             4 => Ok(RejectCode::CanisterReject),
             5 => Ok(RejectCode::CanisterError),
-            _ => Err(ProxyDecodeError::ValueOutOfRange {
-                typ: "RejectCode",
-                err: code.to_string(),
-            }),
+            _ => Err(TryFromError::ValueOutOfRange(code)),
         }
     }
 }
@@ -95,7 +95,8 @@ impl From<ErrorCode> for RejectCode {
             InvalidManagementPayload => CanisterReject,
             InsufficientCyclesInCall => CanisterError,
             CanisterWasmEngineError => CanisterError,
-            CanisterCyclesLimitExceeded => CanisterError,
+            CanisterInstructionLimitExceeded => CanisterError,
+            CanisterInstallCodeRateLimited => SysTransient,
         }
     }
 }
@@ -142,20 +143,12 @@ pub enum ErrorCode {
     InvalidManagementPayload = 519,
     InsufficientCyclesInCall = 520,
     CanisterWasmEngineError = 521,
-    CanisterCyclesLimitExceeded = 522,
-}
-
-impl From<candid::Error> for UserError {
-    fn from(err: Error) -> Self {
-        UserError::new(
-            ErrorCode::CanisterContractViolation,
-            format!("Error decoding candid: {}", err),
-        )
-    }
+    CanisterInstructionLimitExceeded = 522,
+    CanisterInstallCodeRateLimited = 523,
 }
 
 impl TryFrom<u64> for ErrorCode {
-    type Error = ProxyDecodeError;
+    type Error = TryFromError;
     fn try_from(err: u64) -> Result<ErrorCode, Self::Error> {
         match err {
             101 => Ok(ErrorCode::SubnetOversubscribed),
@@ -192,11 +185,9 @@ impl TryFrom<u64> for ErrorCode {
             519 => Ok(ErrorCode::InvalidManagementPayload),
             520 => Ok(ErrorCode::InsufficientCyclesInCall),
             521 => Ok(ErrorCode::CanisterWasmEngineError),
-            522 => Ok(ErrorCode::CanisterCyclesLimitExceeded),
-            _ => Err(ProxyDecodeError::ValueOutOfRange {
-                typ: "ErrorCode",
-                err: err.to_string(),
-            }),
+            522 => Ok(ErrorCode::CanisterInstructionLimitExceeded),
+            523 => Ok(ErrorCode::CanisterInstallCodeRateLimited),
+            _ => Err(TryFromError::ValueOutOfRange(err)),
         }
     }
 }
@@ -276,7 +267,7 @@ mod tests {
             let int_code = code as u64;
             match ErrorCode::try_from(int_code) {
                 Ok(decoded_code) => assert_eq!(code, decoded_code),
-                Err(err) => panic!("Could not decode {} to an ErrorCode: {}.", int_code, err),
+                Err(err) => panic!("Could not decode {} to an ErrorCode: {:?}.", int_code, err),
             }
         }
     }

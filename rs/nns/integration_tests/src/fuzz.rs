@@ -1,5 +1,6 @@
+#![allow(dead_code)]
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::convert::TryFrom;
 use std::fmt;
 use std::sync::Arc;
@@ -25,6 +26,7 @@ use dfn_protobuf::protobuf;
 use ic_base_types::PrincipalId;
 use ic_canister_client::Sender;
 use ic_crypto_sha::Sha256;
+use ic_nervous_system_common::ledger;
 use ic_nns_common::pb::v1::NeuronId;
 use ic_nns_constants::GOVERNANCE_CANISTER_ID;
 use ic_nns_governance::init::GovernanceCanisterInitPayloadBuilder;
@@ -38,7 +40,7 @@ use ic_nns_test_utils::itest_helpers::{
 };
 use ledger_canister::{
     AccountBalanceArgs, AccountIdentifier, BlockHeight, LedgerCanisterInitPayload, Memo,
-    NotifyCanisterArgs, SendArgs, Subaccount, Tokens, TRANSACTION_FEE,
+    NotifyCanisterArgs, SendArgs, Subaccount, Tokens, DEFAULT_TRANSFER_FEE,
 };
 
 /// A user that owns/controls Accounts and/or Neurons.
@@ -74,7 +76,7 @@ struct Account {
     subaccount: Option<Subaccount>,
     /// The user that is the owner of the account.
     owner: User,
-    /// The expected balance, in ICPTs.
+    /// The expected balance, in ICPs.
     balance: Tokens,
 }
 
@@ -96,20 +98,13 @@ struct Neuron {
     nonce: u64,
     /// The user that is the owner of the neuron.
     owner: User,
-    /// The expected stake of the Neuron, in ICPTs.
+    /// The expected stake of the Neuron, in ICPs.
     balance: Tokens,
 }
 
 impl Neuron {
     fn subaccount(&self) -> Subaccount {
-        Subaccount({
-            let mut state = Sha256::new();
-            state.write(&[0x0c]);
-            state.write(b"neuron-stake");
-            state.write(self.owner.sender.get_principal_id().as_slice());
-            state.write(&self.nonce.to_be_bytes());
-            state.finish()
-        })
+        ledger::compute_neuron_staking_subaccount(self.owner.sender.get_principal_id(), self.nonce)
     }
 }
 
@@ -131,17 +126,10 @@ impl From<Neuron> for NeuronProto {
 
 impl From<Neuron> for AccountIdentifier {
     fn from(neuron: Neuron) -> AccountIdentifier {
-        let subaccount = Subaccount::try_from(
-            &{
-                let mut state = Sha256::new();
-                state.write(&[0x0c]);
-                state.write(b"neuron-stake");
-                state.write(neuron.owner.sender.get_principal_id().as_slice());
-                state.write(&neuron.nonce.to_be_bytes());
-                state.finish()
-            }[..],
-        )
-        .expect("Couldn't build subaccount from hash.");
+        let subaccount = ledger::compute_neuron_staking_subaccount(
+            neuron.owner.sender.get_principal_id(),
+            neuron.nonce,
+        );
         AccountIdentifier::new(GOVERNANCE_CANISTER_ID.get(), Some(subaccount))
     }
 }
@@ -188,7 +176,7 @@ impl FuzzState {
             } => {
                 let source_account = self.accounts.get_mut(&source.id).unwrap();
                 source_account.balance =
-                    ((source_account.balance - *amount).unwrap() - TRANSACTION_FEE).unwrap();
+                    ((source_account.balance - *amount).unwrap() - DEFAULT_TRANSFER_FEE).unwrap();
                 let destination_account = self.accounts.get_mut(&destination.id).unwrap();
                 destination_account.balance = (destination_account.balance + *amount).unwrap();
             }
@@ -200,7 +188,7 @@ impl FuzzState {
             } => {
                 let source_account = self.accounts.get_mut(&source.id).unwrap();
                 source_account.balance =
-                    ((source_account.balance - *amount).unwrap() - TRANSACTION_FEE).unwrap();
+                    ((source_account.balance - *amount).unwrap() - DEFAULT_TRANSFER_FEE).unwrap();
                 let destination_neuron = self.neurons.get_mut(&destination.id).unwrap();
                 destination_neuron.balance = (destination_neuron.balance + *amount).unwrap();
             }
@@ -212,8 +200,9 @@ impl FuzzState {
             } => {
                 let source_neuron = self.neurons.get_mut(&source.id).unwrap();
                 let amount = if let Some(amount) = amount {
-                    source_neuron.balance =
-                        ((source_neuron.balance - *amount).unwrap() - TRANSACTION_FEE).unwrap();
+                    source_neuron.balance = ((source_neuron.balance - *amount).unwrap()
+                        - DEFAULT_TRANSFER_FEE)
+                        .unwrap();
                     *amount
                 } else {
                     let amount = source_neuron.balance;
@@ -675,7 +664,7 @@ impl FuzzGenerator {
     fn generate_random_ledger_transfer(&mut self) -> Option<Operation> {
         let id = self.next_op_id;
         let source = self.state.random_account(&mut self.rng)?;
-        if source.balance.get_e8s() < TRANSACTION_FEE.get_e8s() {
+        if source.balance.get_e8s() < DEFAULT_TRANSFER_FEE.get_e8s() {
             return None;
         }
         let destination = self
@@ -683,7 +672,7 @@ impl FuzzGenerator {
             .random_account_different_than(&mut self.rng, &source)?;
         let amount = Tokens::from_e8s(
             self.rng
-                .gen_range(0, source.balance.get_e8s() - TRANSACTION_FEE.get_e8s()),
+                .gen_range(0, source.balance.get_e8s() - DEFAULT_TRANSFER_FEE.get_e8s()),
         );
         let operation = Operation::LedgerTransfer {
             id,
@@ -722,14 +711,14 @@ impl FuzzGenerator {
         let id = self.next_op_id;
         let source = self.state.random_staked_neuron(&mut self.rng)?;
         let destination = self.state.random_account(&mut self.rng)?;
-        if source.balance.get_e8s() < TRANSACTION_FEE.get_e8s() {
+        if source.balance.get_e8s() < DEFAULT_TRANSFER_FEE.get_e8s() {
             return None;
         }
         let amount = match self.rng.gen_bool(1.0 / 2.0) {
-            true => Some(Tokens::from_e8s(
-                self.rng
-                    .gen_range(0, source.balance.get_e8s() - TRANSACTION_FEE.get_e8s()),
-            )),
+            true => Some(Tokens::from_e8s(self.rng.gen_range(
+                0,
+                source.balance.get_e8s() - DEFAULT_TRANSFER_FEE.get_e8s(),
+            ))),
             false => None,
         };
         let operation = Operation::NeuronDisburse {
@@ -981,14 +970,14 @@ impl LocalNnsFuzzDriver {
         fn dfs(
             key: u64,
             adj: &BTreeMap<u64, BTreeSet<u64>>,
-            mut visited: &mut BTreeSet<u64>,
-            mut component: &mut BTreeSet<u64>,
+            visited: &mut BTreeSet<u64>,
+            component: &mut BTreeSet<u64>,
         ) {
             visited.insert(key);
             component.insert(key);
             for value in adj.get(&key).unwrap() {
                 if !visited.contains(value) {
-                    dfs(*value, adj, &mut visited, &mut component);
+                    dfs(*value, adj, visited, component);
                 }
             }
         }
@@ -1042,7 +1031,7 @@ impl LocalNnsFuzzDriver {
                 SendArgs {
                     memo: Memo(0),
                     amount,
-                    fee: TRANSACTION_FEE,
+                    fee: DEFAULT_TRANSFER_FEE,
                     from_subaccount: source.subaccount,
                     to: destination.clone().into(),
                     created_at_time: None,
@@ -1071,7 +1060,7 @@ impl LocalNnsFuzzDriver {
                 SendArgs {
                     memo: Memo(destination.nonce),
                     amount,
-                    fee: TRANSACTION_FEE,
+                    fee: DEFAULT_TRANSFER_FEE,
                     from_subaccount: source.subaccount,
                     to: AccountIdentifier::new(
                         PrincipalId::from(GOVERNANCE_CANISTER_ID),
@@ -1098,7 +1087,7 @@ impl LocalNnsFuzzDriver {
                 protobuf,
                 NotifyCanisterArgs {
                     block_height: result.unwrap(),
-                    max_fee: TRANSACTION_FEE,
+                    max_fee: DEFAULT_TRANSFER_FEE,
                     from_subaccount: source.subaccount,
                     to_canister: GOVERNANCE_CANISTER_ID,
                     to_subaccount: Some(destination.subaccount()),
@@ -1343,14 +1332,11 @@ impl FuzzDriver for LocalNnsFuzzDriver {
                         .insert(neuron.id_in_governance.unwrap(), neuron.clone().into());
                 }
 
-                let ledger_init_args = LedgerCanisterInitPayload::new(
-                    GOVERNANCE_CANISTER_ID.into(),
-                    ledger_init_state,
-                    None,
-                    None,
-                    None,
-                    HashSet::new(),
-                );
+                let ledger_init_args = LedgerCanisterInitPayload::builder()
+                    .minting_account(GOVERNANCE_CANISTER_ID.into())
+                    .initial_values(ledger_init_state)
+                    .build()
+                    .unwrap();
 
                 let nns_init_payload = NnsInitPayloadsBuilder::new()
                     .with_governance_proto(governance)

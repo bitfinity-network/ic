@@ -1,5 +1,6 @@
 use criterion::{black_box, BatchSize, BenchmarkId, Criterion};
 use criterion_time::ProcessTime;
+use ic_base_types::NumBytes;
 use ic_canonical_state::{
     hash_tree::{crypto_hash_lazy_tree, hash_lazy_tree},
     lazy_tree::LazyTree,
@@ -72,10 +73,8 @@ fn bench_traversal(c: &mut Criterion<ProcessTime>) {
     let time = mock_time();
 
     for i in 1..NUM_STATUSES {
-        use ic_types::{
-            ingress::{IngressStatus::*, WasmResult::*},
-            user_error::{ErrorCode, UserError},
-        };
+        use ic_error_types::{ErrorCode, UserError};
+        use ic_types::ingress::{IngressStatus::*, WasmResult::*};
 
         let status = match i % 6 {
             0 => Received {
@@ -109,7 +108,7 @@ fn bench_traversal(c: &mut Criterion<ProcessTime>) {
             5 => Unknown,
             _ => unreachable!(),
         };
-        state.set_ingress_status(message_test_id(i), status);
+        state.set_ingress_status(message_test_id(i), status, NumBytes::from(u64::MAX));
     }
 
     assert_eq!(

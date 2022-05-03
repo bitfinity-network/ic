@@ -1,5 +1,4 @@
 use bit_vec::BitVec;
-use ic_config::embedders::PersistenceType;
 use ic_logger::{debug, ReplicaLogger};
 use ic_replicated_state::{
     page_map::{FileDescriptor, MemoryRegion},
@@ -192,26 +191,26 @@ impl PageBitmap {
 }
 
 pub struct SigsegvMemoryTracker {
-    persistence_type: PersistenceType,
     memory_area: MemoryArea,
     accessed_bitmap: RefCell<PageBitmap>,
     dirty_bitmap: RefCell<PageBitmap>,
     dirty_pages: RefCell<Vec<PageIndex>>,
     speculatively_dirty_pages: RefCell<Vec<PageIndex>>,
     dirty_page_tracking: DirtyPageTracking,
-    page_map: Option<PageMap>,
+    page_map: PageMap,
     use_new_signal_handler: bool,
+    #[cfg(feature = "sigsegv_handler_checksum")]
+    checksum: RefCell<checksum::SigsegChecksum>,
 }
 
 impl SigsegvMemoryTracker {
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn new(
-        persistence_type: PersistenceType,
         addr: *mut libc::c_void,
         size: usize,
         log: ReplicaLogger,
         dirty_page_tracking: DirtyPageTracking,
-        page_map: Option<PageMap>,
+        page_map: PageMap,
     ) -> nix::Result<Self> {
         assert_eq!(ic_sys::sysconf_page_size(), PAGE_SIZE);
         let num_pages = size / PAGE_SIZE;
@@ -227,7 +226,6 @@ impl SigsegvMemoryTracker {
         let speculatively_dirty_pages = RefCell::new(Vec::new());
         let use_new_signal_handler = new_signal_handler_available();
         let tracker = SigsegvMemoryTracker {
-            persistence_type,
             memory_area,
             accessed_bitmap,
             dirty_bitmap,
@@ -236,45 +234,40 @@ impl SigsegvMemoryTracker {
             dirty_page_tracking,
             page_map,
             use_new_signal_handler,
+            #[cfg(feature = "sigsegv_handler_checksum")]
+            checksum: RefCell::new(checksum::SigsegChecksum::default()),
         };
 
         // Map the memory and make the range inaccessible to track it with SIGSEGV.
-        match tracker.persistence_type {
-            PersistenceType::Sigsegv => match (&tracker.page_map, tracker.use_new_signal_handler) {
-                (Some(page_map), true) => match page_map.get_checkpoint_memory_region() {
-                    MemoryRegion::BackedByFile(page_map_range, FileDescriptor { fd }) => {
-                        // Pages outside `mmap_range` will be automatically initialized to zeros
-                        // because of the mapping set up by `MmapMemoryCreator`. This is exactly
-                        // what we need for Wasm `memory.grow()`.
-                        let mmap_range = range_intersection(&tracker.page_range(), &page_map_range);
-                        // The checkpoint page range must be a subset of the Wasm memory page range.
-                        assert_eq!(mmap_range, page_map_range);
-                        let start_addr = tracker.page_start_addr_from(mmap_range.start);
-                        let start_offset_in_file = mmap_range.start.get() as usize * PAGE_SIZE;
-                        let actual_addr = unsafe {
-                            mmap(
-                                start_addr,
-                                range_size_in_bytes(&mmap_range),
-                                ProtFlags::PROT_NONE,
-                                MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED,
-                                fd,
-                                start_offset_in_file as i64,
-                            )?
-                        };
-                        assert_eq!(actual_addr, start_addr, "mmap ignored MAP_FIXED");
-                    }
-                    MemoryRegion::BackedByPage(_) | MemoryRegion::Zeros(_) => {
-                        unsafe { mprotect(addr, size, ProtFlags::PROT_NONE)? };
-                    }
-                },
-                (None, true) => {
-                    unreachable!("The new signal handler requires PageMap");
+        if tracker.use_new_signal_handler {
+            match tracker.page_map.get_checkpoint_memory_region() {
+                MemoryRegion::BackedByFile(page_map_range, FileDescriptor { fd }) => {
+                    // Pages outside `mmap_range` will be automatically initialized to zeros
+                    // because of the mapping set up by `MmapMemoryCreator`. This is exactly
+                    // what we need for Wasm `memory.grow()`.
+                    let mmap_range = range_intersection(&tracker.page_range(), &page_map_range);
+                    // The checkpoint page range must be a subset of the Wasm memory page range.
+                    assert_eq!(mmap_range, page_map_range);
+                    let start_addr = tracker.page_start_addr_from(mmap_range.start);
+                    let start_offset_in_file = mmap_range.start.get() as usize * PAGE_SIZE;
+                    let actual_addr = unsafe {
+                        mmap(
+                            start_addr,
+                            range_size_in_bytes(&mmap_range),
+                            ProtFlags::PROT_NONE,
+                            MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED,
+                            fd,
+                            start_offset_in_file as i64,
+                        )?
+                    };
+                    assert_eq!(actual_addr, start_addr, "mmap ignored MAP_FIXED");
                 }
-                (_, false) => unsafe { mprotect(addr, size, ProtFlags::PROT_NONE)? },
-            },
-            PersistenceType::Pagemap => {
-                unsafe { mprotect(addr, size, ProtFlags::PROT_NONE)? };
+                MemoryRegion::BackedByPage(_) | MemoryRegion::Zeros(_) => {
+                    unsafe { mprotect(addr, size, ProtFlags::PROT_NONE)? };
+                }
             }
+        } else {
+            unsafe { mprotect(addr, size, ProtFlags::PROT_NONE)? }
         }
 
         Ok(tracker)
@@ -285,19 +278,10 @@ impl SigsegvMemoryTracker {
         access_kind: Option<AccessKind>,
         fault_address: *mut libc::c_void,
     ) -> bool {
-        match self.persistence_type {
-            PersistenceType::Sigsegv => match (&self.page_map, self.use_new_signal_handler) {
-                (Some(page_map), true) => {
-                    sigsegv_fault_handler_new(self, page_map, access_kind.unwrap(), fault_address)
-                }
-                (None, true) => {
-                    unreachable!("The new signal handler requires PageMap")
-                }
-                (_, false) => sigsegv_fault_handler_old(self, &self.page_map, fault_address),
-            },
-            PersistenceType::Pagemap => {
-                sigsegv_fault_handler_old(self, &self.page_map, fault_address)
-            }
+        if self.use_new_signal_handler {
+            sigsegv_fault_handler_new(self, &self.page_map, access_kind.unwrap(), fault_address)
+        } else {
+            sigsegv_fault_handler_old(self, &self.page_map, fault_address)
         }
     }
 
@@ -321,16 +305,11 @@ impl SigsegvMemoryTracker {
     }
 
     pub fn validate_speculatively_dirty_page(&self, page_index: PageIndex) -> Option<PageIndex> {
-        match self.page_map.as_ref() {
-            None => Some(page_index),
-            Some(page_map) => {
-                let maybe_dirty_page = self.page_start_addr_from(page_index);
-                let original_page = page_map.get_page(page_index).as_ptr() as *const libc::c_void;
-                match unsafe { libc::memcmp(maybe_dirty_page, original_page, PAGE_SIZE) } {
-                    0 => None,
-                    _ => Some(page_index),
-                }
-            }
+        let maybe_dirty_page = self.page_start_addr_from(page_index);
+        let original_page = self.page_map.get_page(page_index).as_ptr() as *const libc::c_void;
+        match unsafe { libc::memcmp(maybe_dirty_page, original_page, PAGE_SIZE) } {
+            0 => None,
+            _ => Some(page_index),
         }
     }
 
@@ -373,17 +352,12 @@ impl SigsegvMemoryTracker {
     }
 }
 
-/// This is the old (unoptimized) signal handler. We keep it for two reasons:
-/// 1) It is needed for `CowMemoryManager`.
-/// 2) If we discover a bug in the new signal handler, we can quickly revert to
-///    the old implementation.
-/// It is not possible to use a logger from within the signal handler. Hence,
-/// for debugging, we use an ordinary `eprintln!` hidden behind a feature gate.
-/// To enable:
-/// ic-execution-environment = { ..., features = [ "sigsegv_handler_debug" ] }
+/// This is the old (unoptimized) signal handler. We keep it for use on MacOS
+/// where the new signal handler doesn't work because the [`AcessKind`] is not
+/// available.
 pub fn sigsegv_fault_handler_old(
     tracker: &SigsegvMemoryTracker,
-    page_map: &Option<PageMap>,
+    page_map: &PageMap,
     fault_address: *mut libc::c_void,
 ) -> bool {
     // We need to handle page faults in units of pages(!). So, round faulting
@@ -392,26 +366,17 @@ pub fn sigsegv_fault_handler_old(
 
     let page_num = (fault_address_page_boundary - tracker.memory_area.addr()) / PAGE_SIZE;
 
-    #[cfg(feature = "sigsegv_handler_debug")]
-    eprintln!(
-        "> Thread: {:?} sigsegv_fault_handler: base_addr = 0x{:x}, page_size = 0x{:x}, fault_address = 0x{:x}, fault_address_page_boundary = 0x{:x}, page = {}",
-        std::thread::current().id(),
-        tracker.memory_area.addr() as u64,
-        PAGE_SIZE,
-        fault_address as u64,
-        fault_address_page_boundary,
-        page_num
-    );
-
     // Ensure `fault_address` falls within tracked memory area
     if !tracker.memory_area.is_within(fault_address) {
-        #[cfg(feature = "sigsegv_handler_debug")]
-        eprintln!(
-            "fault address {:?} outside of tracked memory area",
-            fault_address
-        );
         return false;
     };
+
+    #[cfg(feature = "sigsegv_handler_checksum")]
+    tracker.checksum.borrow_mut().record_access(
+        tracker.memory_area.addr(),
+        fault_address,
+        AccessKind::Read, // We don't have the access kind, so default to read.
+    );
 
     #[allow(clippy::branches_sharing_code)]
     if tracker
@@ -421,12 +386,6 @@ pub fn sigsegv_fault_handler_old(
     {
         // This page has already been accessed, hence this fault must be for writing.
         // Upgrade its protection to read+write.
-        #[cfg(feature = "sigsegv_handler_debug")]
-        eprintln!(
-            "> sigsegv_fault_handler: page({}) is already faulted: mprotect(addr=0x{:x}, len=0x{:x}, prot=PROT_READ|PROT_WRITE)",
-            page_num,
-            fault_address_page_boundary, PAGE_SIZE
-        );
         unsafe {
             nix::sys::mman::mprotect(
                 fault_address_page_boundary as *mut libc::c_void,
@@ -444,13 +403,6 @@ pub fn sigsegv_fault_handler_old(
         // The fault could be for reading or writing.
         // Load the contents of the page and enable just reading.
         // If the fault was for writing, then another fault will occur right away.
-        #[cfg(feature = "sigsegv_handler_debug")]
-        eprintln!(
-            "> sigsegv_fault_handler: page({}) has not been faulted: mprotect(addr=0x{:x}, len=0x{:x}, prot=PROT_READ)",
-            page_num,
-            fault_address_page_boundary,
-            PAGE_SIZE
-        );
         // Temporarily allow writes to the page, to populate contents with the right
         // data
         unsafe {
@@ -464,25 +416,15 @@ pub fn sigsegv_fault_handler_old(
         // Page contents initialization is optional. For example, if the memory tracker
         // is set up for a memory area mmap-ed to a file, the contents of each
         // page will be initialized by the kernel from that file.
-        if let Some(page_map) = page_map {
-            assert_eq!(tracker.persistence_type, PersistenceType::Sigsegv);
-            let page = page_map.get_page(PageIndex::new(page_num as u64));
-            #[cfg(feature = "sigsegv_handler_debug")]
-            eprintln!(
-                "> sigsegv_fault_handler: setting page({}) contents to {}",
-                page_num,
-                show_bytes_compact(page)
-            );
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    page.as_ptr(),
-                    fault_address_page_boundary as *mut u8,
-                    PAGE_SIZE,
-                )
-            };
-        } else {
-            assert_eq!(tracker.persistence_type, PersistenceType::Pagemap);
-        }
+
+        let page = page_map.get_page(PageIndex::new(page_num as u64));
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                page.as_ptr(),
+                fault_address_page_boundary as *mut u8,
+                PAGE_SIZE,
+            )
+        };
         // Now reduce the access privileges to read-only
         unsafe {
             nix::sys::mman::mprotect(
@@ -496,7 +438,7 @@ pub fn sigsegv_fault_handler_old(
             .accessed_bitmap
             .borrow_mut()
             .mark(PageIndex::new(page_num as u64));
-    }
+    };
     true
 }
 
@@ -546,8 +488,8 @@ pub fn sigsegv_fault_handler_old(
 /// in the constructor of the memory tracker. So handler tries to mprotect `P`
 /// and a few of its subsequent pages that have the same backing memory.
 /// This optimization is referred to as prefetching in the code. Prefetching
-/// is disabled if we are tracking dirty pages and the faulting access was a
-/// write access.
+/// is done both for read and write access. In the latter case the prefetched
+/// pages are marked as speculatively dirty.
 ///
 /// The third case is handled similar to the old implementation with one
 /// important optimization: if the faulting access is a write access and the
@@ -564,6 +506,13 @@ pub fn sigsegv_fault_handler_new(
         // This memory tracker is not responsible for handling this address.
         return false;
     };
+
+    #[cfg(feature = "sigsegv_handler_checksum")]
+    tracker.checksum.borrow_mut().record_access(
+        tracker.memory_area.addr(),
+        fault_address,
+        access_kind,
+    );
 
     let faulting_page = tracker.page_index_from(fault_address);
     let mut accessed_bitmap = tracker.accessed_bitmap.borrow_mut();
@@ -781,32 +730,52 @@ fn range_count(range: &Range<PageIndex>) -> usize {
     (range.end.get() - range.start.get()) as usize
 }
 
-#[allow(dead_code)]
-#[cfg(feature = "sigsegv_handler_debug")]
-pub(crate) fn show_bytes_compact(bytes: &PageBytes) -> String {
-    let mut result = String::new();
-    let mut count = 1;
-    let mut current = None;
-    result += "[";
-    for &b in bytes.iter() {
-        match current {
-            Some(x) if x == b => {
-                count += 1;
-            }
-            Some(x) => {
-                result += &format!("{}x{:x} ", count, x);
-                count = 1;
-            }
-            None => (),
-        }
-        current = Some(b);
-    }
-    if let Some(x) = current {
-        result += &format!("{}x{:x}", count, x)
-    }
-    result += "]";
-    result
-}
-
 #[cfg(test)]
 mod tests;
+
+#[cfg(feature = "sigsegv_handler_checksum")]
+mod checksum {
+    use std::io::Write;
+
+    use crate::AccessKind;
+
+    #[derive(Default)]
+    pub(super) struct SigsegChecksum {
+        value: usize,
+        index: usize,
+    }
+
+    impl SigsegChecksum {
+        pub(super) fn record_access(
+            &mut self,
+            base_addr: usize,
+            access_addr: *const libc::c_void,
+            access_kind: AccessKind,
+        ) {
+            self.index += 1;
+            self.value += self.index
+                * (access_addr as usize - base_addr)
+                * match access_kind {
+                    AccessKind::Read => 1,
+                    AccessKind::Write => 1 << 32,
+                };
+        }
+    }
+
+    impl Drop for SigsegChecksum {
+        fn drop(&mut self) {
+            let output_file = std::env::var("CHECKSUM_FILE").unwrap();
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(output_file)
+                .unwrap();
+            writeln!(
+                file,
+                "Memory tracker completed with checksum {}",
+                self.value
+            )
+            .unwrap();
+        }
+    }
+}

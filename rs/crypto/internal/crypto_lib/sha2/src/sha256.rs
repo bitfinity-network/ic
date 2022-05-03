@@ -1,9 +1,10 @@
+use crate::Context;
+
 #[cfg(not(target_arch = "wasm32"))]
 mod openssl_sha256;
 #[cfg(target_arch = "wasm32")]
 mod rust_sha256;
 
-use crate::Context;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) use openssl_sha256::{hash, InternalSha256};
 #[cfg(target_arch = "wasm32")]

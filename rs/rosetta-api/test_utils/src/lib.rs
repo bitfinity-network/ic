@@ -2,17 +2,19 @@ use ic_rosetta_api::convert::{
     amount_, from_hex, from_model_account_identifier, from_operations, from_public_key,
     principal_id_from_public_key, signed_amount, to_hex, to_model_account_identifier,
 };
-use ic_rosetta_api::errors::ApiError;
-use ic_rosetta_api::models::Error as RosettaError;
+
 use ic_rosetta_api::models::{
-    ConstructionCombineResponse, ConstructionPayloadsRequestMetadata, ConstructionPayloadsResponse,
-    CurveType, PublicKey, Signature, SignatureType,
+    ConstructionCombineResponse, ConstructionParseResponse, ConstructionPayloadsRequestMetadata,
+    ConstructionPayloadsResponse, CurveType, OperationType, PublicKey, Signature, SignatureType,
 };
+use ic_rosetta_api::models::{ConstructionSubmitResponse, Error as RosettaError};
 use ic_rosetta_api::request_types::{
-    AddHotKey, Disburse, Request, RequestResult, SetDissolveTimestamp, Stake, StartDissolve,
-    StopDissolve, TransactionResults,
+    AddHotKey, Disburse, Follow, MergeMaturity, NeuronInfo, RemoveHotKey, Request, RequestResult,
+    SetDissolveTimestamp, Spawn, Stake, StartDissolve, StopDissolve, TransactionOperationResults,
+    TransactionResults,
 };
 use ic_rosetta_api::transaction_id::TransactionIdentifier;
+use ic_rosetta_api::{convert, errors, errors::ApiError, DEFAULT_TOKEN_SYMBOL};
 use ic_types::{messages::Blob, time, PrincipalId};
 
 use ledger_canister::{AccountIdentifier, BlockHeight, Operation, Tokens};
@@ -21,7 +23,6 @@ pub use ed25519_dalek::Keypair as EdKeypair;
 use log::debug;
 use rand::{rngs::StdRng, seq::SliceRandom, thread_rng, SeedableRng};
 use std::collections::HashMap;
-use std::convert::TryInto;
 use std::sync::Arc;
 
 pub mod rosetta_api_serv;
@@ -85,12 +86,13 @@ pub async fn prepare_multiple_txn(
     let mut all_sender_account_ids = Vec::new();
     let mut all_sender_pks = Vec::new();
     let mut trans_fee_amount = None;
+    let token_name = DEFAULT_TOKEN_SYMBOL;
 
     for request in requests {
         // first ask for the fee
         let mut fee_found = false;
-        for o in Request::requests_to_operations(&[request.request.clone()]).unwrap() {
-            if o._type == "FEE" {
+        for o in Request::requests_to_operations(&[request.request.clone()], token_name).unwrap() {
+            if o._type == OperationType::Fee {
                 fee_found = true;
             } else {
                 dry_run_ops.push(o.clone());
@@ -100,7 +102,7 @@ pub async fn prepare_multiple_txn(
 
         match request.request.clone() {
             Request::Transfer(Operation::Transfer { from, fee, .. }) => {
-                trans_fee_amount = Some(amount_(fee).unwrap());
+                trans_fee_amount = Some(amount_(fee, token_name).unwrap());
                 all_sender_account_ids.push(to_model_account_identifier(&from));
 
                 // just a sanity check
@@ -111,7 +113,12 @@ pub async fn prepare_multiple_txn(
             | Request::StopDissolve(StopDissolve { account, .. })
             | Request::SetDissolveTimestamp(SetDissolveTimestamp { account, .. })
             | Request::AddHotKey(AddHotKey { account, .. })
-            | Request::Disburse(Disburse { account, .. }) => {
+            | Request::RemoveHotKey(RemoveHotKey { account, .. })
+            | Request::Disburse(Disburse { account, .. })
+            | Request::Spawn(Spawn { account, .. })
+            | Request::MergeMaturity(MergeMaturity { account, .. })
+            | Request::NeuronInfo(NeuronInfo { account, .. })
+            | Request::Follow(Follow { account, .. }) => {
                 all_sender_account_ids.push(to_model_account_identifier(&account));
             }
             Request::Transfer(Operation::Burn { .. }) => {
@@ -150,7 +157,7 @@ pub async fn prepare_multiple_txn(
     let fee_icpts = Tokens::from_e8s(
         dry_run_suggested_fee
             .clone()
-            .unwrap_or_else(|| amount_(Tokens::default()).unwrap())
+            .unwrap_or_else(|| amount_(Tokens::default(), token_name).unwrap())
             .value
             .parse()
             .unwrap(),
@@ -158,8 +165,8 @@ pub async fn prepare_multiple_txn(
 
     if accept_suggested_fee {
         for o in &mut all_ops {
-            if o._type == "FEE" {
-                o.amount = Some(signed_amount(-(fee_icpts.get_e8s() as i128)));
+            if o._type == OperationType::Fee {
+                o.amount = Some(signed_amount(-(fee_icpts.get_e8s() as i128), token_name));
             }
         }
     } else {
@@ -252,7 +259,7 @@ pub async fn sign_txn(
                 .get(
                     &from_model_account_identifier(p.account_identifier.as_ref().unwrap()).unwrap(),
                 )
-                .map(|x| Arc::clone(x))
+                .map(Arc::clone)
                 .unwrap_or_else(|| Arc::clone(&keypairs[0]));
             let bytes = from_hex(&p.hex_bytes).unwrap();
             let signature_bytes = keypair.sign(&bytes).to_bytes();
@@ -307,6 +314,7 @@ pub async fn do_txn(
     .await
 }
 
+// the 'internal' version returning TransactionResults.
 pub async fn do_multiple_txn(
     ros: &RosettaApiHandle,
     requests: &[RequestInfo],
@@ -317,6 +325,84 @@ pub async fn do_multiple_txn(
     (
         TransactionIdentifier,
         TransactionResults,
+        Tokens, // charged fee
+    ),
+    RosettaError,
+> {
+    match do_multiple_txn_submit(
+        ros,
+        requests,
+        accept_suggested_fee,
+        ingress_end,
+        created_at_time,
+    )
+    .await
+    {
+        Ok((submit_res, charged_fee)) => {
+            let results = convert::from_transaction_operation_results(
+                submit_res.metadata,
+                DEFAULT_TOKEN_SYMBOL,
+            )
+            .expect("Couldn't convert metadata to TransactionResults");
+            if let Some(RequestResult {
+                _type: Request::Transfer(_),
+                transaction_identifier,
+                ..
+            }) = results.operations.last()
+            {
+                assert_eq!(
+                    submit_res.transaction_identifier,
+                    transaction_identifier.clone().unwrap()
+                );
+            }
+            Ok((submit_res.transaction_identifier, results, charged_fee))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+// the 'external' version returning TransactionOperationResults.
+pub async fn do_multiple_txn_external(
+    ros: &RosettaApiHandle,
+    requests: &[RequestInfo],
+    accept_suggested_fee: bool,
+    ingress_end: Option<u64>,
+    created_at_time: Option<u64>,
+) -> Result<
+    (
+        TransactionIdentifier,
+        TransactionOperationResults,
+        Tokens, // charged fee
+    ),
+    RosettaError,
+> {
+    match do_multiple_txn_submit(
+        ros,
+        requests,
+        accept_suggested_fee,
+        ingress_end,
+        created_at_time,
+    )
+    .await
+    {
+        Ok((submit_res, charged_fee)) => Ok((
+            submit_res.transaction_identifier,
+            submit_res.metadata,
+            charged_fee,
+        )),
+        Err(e) => Err(e),
+    }
+}
+
+async fn do_multiple_txn_submit(
+    ros: &RosettaApiHandle,
+    requests: &[RequestInfo],
+    accept_suggested_fee: bool,
+    ingress_end: Option<u64>,
+    created_at_time: Option<u64>,
+) -> Result<
+    (
+        ConstructionSubmitResponse,
         Tokens, // charged fee
     ),
     RosettaError,
@@ -335,9 +421,15 @@ pub async fn do_multiple_txn(
         .await
         .unwrap()?;
 
+    // Verify consistency between requests and construction parse response.
+    fn verify_operations(requests: &[RequestInfo], parse_response: ConstructionParseResponse) {
+        let rs1: Vec<_> = requests.iter().map(|r| r.request.clone()).collect();
+        let rs2 = from_operations(&parse_response.operations, false, DEFAULT_TOKEN_SYMBOL).unwrap();
+        assert_eq!(rs1, rs2, "Requests differs: {:?} vs {:?}", rs1, rs2);
+    }
+
     if !accept_suggested_fee {
-        let rs: Vec<_> = requests.iter().map(|r| r.request.clone()).collect();
-        assert_eq!(rs, from_operations(&parse_res.operations, false).unwrap());
+        verify_operations(requests, parse_res);
     }
 
     // check that we got enough unsigned messages
@@ -360,8 +452,7 @@ pub async fn do_multiple_txn(
         .unwrap()?;
 
     if !accept_suggested_fee {
-        let rs: Vec<_> = requests.iter().map(|r| r.request.clone()).collect();
-        assert_eq!(rs, from_operations(&parse_res.operations, false).unwrap());
+        verify_operations(requests, parse_res);
     }
 
     let hash_res = ros
@@ -397,21 +488,7 @@ pub async fn do_multiple_txn(
         .unwrap()?;
     assert_eq!(submit_res, submit_res3);
 
-    let results: TransactionResults = submit_res.metadata.try_into()?;
-
-    if let Some(RequestResult {
-        _type: Request::Transfer(_),
-        transaction_identifier,
-        ..
-    }) = results.operations.last()
-    {
-        assert_eq!(
-            submit_res.transaction_identifier,
-            transaction_identifier.clone().unwrap()
-        );
-    }
-
-    Ok((submit_res.transaction_identifier, results, charged_fee))
+    Ok((submit_res, charged_fee))
 }
 
 pub async fn send_icpts(
@@ -475,16 +552,18 @@ pub async fn send_icpts_with_window(
                     fee,
                 ))
             } else {
-                Err(RosettaError::from(ic_rosetta_api::errors::ApiError::from(
-                    results,
-                )))
+                Err(errors::convert_to_error(
+                    &convert::transaction_results_to_api_error(results, DEFAULT_TOKEN_SYMBOL),
+                ))
             }
         })
 }
 
 pub fn assert_ic_error(err: &RosettaError, code: u32, ic_http_status: u64, text: &str) {
-    let err = if let ApiError::OperationsErrors(results) = err.clone().into() {
-        results.error().unwrap().clone().into()
+    let err = if let ApiError::OperationsErrors(results, _) =
+        errors::convert_to_api_error(err.clone(), DEFAULT_TOKEN_SYMBOL)
+    {
+        errors::convert_to_error(&results.error().unwrap().clone())
     } else {
         err.clone()
     };
@@ -495,17 +574,24 @@ pub fn assert_ic_error(err: &RosettaError, code: u32, ic_http_status: u64, text:
         details.get("ic_http_status").unwrap().as_u64().unwrap(),
         ic_http_status
     );
-    assert!(details
-        .get("error_message")
-        .unwrap()
-        .as_str()
-        .unwrap()
-        .contains(text));
+    assert!(
+        details
+            .get("error_message")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .contains(text),
+        "Expected error message to contain '{}' but got: '{}'",
+        text,
+        details.get("error_message").unwrap().as_str().unwrap()
+    );
 }
 
 pub fn assert_canister_error(err: &RosettaError, code: u32, text: &str) {
-    let err = if let ApiError::OperationsErrors(results) = err.clone().into() {
-        results.error().unwrap().clone().into()
+    let err = if let ApiError::OperationsErrors(results, _) =
+        errors::convert_to_api_error(err.clone(), DEFAULT_TOKEN_SYMBOL)
+    {
+        errors::convert_to_error(&results.error().unwrap().clone())
     } else {
         err.clone()
     };

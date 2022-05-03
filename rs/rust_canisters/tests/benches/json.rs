@@ -12,9 +12,9 @@ fn main() {
 
             let mut group = criterion.benchmark_group("json encoding");
 
-            let proj = Project::new(env!("CARGO_MANIFEST_DIR"));
+            let proj = Project::new(std::env::var("CARGO_MANIFEST_DIR").unwrap());
 
-            let canister = proj.cargo_bin("json").install_(&r, Vec::new()).await?;
+            let canister = proj.cargo_bin("json", &[]).install_(&r, Vec::new()).await?;
 
             group.bench_function("query", |bench| {
                 bench.iter(|| async {

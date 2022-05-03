@@ -1,16 +1,13 @@
-use ic_interfaces::{
-    execution_environment::{IngressHistoryError, IngressHistoryReader, IngressHistoryWriter},
-    state_manager::StateReader,
+use ic_config::execution_environment::Config;
+use ic_error_types::{ErrorCode, RejectCode};
+use ic_interfaces::execution_environment::{
+    IngressHistoryError, IngressHistoryReader, IngressHistoryWriter,
 };
+use ic_interfaces_state_manager::{StateManagerError, StateReader};
 use ic_logger::{fatal, ReplicaLogger};
 use ic_metrics::{buckets::decimal_buckets, MetricsRegistry, Timer};
 use ic_replicated_state::ReplicatedState;
-use ic_types::{
-    ingress::IngressStatus,
-    messages::MessageId,
-    user_error::{ErrorCode, RejectCode},
-    Height, Time,
-};
+use ic_types::{ingress::IngressStatus, messages::MessageId, Height, Time};
 use prometheus::{Histogram, HistogramVec};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -46,7 +43,15 @@ impl IngressHistoryReader for IngressHistoryReaderImpl {
         &self,
         height: Height,
     ) -> Result<Box<dyn Fn(&MessageId) -> IngressStatus>, IngressHistoryError> {
-        let labeled_state = self.state_reader.get_state_at(height)?;
+        let labeled_state = self
+            .state_reader
+            .get_state_at(height)
+            .map_err(|e| match e {
+                StateManagerError::StateRemoved(h) => IngressHistoryError::StateRemoved(h),
+                StateManagerError::StateNotCommittedYet(h) => {
+                    IngressHistoryError::StateNotAvailableYet(h)
+                }
+            })?;
         let history = labeled_state.take().get_ingress_history();
         Ok(Box::new(move |message_id| {
             history
@@ -69,6 +74,7 @@ struct TransitionStartTime {
 /// Struct that implements the ingress history writer trait. Consumers of this
 /// trait can use this to update the ingress history.
 pub struct IngressHistoryWriterImpl {
+    config: Config,
     log: ReplicaLogger,
     // Wrapped in a RwLock for interior mutability, otherwise &self in methods
     // has to be &mut self.
@@ -80,8 +86,9 @@ pub struct IngressHistoryWriterImpl {
 }
 
 impl IngressHistoryWriterImpl {
-    pub fn new(log: ReplicaLogger, metrics_registry: &MetricsRegistry) -> Self {
+    pub fn new(config: Config, log: ReplicaLogger, metrics_registry: &MetricsRegistry) -> Self {
         Self {
+            config,
             log,
             received_time: RwLock::new(HashMap::new()),
             message_state_transition_completed_ic_duration_seconds: metrics_registry.histogram(
@@ -191,7 +198,11 @@ impl IngressHistoryWriter for IngressHistoryWriterImpl {
             _ => {}
         };
 
-        state.set_ingress_status(message_id, status);
+        state.set_ingress_status(
+            message_id,
+            status,
+            self.config.ingress_history_memory_capacity,
+        );
     }
 }
 
@@ -254,8 +265,11 @@ fn dashboard_label_value_from(code: ErrorCode) -> &'static str {
         InvalidManagementPayload => "Invalid management message payload",
         InsufficientCyclesInCall => "Canister tried to keep more cycles than available in the call",
         CanisterWasmEngineError => "Wasm engine error",
-        CanisterCyclesLimitExceeded => {
-            "Canister Cycles Limit for Single Message Execution Exceeded"
+        CanisterInstructionLimitExceeded => {
+            "Canister exceeded the instruction limit for single message execution"
+        }
+        CanisterInstallCodeRateLimited => {
+            "Canister is rate limited because it executed too many instructions in the previous install_code messages"
         }
     }
 }

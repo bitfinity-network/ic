@@ -2,8 +2,10 @@ use dfn_candid::candid_one;
 use dfn_protobuf::protobuf;
 use ic_canister_client::Sender;
 use ic_crypto_sha::Sha256;
+use ic_nervous_system_common_test_keys::{
+    TEST_NEURON_1_OWNER_KEYPAIR, TEST_NEURON_1_OWNER_PRINCIPAL,
+};
 use ic_nns_common::{pb::v1::NeuronId, types::ProposalId};
-use ic_nns_constants::ids::{TEST_NEURON_1_OWNER_KEYPAIR, TEST_NEURON_1_OWNER_PRINCIPAL};
 use ic_nns_governance::pb::v1::{
     add_or_remove_node_provider::Change,
     manage_neuron::{Command, NeuronIdOrSubaccount},

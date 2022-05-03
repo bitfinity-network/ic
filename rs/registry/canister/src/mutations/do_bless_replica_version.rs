@@ -7,6 +7,7 @@ use crate::{
 use candid::{CandidType, Deserialize};
 #[cfg(target_arch = "wasm32")]
 use dfn_core::println;
+use serde::Serialize;
 
 use ic_protobuf::registry::replica_version::v1::{BlessedReplicaVersions, ReplicaVersionRecord};
 use ic_registry_keys::{make_blessed_replica_version_key, make_replica_version_key};
@@ -52,10 +53,6 @@ impl Registry {
                     .as_bytes()
                     .to_vec(),
                 value: encode_or_panic(&ReplicaVersionRecord {
-                    binary_url: payload.binary_url.clone(),
-                    sha256_hex: payload.sha256_hex.clone(),
-                    node_manager_binary_url: payload.node_manager_binary_url.clone(),
-                    node_manager_sha256_hex: payload.node_manager_sha256_hex.clone(),
                     release_package_url: payload.release_package_url.clone(),
                     release_package_sha256_hex: payload.release_package_sha256_hex,
                 }),
@@ -79,11 +76,10 @@ impl Registry {
 ///
 /// To decouple proposal payload and registry content, this does not directly
 /// import any part of the registry schema. However it is required that, from a
-/// BlessingProposalPayload, it is possible to construct a ReplicaVersionRecord
-/// from a BlessingProposalPayload.
+/// BlessReplicaVersionPayload, it is possible to construct a ReplicaVersionRecord.
 ///
 /// See /rs/protobuf/def/registry/replica_version/v1/replica_version.proto
-#[derive(CandidType, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct BlessReplicaVersionPayload {
     /// Version ID. This can be anything, it has not semantics. The reason it is
     /// part of the payload is that it will be needed in the subsequent step
@@ -92,17 +88,21 @@ pub struct BlessReplicaVersionPayload {
 
     /// The URL against which a HTTP GET request will return a replica binary
     /// that corresponds to this version
+    /// DEPRECATED: Not used, kept only for compatibility.
     pub binary_url: String,
 
     /// The hex-formatted SHA-256 hash of the binary served by 'binary_url'
+    /// DEPRECATED: Not used, kept only for compatibility.
     pub sha256_hex: String,
 
     /// The URL against which a HTTP GET request will return a node manager
     /// binary that corresponds to this version
+    /// DEPRECATED: Not used, kept only for compatibility.
     pub node_manager_binary_url: String,
 
     /// The hex-formatted SHA-256 hash of the binary served by
     /// 'node_manager_binary_url'
+    /// DEPRECATED: Not used, kept only for compatibility.
     pub node_manager_sha256_hex: String,
 
     /// The URL against which a HTTP GET request will return a release package
@@ -112,8 +112,4 @@ pub struct BlessReplicaVersionPayload {
     /// The hex-formatted SHA-256 hash of the archive file served by
     /// 'release_package_url'
     pub release_package_sha256_hex: String,
-}
-
-pub fn blessed_versions_to_string(blessed: &BlessedReplicaVersions) -> String {
-    format!("[{}]", blessed.blessed_version_ids.join(", "))
 }

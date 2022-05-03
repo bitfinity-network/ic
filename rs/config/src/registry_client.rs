@@ -3,23 +3,15 @@ use std::path::PathBuf;
 use url::Url;
 
 /// Eventually, the replica will only read registry data from the local store
-/// and the node manager will both read from and write to the registry local
+/// and the orchestrator will both read from and write to the registry local
 /// store.
 ///
 /// I.e. all data provider variants except for the variant `LocalStore` are
 /// considered deprecated.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
     #[serde(flatten)]
     pub data_provider: Option<DataProviderConfig>,
-}
-
-impl std::default::Default for Config {
-    fn default() -> Self {
-        Self {
-            data_provider: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

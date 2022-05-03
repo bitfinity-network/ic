@@ -1,0 +1,13 @@
+# This has only one purpose (for the time being): To test the expose_build_metadata! macro.
+# This also serves as the most bare-bones example application of that macro.
+
+[package]
+name = "ic-nervous-system-common-test-canister"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+candid = "0.7.4"
+dfn_candid = { path = "../../../rust_canisters/dfn_candid" }
+dfn_core = { path = "../../../rust_canisters/dfn_core" }
+ic-nervous-system-common = { path = ".." }

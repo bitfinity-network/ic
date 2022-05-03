@@ -8,8 +8,11 @@
 //! (and ideally forwards) compatibility with one or more preceeding
 //! protocol versions.
 
-use crate::{encoding::*, CURRENT_CERTIFICATION_VERSION};
+use crate::{
+    all_supported_versions, encoding::*, CertificationVersion, CURRENT_CERTIFICATION_VERSION,
+};
 use assert_matches::assert_matches;
+use ic_error_types::RejectCode;
 use ic_registry_subnet_type::SubnetType;
 use ic_replicated_state::metadata_state::SystemMetadata;
 use ic_test_utilities::types::{
@@ -19,19 +22,11 @@ use ic_test_utilities::types::{
 use ic_types::{
     crypto::CryptoHash,
     messages::{CallbackId, Payload, RejectContext, Request, RequestOrResponse, Response},
-    user_error::RejectCode,
     xnet::StreamHeader,
     CryptoHashOfPartialState, Cycles, Funds,
 };
-use serde::{Deserialize, Serialize};
 use serde_cbor::value::Value;
-use std::collections::BTreeMap;
-
-/// Added subnet to canister ID ranges routing tables.
-const CERTIFICATION_VERSION_3: u32 = 3;
-/// Added optional `Request::cycles_payment` and `Response::cycles_refund`
-/// fields that are not yet populated.
-const CERTIFICATION_VERSION_4: u32 = 4;
+use std::collections::{BTreeMap, VecDeque};
 
 //
 // Tests for exact binary encoding
@@ -44,6 +39,7 @@ const CERTIFICATION_VERSION_4: u32 = 4;
 ///     begin: 23.into(),
 ///     end: 25.into(),
 ///     signals_end: 256.into(),
+///     reject_signals: VecDeque::new(),
 /// }
 /// ```
 ///
@@ -60,16 +56,62 @@ const CERTIFICATION_VERSION_4: u32 = 4;
 /// ```
 #[test]
 fn canonical_encoding_stream_header() {
-    for certification_version in 0..=CURRENT_CERTIFICATION_VERSION {
+    for certification_version in all_supported_versions() {
         let header = StreamHeader {
             begin: 23.into(),
             end: 25.into(),
             signals_end: 256.into(),
+            reject_signals: VecDeque::new(),
         };
 
         assert_eq!(
             "A3 00 17 01 18 19 02 19 01 00",
             as_hex(&encode_stream_header(&header, certification_version,))
+        );
+    }
+}
+
+/// Canonical CBOR encoding (with certification versions 8 and up) of:
+///
+/// ```no_run
+/// StreamHeader {
+///     begin: 23.into(),
+///     end: 25.into(),
+///     signals_end: 256.into(),
+///     reject_signals: vec![249.into(), 250.into(), 252.into()].into(),
+/// }
+/// ```
+///
+/// Expected:
+///
+/// ```text
+/// A4         # map(4)
+///    00      # field_index(StreamHeader::begin)
+///    17      # unsigned(23)
+///    01      # field_index(StreamHeader::end)
+///    18 19   # unsigned(25)
+///    02      # field_index(StreamHeader::signals_end)
+///    19 0100 # unsigned(256)
+///    03      # field_index(StreamHeader::reject_signals)
+///    83      # array(3)
+///       01   # unsigned(1)
+///       02   # unsigned(2)
+///       04   # unsigned(4)
+/// ```
+#[test]
+fn canonical_encoding_stream_header_v8_plus() {
+    for certification_version in all_supported_versions().filter(|v| v >= &CertificationVersion::V8)
+    {
+        let header = StreamHeader {
+            begin: 23.into(),
+            end: 25.into(),
+            signals_end: 256.into(),
+            reject_signals: vec![249.into(), 250.into(), 252.into()].into(),
+        };
+
+        assert_eq!(
+            "A4 00 17 01 18 19 02 19 01 00 03 83 01 02 04",
+            as_hex(&encode_stream_header(&header, certification_version))
         );
     }
 }
@@ -426,7 +468,7 @@ fn canonical_encoding_system_metadata() {
 #[test]
 #[should_panic(expected = "expected field index 0 <= i < 2")]
 fn invalid_message_extra_field() {
-    for certification_version in 0..=CURRENT_CERTIFICATION_VERSION {
+    for certification_version in all_supported_versions() {
         let bytes = types::RequestOrResponse::encode_with_extra_field((
             &request_message(),
             certification_version,
@@ -442,7 +484,7 @@ fn invalid_message_extra_field() {
     expected = "RequestOrResponse: expected exactly one of `request` or `response` to be `Some(_)`, got `RequestOrResponse { request: None, response: None }`"
 )]
 fn invalid_message_empty() {
-    for certification_version in 0..=CURRENT_CERTIFICATION_VERSION {
+    for certification_version in all_supported_versions() {
         let bytes = types::RequestOrResponse::encode_without_field(
             (&request_message(), certification_version),
             0,
@@ -453,72 +495,13 @@ fn invalid_message_empty() {
     }
 }
 
-// Copy of `types::Request` before adding `cycles_payment`.
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RequestV3 {
-    #[serde(with = "serde_bytes")]
-    pub receiver: types::Bytes,
-    #[serde(with = "serde_bytes")]
-    pub sender: types::Bytes,
-    pub sender_reply_callback: u64,
-    pub payment: types::Funds,
-    pub method_name: String,
-    #[serde(with = "serde_bytes")]
-    pub method_payload: types::Bytes,
-}
-
-impl From<(&ic_types::messages::Request, u32)> for RequestV3 {
-    fn from((request, certification_version): (&ic_types::messages::Request, u32)) -> Self {
-        let funds = types::Funds {
-            cycles: (&request.payment, certification_version).into(),
-            icp: 0,
-        };
-        Self {
-            receiver: request.receiver.get().to_vec(),
-            sender: request.sender.get().to_vec(),
-            sender_reply_callback: request.sender_reply_callback.get(),
-            payment: funds,
-            method_name: request.method_name.clone(),
-            method_payload: request.method_payload.clone(),
-        }
-    }
-}
-
-// Copy of `types::RequestOrResponse` with V3 types.
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RequestOrResponseV3 {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub request: Option<RequestV3>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub response: Option<ResponseV3>,
-}
-
-impl From<(&ic_types::messages::RequestOrResponse, u32)> for RequestOrResponseV3 {
-    fn from(
-        (message, certification_version): (&ic_types::messages::RequestOrResponse, u32),
-    ) -> Self {
-        match message {
-            RequestOrResponse::Request(req) => RequestOrResponseV3 {
-                request: Some(RequestV3::from((req, certification_version))),
-                response: None,
-            },
-            RequestOrResponse::Response(resp) => RequestOrResponseV3 {
-                request: None,
-                response: Some(ResponseV3::from((resp, certification_version))),
-            },
-        }
-    }
-}
-
 //
 // `Request` decoding
 //
 
 #[test]
 fn valid_request() {
-    for certification_version in 0..=CURRENT_CERTIFICATION_VERSION {
+    for certification_version in all_supported_versions() {
         let request = request();
         let bytes = types::Request::proxy_encode((&request, certification_version)).unwrap();
 
@@ -527,59 +510,24 @@ fn valid_request() {
 }
 
 #[test]
-fn encoding_request_for_certification_3_and_4_is_the_same() {
-    let request = RequestOrResponse::Request(
-        RequestBuilder::new()
-            .receiver(canister_test_id(1))
-            .sender(canister_test_id(2))
-            .sender_reply_callback(CallbackId::from(3))
-            .payment(Cycles::new(10))
-            .method_name("test".to_string())
-            .method_payload(vec![6])
-            .build(),
-    );
-
-    let v3_encoded_request_with_v3_type =
-        RequestOrResponseV3::proxy_encode((&request, CERTIFICATION_VERSION_3)).unwrap();
-    let v3_encoded_request = encode_message(&request, CERTIFICATION_VERSION_3);
-    let v4_encoded_request = encode_message(&request, CERTIFICATION_VERSION_4);
-
-    assert_eq!(v3_encoded_request_with_v3_type, v3_encoded_request);
-    assert_eq!(v3_encoded_request, v4_encoded_request);
-}
-
-#[test]
 fn invalid_request_extra_field() {
-    for certification_version in 0..=CURRENT_CERTIFICATION_VERSION {
-        if certification_version <= CERTIFICATION_VERSION_3 {
-            let bytes =
-                RequestV3::encode_with_extra_field((&request(), certification_version)).unwrap();
+    for certification_version in all_supported_versions() {
+        let bytes =
+            types::Request::encode_with_extra_field((&request(), certification_version)).unwrap();
 
-            let res: Result<RequestV3, ProxyDecodeError> = RequestV3::proxy_decode(&bytes);
-            assert_matches!(
-                res,
-                Err(ProxyDecodeError::CborDecodeError(err))
-                    if err.to_string().contains("expected field index 0 <= i < 6")
-            );
-        } else {
-            let bytes =
-                types::Request::encode_with_extra_field((&request(), certification_version))
-                    .unwrap();
-
-            let res: Result<Request, ProxyDecodeError> = types::Request::proxy_decode(&bytes);
-            assert_matches!(
-                res,
-                Err(ProxyDecodeError::CborDecodeError(err))
-                    if err.to_string().contains("expected field index 0 <= i < 7")
-            );
-        }
+        let res: Result<Request, ProxyDecodeError> = types::Request::proxy_decode(&bytes);
+        assert_matches!(
+            res,
+            Err(ProxyDecodeError::CborDecodeError(err))
+                if err.to_string().contains("expected field index 0 <= i < 7")
+        );
     }
 }
 
 #[test]
 #[should_panic(expected = "missing field `receiver`")]
 fn invalid_request_missing_receiver() {
-    for certification_version in 0..=CURRENT_CERTIFICATION_VERSION {
+    for certification_version in all_supported_versions() {
         let bytes =
             types::Request::encode_without_field((&request(), certification_version), 0).unwrap();
 
@@ -590,7 +538,7 @@ fn invalid_request_missing_receiver() {
 #[test]
 #[should_panic(expected = "missing field `sender`")]
 fn invalid_request_missing_sender() {
-    for certification_version in 0..=CURRENT_CERTIFICATION_VERSION {
+    for certification_version in all_supported_versions() {
         let bytes =
             types::Request::encode_without_field((&request(), certification_version), 1).unwrap();
 
@@ -601,7 +549,7 @@ fn invalid_request_missing_sender() {
 #[test]
 #[should_panic(expected = "missing field `sender_reply_callback`")]
 fn invalid_request_missing_sender_reply_callback() {
-    for certification_version in 0..=CURRENT_CERTIFICATION_VERSION {
+    for certification_version in all_supported_versions() {
         let bytes =
             types::Request::encode_without_field((&request(), certification_version), 2).unwrap();
 
@@ -612,7 +560,7 @@ fn invalid_request_missing_sender_reply_callback() {
 #[test]
 #[should_panic(expected = "missing field `payment`")]
 fn invalid_request_missing_payment() {
-    for certification_version in 0..=CURRENT_CERTIFICATION_VERSION {
+    for certification_version in all_supported_versions() {
         let bytes =
             types::Request::encode_without_field((&request(), certification_version), 3).unwrap();
 
@@ -623,7 +571,7 @@ fn invalid_request_missing_payment() {
 #[test]
 #[should_panic(expected = "missing field `method_name`")]
 fn invalid_request_missing_method_name() {
-    for certification_version in 0..=CURRENT_CERTIFICATION_VERSION {
+    for certification_version in all_supported_versions() {
         let bytes =
             types::Request::encode_without_field((&request(), certification_version), 4).unwrap();
 
@@ -634,40 +582,11 @@ fn invalid_request_missing_method_name() {
 #[test]
 #[should_panic(expected = "missing field `method_payload`")]
 fn invalid_request_missing_method_payload() {
-    for certification_version in 0..=CURRENT_CERTIFICATION_VERSION {
+    for certification_version in all_supported_versions() {
         let bytes =
             types::Request::encode_without_field((&request(), certification_version), 5).unwrap();
 
         let _: Request = types::Request::proxy_decode(&bytes).unwrap();
-    }
-}
-
-// Copy of `types::Response` before adding `cycles_refund`.
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ResponseV3 {
-    #[serde(with = "serde_bytes")]
-    pub originator: types::Bytes,
-    #[serde(with = "serde_bytes")]
-    pub respondent: types::Bytes,
-    pub originator_reply_callback: u64,
-    pub refund: types::Funds,
-    pub response_payload: types::Payload,
-}
-
-impl From<(&ic_types::messages::Response, u32)> for ResponseV3 {
-    fn from((response, certification_version): (&ic_types::messages::Response, u32)) -> Self {
-        let funds = types::Funds {
-            cycles: (&response.refund, certification_version).into(),
-            icp: 0,
-        };
-        Self {
-            originator: response.originator.get().to_vec(),
-            respondent: response.respondent.get().to_vec(),
-            originator_reply_callback: response.originator_reply_callback.get(),
-            refund: funds,
-            response_payload: (&response.response_payload, certification_version).into(),
-        }
     }
 }
 
@@ -677,7 +596,7 @@ impl From<(&ic_types::messages::Response, u32)> for ResponseV3 {
 
 #[test]
 fn valid_response() {
-    for certification_version in 0..=CURRENT_CERTIFICATION_VERSION {
+    for certification_version in all_supported_versions() {
         let response = response();
         let bytes = types::Response::proxy_encode((&response, certification_version)).unwrap();
 
@@ -686,58 +605,24 @@ fn valid_response() {
 }
 
 #[test]
-fn encoding_response_for_certification_3_and_4_is_the_same() {
-    let response = RequestOrResponse::Response(
-        ResponseBuilder::new()
-            .originator(canister_test_id(5))
-            .respondent(canister_test_id(4))
-            .originator_reply_callback(CallbackId::from(3))
-            .refund(Cycles::new(10))
-            .response_payload(Payload::Data(vec![1]))
-            .build(),
-    );
-
-    let v3_encoded_response_with_v3_type =
-        RequestOrResponseV3::proxy_encode((&response, CERTIFICATION_VERSION_3)).unwrap();
-    let v3_encoded_response = encode_message(&response, CERTIFICATION_VERSION_3);
-    let v4_encoded_response = encode_message(&response, CERTIFICATION_VERSION_4);
-
-    assert_eq!(v3_encoded_response_with_v3_type, v3_encoded_response);
-    assert_eq!(v3_encoded_response, v4_encoded_response);
-}
-
-#[test]
 fn invalid_response_extra_field() {
-    for certification_version in 0..=CURRENT_CERTIFICATION_VERSION {
-        if certification_version <= CERTIFICATION_VERSION_3 {
-            let bytes =
-                ResponseV3::encode_with_extra_field((&response(), certification_version)).unwrap();
+    for certification_version in all_supported_versions() {
+        let bytes =
+            types::Response::encode_with_extra_field((&response(), certification_version)).unwrap();
 
-            let res: Result<ResponseV3, ProxyDecodeError> = ResponseV3::proxy_decode(&bytes);
-            assert_matches!(
-                res,
-                Err(ProxyDecodeError::CborDecodeError(err))
-                    if err.to_string().contains("expected field index 0 <= i < 5")
-            );
-        } else {
-            let bytes =
-                types::Response::encode_with_extra_field((&response(), certification_version))
-                    .unwrap();
-
-            let res: Result<Response, ProxyDecodeError> = types::Response::proxy_decode(&bytes);
-            assert_matches!(
-                res,
-                Err(ProxyDecodeError::CborDecodeError(err))
-                    if err.to_string().contains("expected field index 0 <= i < 6")
-            );
-        }
+        let res: Result<Response, ProxyDecodeError> = types::Response::proxy_decode(&bytes);
+        assert_matches!(
+            res,
+            Err(ProxyDecodeError::CborDecodeError(err))
+                if err.to_string().contains("expected field index 0 <= i < 6")
+        );
     }
 }
 
 #[test]
 #[should_panic(expected = "missing field `originator`")]
 fn invalid_response_missing_originator() {
-    for certification_version in 0..=CURRENT_CERTIFICATION_VERSION {
+    for certification_version in all_supported_versions() {
         let bytes =
             types::Response::encode_without_field((&response(), certification_version), 0).unwrap();
 
@@ -748,7 +633,7 @@ fn invalid_response_missing_originator() {
 #[test]
 #[should_panic(expected = "missing field `respondent`")]
 fn invalid_response_missing_respondent() {
-    for certification_version in 0..CURRENT_CERTIFICATION_VERSION {
+    for certification_version in all_supported_versions() {
         let bytes =
             types::Response::encode_without_field((&response(), certification_version), 1).unwrap();
 
@@ -759,7 +644,7 @@ fn invalid_response_missing_respondent() {
 #[test]
 #[should_panic(expected = "missing field `originator_reply_callback`")]
 fn invalid_response_missing_originator_reply_callback() {
-    for certification_version in 0..CURRENT_CERTIFICATION_VERSION {
+    for certification_version in all_supported_versions() {
         let bytes =
             types::Response::encode_without_field((&response(), certification_version), 2).unwrap();
 
@@ -770,7 +655,7 @@ fn invalid_response_missing_originator_reply_callback() {
 #[test]
 #[should_panic(expected = "missing field `refund`")]
 fn invalid_response_missing_refund() {
-    for certification_version in 0..=CURRENT_CERTIFICATION_VERSION {
+    for certification_version in all_supported_versions() {
         let bytes =
             types::Response::encode_without_field((&response(), certification_version), 3).unwrap();
 
@@ -781,7 +666,7 @@ fn invalid_response_missing_refund() {
 #[test]
 #[should_panic(expected = "missing field `response_payload`")]
 fn invalid_response_missing_response_payload() {
-    for certification_version in 0..=CURRENT_CERTIFICATION_VERSION {
+    for certification_version in all_supported_versions() {
         let bytes =
             types::Response::encode_without_field((&response(), certification_version), 4).unwrap();
 
@@ -795,7 +680,7 @@ fn invalid_response_missing_response_payload() {
 
 #[test]
 fn valid_funds() {
-    for certification_version in 0..=CURRENT_CERTIFICATION_VERSION {
+    for certification_version in all_supported_versions() {
         let funds = funds();
         let bytes = types::Funds::proxy_encode((&funds, certification_version)).unwrap();
 
@@ -806,7 +691,7 @@ fn valid_funds() {
 #[test]
 #[should_panic(expected = "expected field index 0 <= i < 2")]
 fn invalid_funds_extra_field() {
-    for certification_version in 0..=CURRENT_CERTIFICATION_VERSION {
+    for certification_version in all_supported_versions() {
         let bytes =
             types::Funds::encode_with_extra_field((&funds(), certification_version)).unwrap();
 
@@ -817,7 +702,7 @@ fn invalid_funds_extra_field() {
 #[test]
 #[should_panic(expected = "missing field `cycles`")]
 fn invalid_funds_missing_cycles() {
-    for certification_version in 0..=CURRENT_CERTIFICATION_VERSION {
+    for certification_version in all_supported_versions() {
         let bytes =
             types::Funds::encode_without_field((&funds(), certification_version), 0).unwrap();
 
@@ -831,7 +716,7 @@ fn invalid_funds_missing_cycles() {
 
 #[test]
 fn valid_data_payload() {
-    for certification_version in 0..=CURRENT_CERTIFICATION_VERSION {
+    for certification_version in all_supported_versions() {
         let payload = data_payload();
         let bytes = types::Payload::proxy_encode((&payload, certification_version)).unwrap();
 
@@ -841,7 +726,7 @@ fn valid_data_payload() {
 
 #[test]
 fn valid_reject_payload() {
-    for certification_version in 0..=CURRENT_CERTIFICATION_VERSION {
+    for certification_version in all_supported_versions() {
         let payload = reject_payload();
         let bytes = types::Payload::proxy_encode((&payload, certification_version)).unwrap();
 
@@ -852,7 +737,7 @@ fn valid_reject_payload() {
 #[test]
 #[should_panic(expected = "expected field index 0 <= i < 2")]
 fn invalid_payload_extra_field() {
-    for certification_version in 0..=CURRENT_CERTIFICATION_VERSION {
+    for certification_version in all_supported_versions() {
         let bytes =
             types::Payload::encode_with_extra_field((&data_payload(), certification_version))
                 .unwrap();
@@ -866,7 +751,7 @@ fn invalid_payload_extra_field() {
     expected = "Payload: expected exactly one of `data` or `reject` to be `Some(_)`, got `Payload { data: None, reject: None }`"
 )]
 fn invalid_payload_empty() {
-    for certification_version in 0..=CURRENT_CERTIFICATION_VERSION {
+    for certification_version in all_supported_versions() {
         let bytes =
             types::Payload::encode_without_field((&data_payload(), certification_version), 0)
                 .unwrap();
@@ -881,7 +766,7 @@ fn invalid_payload_empty() {
 
 #[test]
 fn valid_reject_context() {
-    for certification_version in 0..=CURRENT_CERTIFICATION_VERSION {
+    for certification_version in all_supported_versions() {
         let context = reject_context();
         let bytes = types::RejectContext::proxy_encode((&context, certification_version)).unwrap();
 
@@ -892,7 +777,7 @@ fn valid_reject_context() {
 #[test]
 #[should_panic(expected = "expected field index 0 <= i < 2")]
 fn invalid_reject_context_extra_field() {
-    for certification_version in 0..=CURRENT_CERTIFICATION_VERSION {
+    for certification_version in all_supported_versions() {
         let bytes = types::RejectContext::encode_with_extra_field((
             &reject_context(),
             certification_version,
@@ -906,7 +791,7 @@ fn invalid_reject_context_extra_field() {
 #[test]
 #[should_panic(expected = "missing field `code`")]
 fn invalid_reject_context_missing_code() {
-    for certification_version in 0..=CURRENT_CERTIFICATION_VERSION {
+    for certification_version in all_supported_versions() {
         let bytes = types::RejectContext::encode_without_field(
             (&reject_context(), certification_version),
             0,
@@ -920,7 +805,7 @@ fn invalid_reject_context_missing_code() {
 #[test]
 #[should_panic(expected = "missing field `message`")]
 fn invalid_reject_context_missing_message() {
-    for certification_version in 0..=CURRENT_CERTIFICATION_VERSION {
+    for certification_version in all_supported_versions() {
         let bytes = types::RejectContext::encode_without_field(
             (&reject_context(), certification_version),
             1,

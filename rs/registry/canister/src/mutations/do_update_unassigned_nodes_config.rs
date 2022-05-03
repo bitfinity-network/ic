@@ -1,10 +1,15 @@
-use crate::{common::LOG_PREFIX, mutations::common::encode_or_panic, registry::Registry};
+use crate::{
+    common::LOG_PREFIX,
+    mutations::common::{check_replica_version_is_blessed, encode_or_panic},
+    registry::Registry,
+};
 
 use candid::{CandidType, Deserialize};
 use ic_nns_common::registry::decode_or_panic;
 use ic_protobuf::registry::unassigned_nodes_config::v1::UnassignedNodesConfigRecord;
 use ic_registry_keys::make_unassigned_nodes_config_record_key;
 use ic_registry_transport::pb::v1::{registry_mutation, RegistryMutation};
+use serde::Serialize;
 
 /// Updates the parameter that apply to all unassigned nodes in the Registry.
 ///
@@ -40,6 +45,8 @@ impl Registry {
             },
         };
 
+        check_replica_version_is_blessed(self, &config.replica_version);
+
         let mutations = vec![RegistryMutation {
             mutation_type: registry_mutation::Type::Upsert as i32,
             key: unassigned_nodes_key.as_bytes().to_vec(),
@@ -51,7 +58,7 @@ impl Registry {
     }
 }
 
-#[derive(CandidType, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(CandidType, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct UpdateUnassignedNodesConfigPayload {
     pub ssh_readonly_access: Option<Vec<String>>,
     pub replica_version: Option<String>,

@@ -4,27 +4,28 @@ generic-guest-os-diskimg:
     - .rules-parent-pipeline-autorun-on-trigger
   stage: guest-os-build
   needs:
-    - cargo-build-release-linux-native
+    - artifacts-upload-to-s3
   script:
     - |
       set -xeuo pipefail
 
-      VERSION=$(git rev-parse --verify HEAD)
+      VERSION=$(cat VERSION)
+      export VERSION
+      echo "Build ID: ${VERSION}"
+      "$CI_PROJECT_DIR"/gitlab-ci/src/artifacts/rclone_download.py \
+          --git-rev="${VERSION}" --remote-path="release" \
+          --out="artifacts/release"
 
       ls -lah /var/run/docker.sock; groups
 
       gunzip -c -d artifacts/release/boundary-node-control-plane.gz > artifacts/release/boundary-node-control-plane
+      gunzip -c -d artifacts/release/boundary-node-prober.gz > artifacts/release/boundary-node-prober
 
       cd ic-os/generic-guestos
 
-      IMAGE=$(grep FROM rootfs/Dockerfile | cut -d' ' -f2 | head -1)
-      if ! (docker image list --format "{{.Repository}}:{{.Tag}}" | grep -q "$IMAGE"); then
-          docker pull "$IMAGE"
-      fi
-
       mkdir -p build-out/disk-img/ build-tmp/
       buildevents cmd  "${ROOT_PIPELINE_ID}" "${CI_JOB_ID}" build-disk-img -- \
-      placebo -v -i "rootfs/**/*" -i "../../artifacts/release/**/*" -- \
+      capsule --passive -v -t "${VERSION}" -o build-tmp/disk.img -- \
       ./scripts/build-disk-image.sh -o build-tmp/disk.img -p root -v "${VERSION}" -x ../../artifacts/release/
       echo "${VERSION}" > build-tmp/version.txt
       ls -lah build-tmp
@@ -38,7 +39,7 @@ generic-guest-os-diskimg:
         "$CI_PROJECT_DIR"/gitlab-ci/tools/copy-disk "$CDPRNET" "generic"
 
       buildevents cmd "${ROOT_PIPELINE_ID}" "${CI_JOB_ID}" rclone -- \
-        "$CI_PROJECT_DIR"/gitlab-ci/src/artifacts/rclone_upload.py build-out/disk-img/ generic-guest-os/disk-img
+        "$CI_PROJECT_DIR"/gitlab-ci/src/artifacts/rclone_upload.py --version="${VERSION}" build-out/disk-img/ generic-guest-os/disk-img
 
   artifacts:
     paths:

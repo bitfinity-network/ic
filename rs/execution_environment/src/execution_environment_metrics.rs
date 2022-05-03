@@ -1,6 +1,7 @@
+use ic_error_types::UserError;
+use ic_ic00_types as ic00;
 use ic_metrics::buckets::decimal_buckets;
 use ic_metrics::{MetricsRegistry, Timer};
-use ic_types::{ic00, user_error::UserError};
 use prometheus::HistogramVec;
 use std::str::FromStr;
 
@@ -57,7 +58,7 @@ impl ExecutionEnvironmentMetrics {
         res: &Result<Vec<u8>, UserError>,
     ) {
         let method_name_label = if let Ok(method_name) = ic00::Method::from_str(method_name) {
-            format!("ic00_{}", method_name.to_string())
+            format!("ic00_{}", method_name)
         } else {
             String::from("unknown_method")
         };

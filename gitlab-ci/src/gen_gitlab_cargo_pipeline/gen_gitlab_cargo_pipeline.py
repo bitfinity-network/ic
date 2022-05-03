@@ -231,7 +231,13 @@ def log_rdeps(marked_crate_to_dep):
 
 
 def generate_gitlab_yaml(
-    crates, gitlab_ci_config, fout, force_pipeline=False, gitlab_ci_config_changes=False, prod_generic_test_job=None
+    crates,
+    gitlab_ci_config,
+    fout,
+    force_pipeline=False,
+    gitlab_ci_config_changes=False,
+    prod_generic_test_job=None,
+    disable_caching=False,
 ):
     """
     Generate a GitLab YAML pipeline that runs Cargo tests on the given crates.
@@ -244,6 +250,7 @@ def generate_gitlab_yaml(
         force_pipeline: Generate a pipeline even if no crates have been changed.
         gitlab_ci_config_changes: Whether the gitlab ci configurations have been altered.
         prod_generic_test_job: Config for the generic prod test, if it should be added to the output.
+        disable_caching: Whether the generated pipeline should disable capsule caching.
 
     """
     crate_test_name_overrides = gitlab_ci_config.get("crate_test_name_override") or {}
@@ -279,6 +286,8 @@ def generate_gitlab_yaml(
             fout.write("  PARENT_PIPELINE_ID: %s\n" % (os.getenv("CI_PIPELINE_ID")))
             fout.write("  CDPRNET: cdpr0%s\n" % (random.randint(1, 5)))
             fout.write("  GIT_REVISION: $CI_COMMIT_SHA\n")
+            if disable_caching:
+                fout.write("  CAPSULE_EXTRA_ARGS: --placebo\n")
 
         if gitlab_ci_config_changes:
             fout.write("  GITLAB_CI_CONFIG_CHANGED: 'true'\n")
@@ -318,15 +327,26 @@ def _generate_tests_may_raise_exception(
     out: typing.TextIO,
     cargo_sample_size: int = 5,
 ):
-    """Generate a Gitlab YAML pipeline config (internal function). May raise exceptions."""
-    if git_changes.is_protected():
-        logging.info("on protected branch, test all crates")
-        generate_gitlab_yaml(workspace_crates, gitlab_ci_config, out)
-        return
-
     git_repo = git.Repo(rust_workspace, search_parent_directories=True)
     git_root = git_repo.git.rev_parse("--show-toplevel")
     prod_generic_test_job = get_prod_generic_test_job(git_root)
+
+    """Generate a Gitlab YAML pipeline config (internal function). May raise exceptions."""
+    if git_changes.is_protected():
+        logging.info("on protected branch, test all crates")
+        generate_gitlab_yaml(
+            workspace_crates,
+            gitlab_ci_config,
+            out,
+            prod_generic_test_job=prod_generic_test_job,
+            disable_caching=True,
+        )
+        return
+
+    disable_caching = (
+        re.search(r"(\b)nocache(\b)", os.getenv("CI_MERGE_REQUEST_TITLE", "")) is not None
+        or re.search(r"(\b)nocache(\b)", git_repo.commit().message) is not None
+    )
 
     if os.environ.get("TRIGGER_PAYLOAD"):
         logging.info("Running a triggered pipeline, testing all crates")
@@ -335,30 +355,39 @@ def _generate_tests_may_raise_exception(
             gitlab_ci_config,
             out,
             prod_generic_test_job=prod_generic_test_job,
+            disable_caching=disable_caching,
         )
         return
 
     if os.getenv("CI_MERGE_REQUEST_EVENT_TYPE", "") != "merge_train":
         if re.search(r"(\b)lessci(\b)", os.getenv("CI_MERGE_REQUEST_TITLE", "")):
             logging.debug("lessci detected in merge request title, running reduced set")
-            generate_gitlab_yaml([], gitlab_ci_config, out)
+            generate_gitlab_yaml([], gitlab_ci_config, out, disable_caching=disable_caching)
             return
         if re.search(r"(\b)moreci(\b)", os.getenv("CI_MERGE_REQUEST_TITLE", "")):
-            logging.debug("moreci detected in merge request title, running reduced set")
+            logging.debug("moreci detected in merge request title, running full set")
             generate_gitlab_yaml(
                 workspace_crates,
                 gitlab_ci_config,
                 out,
+                prod_generic_test_job=prod_generic_test_job,
+                disable_caching=disable_caching,
             )
             return
     else:
         logging.info("On merge train pipeline use the parent pipeline's CI fast path")
-        generate_gitlab_yaml([], gitlab_ci_config, out)
+        generate_gitlab_yaml([], gitlab_ci_config, out, disable_caching=disable_caching)
         return
 
     if re.search(r"(\b)moreci(\b)", git_repo.commit().message):
         logging.info("moreci in commit message, test all crates")
-        generate_gitlab_yaml(workspace_crates, gitlab_ci_config, out, prod_generic_test_job=prod_generic_test_job)
+        generate_gitlab_yaml(
+            workspace_crates,
+            gitlab_ci_config,
+            out,
+            prod_generic_test_job=prod_generic_test_job,
+            disable_caching=disable_caching,
+        )
         return
 
     # Bypass entire cargo pipeline if
@@ -378,7 +407,7 @@ def _generate_tests_may_raise_exception(
         # The commit message contained the word "lessci", which
         # instructed us to generate a noop pipeline.
         logging.info("lessci or [hotfix] in commit message, skip child pipeline")
-        generate_gitlab_yaml([], gitlab_ci_config, out)
+        generate_gitlab_yaml([], gitlab_ci_config, out, disable_caching=disable_caching)
         return
 
     changed_files = git_changes.get_changed_files(git_root, [rust_workspace])
@@ -387,7 +416,13 @@ def _generate_tests_may_raise_exception(
     for file_name in changed_files:
         if file_name == f"{rust_workspace}/Cargo.toml":
             logging.info("CI config file %s changed, testing all crates", file_name)
-            generate_gitlab_yaml(workspace_crates, gitlab_ci_config, out, prod_generic_test_job=prod_generic_test_job)
+            generate_gitlab_yaml(
+                workspace_crates,
+                gitlab_ci_config,
+                out,
+                prod_generic_test_job=prod_generic_test_job,
+                disable_caching=disable_caching,
+            )
             return
 
     # Filter out files that are either:
@@ -422,11 +457,6 @@ def _generate_tests_may_raise_exception(
 
     log_rdeps(wmarked_crates_to_dep)
 
-    if git_changes.get_changed_files(git_root, [guestos_workspace]):
-        force_pipeline = True
-    else:
-        force_pipeline = False
-
     cargo_test_sample_crates = set()
     if git_changes.nix_shell_changes(rust_workspace) or git_changes.ci_config_changes(git_root):
         logging.info("Nix or CI config changed, also test sample crates")
@@ -440,40 +470,37 @@ def _generate_tests_may_raise_exception(
             cargo_test_sample_crates.union(set(wmarked_crates_to_dep.keys())),
             gitlab_ci_config,
             out,
-            force_pipeline,
             gitlab_ci_config_changes=True,
             prod_generic_test_job=prod_generic_test_job,
+            disable_caching=disable_caching,
         )
     else:
-        if git_changes.get_changed_files(git_root, ["testnet", "ic-os", "rs/workload_generator", "rs/registry/client"]):
-            # Run a shortened generic prod test with the latest revision that has the disk image
-            prod_generic_test_job = get_prod_generic_test_job(git_root, empty_child_pipeline=True)
-        else:
+        force_pipeline = git_changes.get_changed_files(git_root, [guestos_workspace]) or git_changes.get_changed_files(
+            git_root, ["testnet", "ic-os", "scalability", "rs/workload_generator", "rs/registry/client"]
+        )
+
+        if not force_pipeline:
             prod_generic_test_job = None
+
         generate_gitlab_yaml(
             cargo_test_sample_crates.union(set(wmarked_crates_to_dep.keys())),
             gitlab_ci_config,
             out,
             force_pipeline,
             prod_generic_test_job=prod_generic_test_job,
+            disable_caching=disable_caching,
         )
 
 
-def get_prod_generic_test_job(git_root: str, empty_child_pipeline=False):
+def get_prod_generic_test_job(git_root: str):
     gl_cfg = gitlab_config.DfinityGitLabConfig(git_root)
     gl_cfg_file = f"{git_root}/.gitlab-ci.yml"
     if os.path.exists(gl_cfg_file):
         gl_cfg.ci_cfg_load_from_file(open(gl_cfg_file))
         job_file = f"{git_root}/gitlab-ci/config/00--child-pipeline-prod-generic-test.yml"
         gl_cfg.ci_cfg_load_from_file(open(job_file))
-        if empty_child_pipeline:
-            job = gl_cfg.ci_cfg_expanded["prod-generic-test"]
-            job["needs"] = []
-            del job["variables"]["GIT_REVISION"]
-            job["variables"]["CDPRNET"] = "cdpr0%s" % (random.randint(1, 5))
-        else:
-            job = gl_cfg.ci_cfg["prod-generic-test"]
-            job["stage"] = "prod-tests"
+        job = gl_cfg.ci_cfg["prod-generic-test"]
+        job["stage"] = "prod-tests"
         result = {"prod-generic-test": job}
         return result
 
@@ -538,10 +565,14 @@ def generate_tests(
                 channel="#precious-bots",
             )
         logging.info("crate dependency analysis failed, testing all crates")
+        git_root = git_repo.git.rev_parse("--show-toplevel")
+        prod_generic_test_job = get_prod_generic_test_job(git_root)
         generate_gitlab_yaml(
             workspace_crates,
             gitlab_ci_config,
             out,
+            prod_generic_test_job=prod_generic_test_job,
+            disable_caching=True,
         )
 
     logging.info("Wrote Cargo test GitLab pipeline to %s", out)
@@ -568,7 +599,7 @@ def generate_gitlab_yaml_for_all_crates(rust_workspace: str) -> str:
     gitlab_ci_config = load_gitlab_ci_config(rust_workspace)
 
     out = io.StringIO()
-    generate_gitlab_yaml(workspace_crates, gitlab_ci_config, out)
+    generate_gitlab_yaml(workspace_crates, gitlab_ci_config, out, disable_caching=True)
     out.seek(0)
     return out.read()
 

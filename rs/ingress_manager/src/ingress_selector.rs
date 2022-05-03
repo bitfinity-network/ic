@@ -3,32 +3,36 @@
 //! messages of Consensus payloads and to keep track of finalized Ingress
 //! Messages to ensure that no message is added to a block more than once.
 use crate::IngressManager;
+use ic_constants::MAX_INGRESS_TTL;
 use ic_cycles_account_manager::IngressInductionCost;
 use ic_interfaces::{
     execution_environment::IngressHistoryReader,
     ingress_manager::{
         IngressPayloadValidationError, IngressPermanentError, IngressSelector, IngressSetQuery,
+        IngressTransientError,
     },
     ingress_pool::{IngressPoolSelect, SelectResult},
+    payload::BatchPayloadSectionBuilder,
     validation::{ValidationError, ValidationResult},
 };
+use ic_interfaces_state_manager::StateManagerError;
 use ic_logger::{error, warn};
-use ic_registry_client::helper::subnet::IngressMessageSettings;
+use ic_registry_client_helpers::subnet::IngressMessageSettings;
 use ic_replicated_state::ReplicatedState;
 use ic_types::{
     artifact::IngressMessageId,
     batch::{IngressPayload, ValidationContext},
-    ingress::{IngressStatus, MAX_INGRESS_TTL},
+    consensus::Payload,
+    ingress::{IngressSets, IngressStatus},
     messages::{MessageId, SignedIngress},
     CanisterId, CountBytes, Cycles, Height, NumBytes, Time,
 };
 use ic_validator::{validate_request, RequestValidationError};
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 impl<'a> IngressSelector for IngressManager {
     fn get_ingress_payload(
         &self,
-        ingress_pool: &dyn IngressPoolSelect,
         past_ingress: &dyn IngressSetQuery,
         context: &ValidationContext,
         byte_limit: NumBytes,
@@ -78,7 +82,7 @@ impl<'a> IngressSelector for IngressManager {
         let mut cycles_needed: BTreeMap<CanisterId, Cycles> = BTreeMap::new();
         let mut num_messages = 0;
 
-        let messages_in_payload = ingress_pool.select_validated(
+        let messages_in_payload = self.ingress_pool.select_validated(
             expiry_range,
             Box::new(move |ingress_obj| {
                 let result = self.validate_ingress(
@@ -164,11 +168,16 @@ impl<'a> IngressSelector for IngressManager {
             Err(err) => {
                 warn!(
                     self.log,
-                    "StateManager doesn't have state for height {}: {:?}", certified_height, err
+                    "StateManager doesn't have state for height {}: {:?}", certified_height, err,
                 );
-                return Err(ValidationError::Permanent(
-                    IngressPermanentError::StateManagerError(err),
-                ));
+                return Err(match err {
+                    StateManagerError::StateRemoved(h) => {
+                        ValidationError::Permanent(IngressPermanentError::StateRemoved(h))
+                    }
+                    StateManagerError::StateNotCommittedYet(h) => {
+                        ValidationError::Transient(IngressTransientError::StateNotCommittedYet(h))
+                    }
+                });
             }
         };
 
@@ -203,8 +212,90 @@ impl<'a> IngressSelector for IngressManager {
         Ok(())
     }
 
+    fn filter_past_payloads(
+        &self,
+        past_payloads: &[(Height, Time, Payload)],
+        context: &ValidationContext,
+    ) -> IngressSets {
+        let mut ingress_payload_cache = self.ingress_payload_cache.write().unwrap();
+
+        // Record the metrics
+        self.metrics
+            .ingress_payload_cache_size
+            .set(ingress_payload_cache.len() as i64);
+
+        let past_ingress: Vec<_> = past_payloads
+            .iter()
+            .filter_map(|(height, _, payload)| {
+                if payload.is_summary() {
+                    None
+                } else {
+                    let payload_hash = payload.get_hash();
+                    let batch = &payload.as_ref().as_data().batch;
+                    let ingress = ingress_payload_cache
+                        .entry((*height, payload_hash.clone()))
+                        .or_insert_with(|| {
+                            Arc::new(batch.ingress.message_ids().into_iter().collect())
+                        });
+                    Some(ingress.clone())
+                }
+            })
+            .collect();
+
+        // We assume that 'past_payloads' comes in descending heights, following the
+        // block parent traversal order.
+        if let Some((min_height, _, _)) = past_payloads.last() {
+            // The step below is to garbage collect no longer used past ingress payload
+            // cache. It assumes the sequence of calls to payload selection/validation
+            // leads to a monotonic sequence of lower-bound (min_height).
+            //
+            // Usually this is true, but even when it is not true (e.g. in tests) it is
+            // always safe to remove entries from ingress_payload_cache at the expense
+            // of having to re-compute them.
+            let keys: Vec<_> = ingress_payload_cache.keys().cloned().collect();
+            for key in keys {
+                if key.0 < *min_height {
+                    ingress_payload_cache.remove(&key);
+                }
+            }
+        }
+
+        let min_block_time = match past_payloads.last() {
+            None => context.time,
+            Some((_, time, _)) => *time,
+        };
+
+        IngressSets::new(past_ingress, min_block_time)
+    }
+
     fn request_purge_finalized_messages(&self, message_ids: Vec<IngressMessageId>) {
         self.messages_to_purge.write().unwrap().push(message_ids)
+    }
+}
+
+impl BatchPayloadSectionBuilder<IngressPayload> for IngressManager {
+    fn build_payload(
+        &self,
+        validation_context: &ValidationContext,
+        max_size: NumBytes,
+        _priority: usize,
+        past_payloads: &[(Height, Time, Payload)],
+    ) -> (IngressPayload, NumBytes) {
+        let past_payloads = self.filter_past_payloads(past_payloads, validation_context);
+        let payload = self.get_ingress_payload(&past_payloads, validation_context, max_size);
+        let size = NumBytes::new(payload.count_bytes() as u64);
+        (payload, size)
+    }
+
+    fn validate_payload(
+        &self,
+        payload: &IngressPayload,
+        validation_context: &ValidationContext,
+        past_payloads: &[(Height, Time, Payload)],
+    ) -> Result<NumBytes, IngressPayloadValidationError> {
+        let past_payloads = self.filter_past_payloads(past_payloads, validation_context);
+        self.validate_ingress_payload(payload, &past_payloads, validation_context)?;
+        Ok(NumBytes::new(payload.count_bytes() as u64))
     }
 }
 
@@ -399,9 +490,10 @@ mod tests {
     // use the `RegistryClient` which spawns tokio tasks. Without tokio, the tests
     // would compile but panic at runtime.
     use super::*;
-    use crate::tests::{setup, setup_registry, setup_with_params};
+    use crate::tests::{access_ingress_pool, setup, setup_registry, setup_with_params};
     use assert_matches::assert_matches;
     use ic_crypto::crypto_hash;
+    use ic_ic00_types::{CanisterIdRecord, Payload, IC_00};
     use ic_interfaces::{
         artifact_pool::UnvalidatedArtifact,
         execution_environment::IngressHistoryError,
@@ -423,7 +515,6 @@ mod tests {
     use ic_types::{
         artifact::{IngressMessageAttribute, IngressMessageId},
         batch::IngressPayload,
-        ic00::{CanisterIdRecord, Payload, IC_00},
         messages::{MessageId, SignedIngress},
         time::current_time_and_expiry_time,
         Height, RegistryVersion,
@@ -435,9 +526,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_empty_ingress_payload() {
-        setup(|ingress_manager, ingress_pool| {
+        setup(|ingress_manager, _| {
             let ingress_msgs = ingress_manager.get_ingress_payload(
-                &ingress_pool,
                 &HashSet::new(),
                 &ValidationContext {
                     time: mock_time(),
@@ -517,7 +607,7 @@ mod tests {
                     )
                     .build(),
             ),
-            |ingress_manager, mut ingress_pool| {
+            |ingress_manager, ingress_pool| {
                 let time = mock_time();
                 let time_source = FastForwardTimeSource::new();
                 let validation_context = ValidationContext {
@@ -549,24 +639,25 @@ mod tests {
                 for m in ingress_messages.iter() {
                     let message_id = IngressMessageId::from(m);
                     let attribute = IngressMessageAttribute::new(m);
-                    ingress_pool.insert(UnvalidatedArtifact {
-                        message: m.clone(),
-                        peer_id: node_test_id(0),
-                        timestamp: time_source.get_relative_time(),
+                    access_ingress_pool(&ingress_pool, |mut ingress_pool| {
+                        ingress_pool.insert(UnvalidatedArtifact {
+                            message: m.clone(),
+                            peer_id: node_test_id(0),
+                            timestamp: time_source.get_relative_time(),
+                        });
+                        ingress_pool.apply_changeset(vec![ChangeAction::MoveToValidated((
+                            message_id.clone(),
+                            node_test_id(0),
+                            m.count_bytes(),
+                            attribute,
+                            crypto_hash(m.binary()).get(),
+                        ))]);
+                        // check that message is indeed in the pool
+                        assert!(ingress_pool.contains(&message_id));
                     });
-                    ingress_pool.apply_changeset(vec![ChangeAction::MoveToValidated((
-                        message_id.clone(),
-                        node_test_id(0),
-                        m.count_bytes(),
-                        attribute,
-                        crypto_hash(m.binary()).get(),
-                    ))]);
-                    // check that message is indeed in the pool
-                    assert!(ingress_pool.contains(&message_id));
                 }
 
                 let payload = ingress_manager.get_ingress_payload(
-                    &ingress_pool,
                     &HashSet::new(),
                     &validation_context,
                     MAX_SIZE_AS_NUM_BYTES,
@@ -719,7 +810,7 @@ mod tests {
                     )
                     .build(),
             ),
-            |ingress_manager, mut ingress_pool| {
+            |ingress_manager, ingress_pool| {
                 let time_source = FastForwardTimeSource::new();
                 let validation_context = ValidationContext {
                     time: mock_time(),
@@ -734,23 +825,24 @@ mod tests {
                     .build();
                 let message_id = IngressMessageId::from(&ingress_msg1);
                 let attribute = IngressMessageAttribute::new(&ingress_msg1);
-                ingress_pool.insert(UnvalidatedArtifact {
-                    message: ingress_msg1.clone(),
-                    peer_id: node_test_id(0),
-                    timestamp: time_source.get_relative_time(),
+                access_ingress_pool(&ingress_pool, |mut ingress_pool| {
+                    ingress_pool.insert(UnvalidatedArtifact {
+                        message: ingress_msg1.clone(),
+                        peer_id: node_test_id(0),
+                        timestamp: time_source.get_relative_time(),
+                    });
+                    let ingress_size1 = ingress_msg1.count_bytes();
+                    ingress_pool.apply_changeset(vec![ChangeAction::MoveToValidated((
+                        message_id,
+                        node_test_id(0),
+                        ingress_size1,
+                        attribute,
+                        crypto_hash(ingress_msg1.binary()).get(),
+                    ))]);
                 });
-                let ingress_size1 = ingress_msg1.count_bytes();
-                ingress_pool.apply_changeset(vec![ChangeAction::MoveToValidated((
-                    message_id,
-                    node_test_id(0),
-                    ingress_size1,
-                    attribute,
-                    crypto_hash(ingress_msg1.binary()).get(),
-                ))]);
 
                 // get ingress message in payload
                 let first_ingress_payload = ingress_manager.get_ingress_payload(
-                    &ingress_pool,
                     &HashSet::new(),
                     &validation_context,
                     MAX_SIZE_AS_NUM_BYTES,
@@ -775,7 +867,7 @@ mod tests {
                     )
                     .build(),
             ),
-            |ingress_manager, mut ingress_pool| {
+            |ingress_manager, ingress_pool| {
                 let time_source = FastForwardTimeSource::new();
                 let validation_context = ValidationContext {
                     time: mock_time(),
@@ -790,23 +882,24 @@ mod tests {
                     .build();
                 let message_id = IngressMessageId::from(&ingress_msg1);
                 let attribute = IngressMessageAttribute::new(&ingress_msg1);
-                ingress_pool.insert(UnvalidatedArtifact {
-                    message: ingress_msg1.clone(),
-                    peer_id: node_test_id(0),
-                    timestamp: time_source.get_relative_time(),
+                access_ingress_pool(&ingress_pool, |mut ingress_pool| {
+                    ingress_pool.insert(UnvalidatedArtifact {
+                        message: ingress_msg1.clone(),
+                        peer_id: node_test_id(0),
+                        timestamp: time_source.get_relative_time(),
+                    });
+                    let ingress_size1 = ingress_msg1.count_bytes();
+                    ingress_pool.apply_changeset(vec![ChangeAction::MoveToValidated((
+                        message_id,
+                        node_test_id(0),
+                        ingress_size1,
+                        attribute,
+                        crypto_hash(ingress_msg1.binary()).get(),
+                    ))]);
                 });
-                let ingress_size1 = ingress_msg1.count_bytes();
-                ingress_pool.apply_changeset(vec![ChangeAction::MoveToValidated((
-                    message_id,
-                    node_test_id(0),
-                    ingress_size1,
-                    attribute,
-                    crypto_hash(ingress_msg1.binary()).get(),
-                ))]);
 
                 // get ingress message in payload
                 let first_ingress_payload = ingress_manager.get_ingress_payload(
-                    &ingress_pool,
                     &HashSet::new(),
                     &validation_context,
                     MAX_SIZE_AS_NUM_BYTES,
@@ -820,7 +913,6 @@ mod tests {
                     hash_set.insert(id);
                 }
                 let second_ingress_payload = ingress_manager.get_ingress_payload(
-                    &ingress_pool,
                     &hash_set,
                     &validation_context,
                     MAX_SIZE_AS_NUM_BYTES,
@@ -846,7 +938,7 @@ mod tests {
                     )
                     .build(),
             ),
-            |ingress_manager, mut ingress_pool| {
+            |ingress_manager, ingress_pool| {
                 let time_source = FastForwardTimeSource::new();
 
                 // create two small messages
@@ -862,35 +954,37 @@ mod tests {
                     .build();
 
                 // add them to the pool
-                let message_id = IngressMessageId::from(&ingress_msg1);
-                let attribute = IngressMessageAttribute::new(&ingress_msg1);
-                ingress_pool.insert(UnvalidatedArtifact {
-                    message: ingress_msg1.clone(),
-                    peer_id: node_test_id(0),
-                    timestamp: time_source.get_relative_time(),
-                });
-                ingress_pool.apply_changeset(vec![ChangeAction::MoveToValidated((
-                    message_id,
-                    node_test_id(0),
-                    ingress_msg1.count_bytes(),
-                    attribute,
-                    crypto_hash(ingress_msg1.binary()).get(),
-                ))]);
+                access_ingress_pool(&ingress_pool, |mut ingress_pool| {
+                    let message_id = IngressMessageId::from(&ingress_msg1);
+                    let attribute = IngressMessageAttribute::new(&ingress_msg1);
+                    ingress_pool.insert(UnvalidatedArtifact {
+                        message: ingress_msg1.clone(),
+                        peer_id: node_test_id(0),
+                        timestamp: time_source.get_relative_time(),
+                    });
+                    ingress_pool.apply_changeset(vec![ChangeAction::MoveToValidated((
+                        message_id,
+                        node_test_id(0),
+                        ingress_msg1.count_bytes(),
+                        attribute,
+                        crypto_hash(ingress_msg1.binary()).get(),
+                    ))]);
 
-                let attribute = IngressMessageAttribute::new(&ingress_msg2);
-                let message_id = IngressMessageId::from(&ingress_msg2);
-                ingress_pool.insert(UnvalidatedArtifact {
-                    message: ingress_msg2.clone(),
-                    peer_id: node_test_id(0),
-                    timestamp: time_source.get_relative_time(),
+                    let attribute = IngressMessageAttribute::new(&ingress_msg2);
+                    let message_id = IngressMessageId::from(&ingress_msg2);
+                    ingress_pool.insert(UnvalidatedArtifact {
+                        message: ingress_msg2.clone(),
+                        peer_id: node_test_id(0),
+                        timestamp: time_source.get_relative_time(),
+                    });
+                    ingress_pool.apply_changeset(vec![ChangeAction::MoveToValidated((
+                        message_id,
+                        node_test_id(0),
+                        ingress_msg2.count_bytes(),
+                        attribute,
+                        crypto_hash(ingress_msg2.binary()).get(),
+                    ))]);
                 });
-                ingress_pool.apply_changeset(vec![ChangeAction::MoveToValidated((
-                    message_id,
-                    node_test_id(0),
-                    ingress_msg2.count_bytes(),
-                    attribute,
-                    crypto_hash(ingress_msg2.binary()).get(),
-                ))]);
 
                 let validation_context = ValidationContext {
                     time: mock_time(),
@@ -899,7 +993,6 @@ mod tests {
                 };
 
                 let ingress_payload = ingress_manager.get_ingress_payload(
-                    &ingress_pool,
                     &HashSet::new(),
                     &validation_context,
                     MAX_SIZE_AS_NUM_BYTES,
@@ -927,7 +1020,7 @@ mod tests {
                     )
                     .build(),
             ),
-            |ingress_manager, mut ingress_pool| {
+            |ingress_manager, ingress_pool| {
                 let time_source = FastForwardTimeSource::new();
 
                 // create two large messages (one of them would fit)
@@ -945,35 +1038,37 @@ mod tests {
                     .build();
 
                 // add them to the pool
-                let message_id = IngressMessageId::from(&ingress_msg1);
-                let attribute = IngressMessageAttribute::new(&ingress_msg1);
-                ingress_pool.insert(UnvalidatedArtifact {
-                    message: ingress_msg1.clone(),
-                    peer_id: node_test_id(0),
-                    timestamp: time_source.get_relative_time(),
-                });
-                ingress_pool.apply_changeset(vec![ChangeAction::MoveToValidated((
-                    message_id,
-                    node_test_id(0),
-                    ingress_msg1.count_bytes(),
-                    attribute,
-                    crypto_hash(ingress_msg1.binary()).get(),
-                ))]);
+                access_ingress_pool(&ingress_pool, |mut ingress_pool| {
+                    let message_id = IngressMessageId::from(&ingress_msg1);
+                    let attribute = IngressMessageAttribute::new(&ingress_msg1);
+                    ingress_pool.insert(UnvalidatedArtifact {
+                        message: ingress_msg1.clone(),
+                        peer_id: node_test_id(0),
+                        timestamp: time_source.get_relative_time(),
+                    });
+                    ingress_pool.apply_changeset(vec![ChangeAction::MoveToValidated((
+                        message_id,
+                        node_test_id(0),
+                        ingress_msg1.count_bytes(),
+                        attribute,
+                        crypto_hash(ingress_msg1.binary()).get(),
+                    ))]);
 
-                let attribute = IngressMessageAttribute::new(&ingress_msg2);
-                let message_id = IngressMessageId::from(&ingress_msg2);
-                ingress_pool.insert(UnvalidatedArtifact {
-                    message: ingress_msg2.clone(),
-                    peer_id: node_test_id(0),
-                    timestamp: time_source.get_relative_time(),
+                    let attribute = IngressMessageAttribute::new(&ingress_msg2);
+                    let message_id = IngressMessageId::from(&ingress_msg2);
+                    ingress_pool.insert(UnvalidatedArtifact {
+                        message: ingress_msg2.clone(),
+                        peer_id: node_test_id(0),
+                        timestamp: time_source.get_relative_time(),
+                    });
+                    ingress_pool.apply_changeset(vec![ChangeAction::MoveToValidated((
+                        message_id,
+                        node_test_id(0),
+                        ingress_msg2.count_bytes(),
+                        attribute,
+                        crypto_hash(ingress_msg2.binary()).get(),
+                    ))]);
                 });
-                ingress_pool.apply_changeset(vec![ChangeAction::MoveToValidated((
-                    message_id,
-                    node_test_id(0),
-                    ingress_msg2.count_bytes(),
-                    attribute,
-                    crypto_hash(ingress_msg2.binary()).get(),
-                ))]);
 
                 let validation_context = ValidationContext {
                     time: mock_time(),
@@ -982,7 +1077,6 @@ mod tests {
                 };
 
                 let ingress_payload = ingress_manager.get_ingress_payload(
-                    &ingress_pool,
                     &HashSet::new(),
                     &validation_context,
                     NumBytes::new(MAX_SIZE as u64),
@@ -1115,7 +1209,7 @@ mod tests {
                     )
                     .build(),
             ),
-            |ingress_manager, mut ingress_pool| {
+            |ingress_manager, ingress_pool| {
                 let time_source = FastForwardTimeSource::new();
                 let ingress_msg2 = SignedIngressBuilder::new()
                     .canister_id(canister_test_id(0))
@@ -1124,33 +1218,36 @@ mod tests {
                     .build();
                 let message_id2 = IngressMessageId::from(&ingress_msg2);
 
-                let attribute = IngressMessageAttribute::new(&ingress_msg1);
-                ingress_pool.insert(UnvalidatedArtifact {
-                    message: ingress_msg1.clone(),
-                    peer_id: node_test_id(0),
-                    timestamp: time_source.get_relative_time(),
-                });
-                ingress_pool.apply_changeset(vec![ChangeAction::MoveToValidated((
-                    message_id1,
-                    node_test_id(0),
-                    ingress_msg1.count_bytes(),
-                    attribute,
-                    crypto_hash(ingress_msg1.binary()).get(),
-                ))]);
+                let attribute1 = IngressMessageAttribute::new(&ingress_msg1);
+                let attribute2 = IngressMessageAttribute::new(&ingress_msg2);
 
-                let attribute = IngressMessageAttribute::new(&ingress_msg2);
-                ingress_pool.insert(UnvalidatedArtifact {
-                    message: ingress_msg2.clone(),
-                    peer_id: node_test_id(0),
-                    timestamp: time_source.get_relative_time(),
+                access_ingress_pool(&ingress_pool, |mut ingress_pool| {
+                    ingress_pool.insert(UnvalidatedArtifact {
+                        message: ingress_msg1.clone(),
+                        peer_id: node_test_id(0),
+                        timestamp: time_source.get_relative_time(),
+                    });
+                    ingress_pool.apply_changeset(vec![ChangeAction::MoveToValidated((
+                        message_id1,
+                        node_test_id(0),
+                        ingress_msg1.count_bytes(),
+                        attribute1,
+                        crypto_hash(ingress_msg1.binary()).get(),
+                    ))]);
+                    ingress_pool.insert(UnvalidatedArtifact {
+                        message: ingress_msg2.clone(),
+                        peer_id: node_test_id(0),
+                        timestamp: time_source.get_relative_time(),
+                    });
+                    ingress_pool.apply_changeset(vec![ChangeAction::MoveToValidated((
+                        message_id2,
+                        node_test_id(0),
+                        ingress_msg2.count_bytes(),
+                        attribute2,
+                        crypto_hash(ingress_msg2.binary()).get(),
+                    ))]);
                 });
-                ingress_pool.apply_changeset(vec![ChangeAction::MoveToValidated((
-                    message_id2,
-                    node_test_id(0),
-                    ingress_msg2.count_bytes(),
-                    attribute,
-                    crypto_hash(ingress_msg2.binary()).get(),
-                ))]);
+
                 let validation_context = ValidationContext {
                     time: mock_time(),
                     registry_version: RegistryVersion::from(1),
@@ -1158,7 +1255,6 @@ mod tests {
                 };
 
                 let ingress_payload = ingress_manager.get_ingress_payload(
-                    &ingress_pool,
                     &HashSet::new(),
                     &validation_context,
                     MAX_SIZE_AS_NUM_BYTES,
@@ -1301,7 +1397,7 @@ mod tests {
                     )
                     .build(),
             ),
-            |ingress_manager, mut ingress_pool| {
+            |ingress_manager, ingress_pool| {
                 let time_source = FastForwardTimeSource::new();
                 let validation_context = ValidationContext {
                     time: time + MAX_INGRESS_TTL,
@@ -1310,27 +1406,29 @@ mod tests {
                 };
 
                 let ingress_messages = vec![m1.clone(), m2, m3, m4];
+
                 for m in ingress_messages.iter() {
                     let message_id = IngressMessageId::from(m);
                     let attribute = IngressMessageAttribute::new(m);
-                    ingress_pool.insert(UnvalidatedArtifact {
-                        message: m.clone(),
-                        peer_id: node_test_id(0),
-                        timestamp: time_source.get_relative_time(),
+                    access_ingress_pool(&ingress_pool, |mut ingress_pool| {
+                        ingress_pool.insert(UnvalidatedArtifact {
+                            message: m.clone(),
+                            peer_id: node_test_id(0),
+                            timestamp: time_source.get_relative_time(),
+                        });
+                        ingress_pool.apply_changeset(vec![ChangeAction::MoveToValidated((
+                            message_id.clone(),
+                            node_test_id(0),
+                            m.count_bytes(),
+                            attribute,
+                            crypto_hash(m.binary()).get(),
+                        ))]);
+                        // check that message is indeed in the pool
+                        assert!(ingress_pool.contains(&message_id));
                     });
-                    ingress_pool.apply_changeset(vec![ChangeAction::MoveToValidated((
-                        message_id.clone(),
-                        node_test_id(0),
-                        m.count_bytes(),
-                        attribute,
-                        crypto_hash(m.binary()).get(),
-                    ))]);
-                    // check that message is indeed in the pool
-                    assert!(ingress_pool.contains(&message_id));
                 }
 
                 let payload = ingress_manager.get_ingress_payload(
-                    &ingress_pool,
                     &HashSet::new(),
                     &validation_context,
                     MAX_SIZE_AS_NUM_BYTES,

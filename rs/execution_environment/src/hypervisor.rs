@@ -1,35 +1,36 @@
-use crate::QueryExecutionType;
-use ic_canister_sandbox_replica_controller2::sandboxed_execution_controller::SandboxedExecutionController;
-use ic_config::feature_status::FeatureStatus;
+use crate::{NonReplicatedQueryKind as QueryKind, QueryExecutionType};
+use ic_canister_sandbox_replica_controller::sandboxed_execution_controller::SandboxedExecutionController;
+use ic_config::flag_status::FlagStatus;
 use ic_config::{embedders::Config as EmbeddersConfig, execution_environment::Config};
-use ic_cow_state::{error::CowError, CowMemoryManager};
 use ic_cycles_account_manager::CyclesAccountManager;
-use ic_embedders::{
-    wasm_executor::WasmExecutor, WasmExecutionInput, WasmExecutionOutput, WasmtimeEmbedder,
-};
+use ic_embedders::{wasm_executor::WasmExecutor, WasmExecutionInput, WasmtimeEmbedder};
+use ic_error_types::{ErrorCode, UserError};
+use ic_ic00_types::CanisterStatusType;
+use ic_ic00_types::IC_00;
 use ic_interfaces::execution_environment::{
-    ExecutionParameters, HypervisorError, HypervisorResult,
+    ExecutionParameters, HypervisorError, HypervisorResult, WasmExecutionOutput,
 };
 use ic_interfaces::messages::RequestOrIngress;
 use ic_logger::{debug, fatal, ReplicaLogger};
 use ic_metrics::{buckets::exponential_buckets, MetricsRegistry};
-use ic_registry_routing_table::RoutingTable;
 use ic_registry_subnet_type::SubnetType;
+use ic_replicated_state::NetworkTopology;
 use ic_replicated_state::{
     page_map::allocated_pages_count, CallContextAction, CallOrigin, CanisterState, ExecutionState,
     SchedulerState, SystemState,
 };
 use ic_sys::PAGE_SIZE;
-use ic_system_api::{ApiType, NonReplicatedQueryKind};
+use ic_system_api::{
+    sandbox_safe_system_state::SandboxSafeSystemState, ApiType, NonReplicatedQueryKind,
+};
 use ic_types::{
-    canonical_error::{internal_error, not_found_error, permission_denied_error, CanonicalError},
     ingress::WasmResult,
     messages::Payload,
     methods::{Callback, FuncRef, SystemMethod, WasmMethod},
-    CanisterId, CanisterStatusType, Cycles, NumBytes, NumInstructions, PrincipalId, SubnetId, Time,
+    CanisterId, Cycles, NumBytes, NumInstructions, PrincipalId, SubnetId, Time,
 };
 use prometheus::{Histogram, IntCounterVec, IntGauge};
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc};
 
 #[doc(hidden)] // pub for usage in tests
 pub struct HypervisorMetrics {
@@ -118,10 +119,8 @@ impl Hypervisor {
         canister: CanisterState,
         mut request: RequestOrIngress,
         time: Time,
-        routing_table: Arc<RoutingTable>,
-        subnet_records: Arc<BTreeMap<SubnetId, SubnetType>>,
+        network_topology: Arc<NetworkTopology>,
         execution_parameters: ExecutionParameters,
-        nns_subnet_id: SubnetId,
     ) -> (CanisterState, NumInstructions, CallContextAction, NumBytes) {
         debug!(self.log, "execute_update: method {}", request.method_name());
 
@@ -131,7 +130,7 @@ impl Hypervisor {
         if CanisterStatusType::Running != canister.status() {
             return (
                 canister,
-                execution_parameters.instruction_limit,
+                execution_parameters.total_instruction_limit,
                 CallContextAction::Fail {
                     error: HypervisorError::CanisterStopped,
                     refund: incoming_cycles,
@@ -149,7 +148,7 @@ impl Hypervisor {
             None => {
                 return (
                     CanisterState::from_parts(None, system_state, scheduler_state),
-                    execution_parameters.instruction_limit,
+                    execution_parameters.total_instruction_limit,
                     CallContextAction::Fail {
                         error: HypervisorError::WasmModuleNotFound,
                         refund: incoming_cycles,
@@ -164,7 +163,7 @@ impl Hypervisor {
         if !execution_state.exports_method(&method) {
             return (
                 CanisterState::from_parts(Some(execution_state), system_state, scheduler_state),
-                execution_parameters.instruction_limit,
+                execution_parameters.total_instruction_limit,
                 CallContextAction::Fail {
                     error: HypervisorError::MethodNotFound(method),
                     refund: incoming_cycles,
@@ -176,7 +175,7 @@ impl Hypervisor {
         let call_context_id = system_state
             .call_context_manager_mut()
             .unwrap()
-            .new_call_context(CallOrigin::from(&request), incoming_cycles);
+            .new_call_context(CallOrigin::from(&request), incoming_cycles, time);
 
         let api_type = ApiType::update(
             time,
@@ -186,26 +185,20 @@ impl Hypervisor {
             call_context_id,
             self.own_subnet_id,
             self.own_subnet_type,
-            nns_subnet_id,
-            routing_table,
-            subnet_records,
+            network_topology,
         );
-        let output = execute(
+        let (output, output_execution_state, output_system_state) = self.execute(
             api_type,
             system_state.clone(),
             memory_usage,
             execution_parameters,
             FuncRef::Method(method),
             execution_state,
-            Arc::clone(&self.cycles_account_manager),
-            Arc::clone(&self.metrics),
-            Arc::clone(&self.wasm_executor),
-            self.sandbox_executor.clone(),
         );
 
         let (mut system_state, heap_delta) = if output.wasm_result.is_ok() {
             (
-                output.system_state,
+                output_system_state,
                 NumBytes::from((output.instance_stats.dirty_pages * PAGE_SIZE) as u64),
             )
         } else {
@@ -220,7 +213,7 @@ impl Hypervisor {
             .on_canister_result(call_context_id, output.wasm_result);
 
         let canister =
-            CanisterState::from_parts(Some(output.execution_state), system_state, scheduler_state);
+            CanisterState::from_parts(Some(output_execution_state), system_state, scheduler_state);
         (canister, output.num_instructions_left, action, heap_delta)
     }
 
@@ -250,7 +243,7 @@ impl Hypervisor {
         if CanisterStatusType::Running != canister.status() {
             return (
                 canister,
-                execution_parameters.instruction_limit,
+                execution_parameters.total_instruction_limit,
                 Err(HypervisorError::CanisterStopped),
             );
         }
@@ -260,11 +253,11 @@ impl Hypervisor {
         let (execution_state, system_state, scheduler_state) = canister.into_parts();
 
         // Validate that the Wasm module is present.
-        let mut execution_state = match execution_state {
+        let execution_state = match execution_state {
             None => {
                 return (
                     CanisterState::from_parts(None, system_state, scheduler_state),
-                    execution_parameters.instruction_limit,
+                    execution_parameters.total_instruction_limit,
                     Err(HypervisorError::WasmModuleNotFound),
                 );
             }
@@ -275,20 +268,13 @@ impl Hypervisor {
         if !execution_state.exports_method(&method) {
             return (
                 CanisterState::from_parts(Some(execution_state), system_state, scheduler_state),
-                execution_parameters.instruction_limit,
+                execution_parameters.total_instruction_limit,
                 Err(HypervisorError::MethodNotFound(method)),
             );
         }
 
         match query_execution_type {
             QueryExecutionType::Replicated => {
-                if execution_state.cow_mem_mgr.is_valid() {
-                    // Replicated queries are similar to update executions and they operate
-                    // against the "current" canister state
-                    execution_state.mapped_state =
-                        Some(Arc::new(execution_state.cow_mem_mgr.get_map()));
-                }
-
                 let api_type =
                     ApiType::replicated_query(time, payload.to_vec(), caller, data_certificate);
                 // As we are executing the query in the replicated mode, we do
@@ -296,17 +282,13 @@ impl Hypervisor {
                 // unmodified version of the canister. Hence, execute on clones
                 // of system and execution states so that we have the original
                 // versions.
-                let output = execute(
+                let (output, _output_execution_state, _system_state_accessor) = self.execute(
                     api_type,
                     system_state.clone(),
                     memory_usage,
                     execution_parameters,
                     FuncRef::Method(method),
                     execution_state.clone(),
-                    Arc::clone(&self.cycles_account_manager),
-                    Arc::clone(&self.metrics),
-                    Arc::clone(&self.wasm_executor),
-                    self.sandbox_executor.clone(),
                 );
 
                 let canister =
@@ -315,62 +297,126 @@ impl Hypervisor {
             }
             QueryExecutionType::NonReplicated {
                 call_context_id,
-                routing_table,
+                network_topology,
                 query_kind,
             } => {
-                if execution_state.cow_mem_mgr.is_valid() {
-                    // Non replicated queries execute against
-                    // older snapshotted state.
-                    execution_state.mapped_state = match execution_state
-                        .cow_mem_mgr
-                        .get_map_for_snapshot(execution_state.last_executed_round.get())
-                    {
-                        Ok(state) => Some(Arc::new(state)),
-                        Err(err @ CowError::SlotDbError { .. }) => {
-                            fatal!(self.log, "Failure due to {}", err)
-                        }
-                    };
-                }
-
                 let api_type = ApiType::non_replicated_query(
                     time,
-                    payload.to_vec(),
                     caller,
-                    call_context_id,
                     self.own_subnet_id,
-                    routing_table,
+                    payload.to_vec(),
                     data_certificate,
-                    query_kind.clone(),
+                    match query_kind {
+                        QueryKind::Pure => NonReplicatedQueryKind::Pure,
+                        QueryKind::Stateful => NonReplicatedQueryKind::Stateful {
+                            call_context_id,
+                            network_topology,
+                            outgoing_request: None,
+                        },
+                    },
                 );
                 // As we are executing the query in non-replicated mode, we can
                 // modify the canister as the caller is not going to be able to
                 // commit modifications to the canister anyway.
-                let output = execute(
+                let (output, output_execution_state, output_system_state) = self.execute(
                     api_type,
                     system_state,
                     memory_usage,
                     execution_parameters,
                     FuncRef::Method(method),
                     execution_state.clone(),
-                    Arc::clone(&self.cycles_account_manager),
-                    Arc::clone(&self.metrics),
-                    Arc::clone(&self.wasm_executor),
-                    self.sandbox_executor.clone(),
                 );
 
                 let new_execution_state = match query_kind {
-                    NonReplicatedQueryKind::Pure => execution_state,
-                    NonReplicatedQueryKind::Stateful => output.execution_state,
+                    QueryKind::Pure => execution_state,
+                    QueryKind::Stateful => output_execution_state,
                 };
 
                 let canister = CanisterState::from_parts(
                     Some(new_execution_state),
-                    output.system_state,
+                    output_system_state,
                     scheduler_state,
                 );
                 (canister, output.num_instructions_left, output.wasm_result)
             }
         }
+    }
+
+    /// Execute a query call that has no caller provided.
+    /// This type of query is triggered by the IC only when
+    /// there is a need to execute a query call on the provided canister.
+    #[allow(clippy::type_complexity)]
+    pub fn execute_anonymous_query(
+        &self,
+        time: Time,
+        method: &str,
+        payload: &[u8],
+        canister: CanisterState,
+        data_certificate: Option<Vec<u8>>,
+        execution_parameters: ExecutionParameters,
+    ) -> (
+        CanisterState,
+        NumInstructions,
+        HypervisorResult<Option<WasmResult>>,
+    ) {
+        // Validate that the canister is running.
+        if CanisterStatusType::Running != canister.status() {
+            return (
+                canister,
+                execution_parameters.total_instruction_limit,
+                Err(HypervisorError::CanisterStopped),
+            );
+        }
+
+        let method = WasmMethod::Query(method.to_string());
+        let memory_usage = canister.memory_usage(self.own_subnet_type);
+        let (execution_state, system_state, scheduler_state) = canister.into_parts();
+
+        // Validate that the Wasm module is present.
+        let execution_state = match execution_state {
+            None => {
+                return (
+                    CanisterState::from_parts(None, system_state, scheduler_state),
+                    execution_parameters.total_instruction_limit,
+                    Err(HypervisorError::WasmModuleNotFound),
+                );
+            }
+            Some(state) => state,
+        };
+
+        // Validate that the Wasm module exports the method.
+        if !execution_state.exports_method(&method) {
+            return (
+                CanisterState::from_parts(Some(execution_state), system_state, scheduler_state),
+                execution_parameters.total_instruction_limit,
+                Err(HypervisorError::MethodNotFound(method)),
+            );
+        }
+
+        let api_type = ApiType::non_replicated_query(
+            time,
+            IC_00.get(),
+            self.own_subnet_id,
+            payload.to_vec(),
+            data_certificate,
+            NonReplicatedQueryKind::Pure,
+        );
+        // We do not want to commit updates. Hence, execute on clones
+        // of system and execution states so that we have the original
+        // versions.
+        let (output, _, _) = self.execute(
+            api_type,
+            system_state.clone(),
+            memory_usage,
+            execution_parameters,
+            FuncRef::Method(method),
+            execution_state.clone(),
+        );
+
+        // We return the unmodified version of the canister.
+        let canister =
+            CanisterState::from_parts(Some(execution_state), system_state, scheduler_state);
+        (canister, output.num_instructions_left, output.wasm_result)
     }
 
     /// Execute a callback.
@@ -398,10 +444,8 @@ impl Hypervisor {
         payload: Payload,
         incoming_cycles: Cycles,
         time: Time,
-        routing_table: Arc<RoutingTable>,
-        subnet_records: Arc<BTreeMap<SubnetId, SubnetType>>,
+        network_topology: Arc<NetworkTopology>,
         execution_parameters: ExecutionParameters,
-        nns_subnet_id: SubnetId,
     ) -> (
         CanisterState,
         NumInstructions,
@@ -412,7 +456,7 @@ impl Hypervisor {
         if canister.status() == CanisterStatusType::Stopped {
             return (
                 canister,
-                execution_parameters.instruction_limit,
+                execution_parameters.total_instruction_limit,
                 NumBytes::from(0),
                 Err(HypervisorError::CanisterStopped),
             );
@@ -422,7 +466,7 @@ impl Hypervisor {
         if canister.execution_state.is_none() {
             return (
                 canister,
-                execution_parameters.instruction_limit,
+                execution_parameters.total_instruction_limit,
                 NumBytes::from(0),
                 Err(HypervisorError::WasmModuleNotFound),
             );
@@ -438,8 +482,8 @@ impl Hypervisor {
             .unwrap();
 
         let closure = match payload {
-            Payload::Data(_) => callback.on_reply.clone(),
-            Payload::Reject(_) => callback.on_reject.clone(),
+            Payload::Data(_) => callback.on_reply,
+            Payload::Reject(_) => callback.on_reject,
         };
 
         let api_type = match payload {
@@ -451,9 +495,7 @@ impl Hypervisor {
                 call_responded,
                 self.own_subnet_id,
                 self.own_subnet_type,
-                nns_subnet_id,
-                routing_table,
-                subnet_records,
+                network_topology,
             ),
             Payload::Reject(context) => ApiType::reject_callback(
                 time,
@@ -463,9 +505,7 @@ impl Hypervisor {
                 call_responded,
                 self.own_subnet_id,
                 self.own_subnet_type,
-                nns_subnet_id,
-                routing_table,
-                subnet_records,
+                network_topology,
             ),
         };
 
@@ -478,29 +518,23 @@ impl Hypervisor {
             }
         };
 
-        let output = execute(
+        let (output, output_execution_state, output_system_state) = self.execute(
             api_type,
             canister.system_state.clone(),
             canister.memory_usage(self.own_subnet_type),
             execution_parameters.clone(),
             func_ref,
             canister.execution_state.take().unwrap(),
-            Arc::clone(&self.cycles_account_manager),
-            Arc::clone(&self.metrics),
-            Arc::clone(&self.wasm_executor),
-            self.sandbox_executor.clone(),
         );
 
-        let cycles_account_manager = Arc::clone(&self.cycles_account_manager);
-        let metrics = Arc::clone(&self.metrics);
         let canister_current_memory_usage = canister.memory_usage(self.own_subnet_type);
         let call_origin = call_origin.clone();
 
-        canister.execution_state = Some(output.execution_state);
+        canister.execution_state = Some(output_execution_state);
         match output.wasm_result {
             result @ Ok(_) => {
                 // Executing the reply/reject closure succeeded.
-                canister.system_state = output.system_state;
+                canister.system_state = output_system_state;
                 let heap_delta =
                     NumBytes::from((output.instance_stats.dirty_pages * PAGE_SIZE) as u64);
                 (canister, output.num_instructions_left, heap_delta, result)
@@ -527,27 +561,25 @@ impl Hypervisor {
                                 FuncRef::QueryClosure(cleanup_closure)
                             }
                         };
-                        let cleanup_output = execute(
-                            ApiType::Cleanup { time },
-                            canister.system_state.clone(),
-                            canister_current_memory_usage,
-                            ExecutionParameters {
-                                instruction_limit: output.num_instructions_left,
-                                ..execution_parameters
-                            },
-                            func_ref,
-                            canister.execution_state.take().unwrap(),
-                            cycles_account_manager,
-                            metrics,
-                            Arc::clone(&self.wasm_executor),
-                            self.sandbox_executor.clone(),
-                        );
+                        let (cleanup_output, output_execution_state, output_system_state) = self
+                            .execute(
+                                ApiType::Cleanup { time },
+                                canister.system_state.clone(),
+                                canister_current_memory_usage,
+                                ExecutionParameters {
+                                    total_instruction_limit: output.num_instructions_left,
+                                    slice_instruction_limit: output.num_instructions_left,
+                                    ..execution_parameters
+                                },
+                                func_ref,
+                                canister.execution_state.take().unwrap(),
+                            );
 
-                        canister.execution_state = Some(cleanup_output.execution_state);
+                        canister.execution_state = Some(output_execution_state);
                         match cleanup_output.wasm_result {
                             Ok(_) => {
                                 // Executing the cleanup callback has succeeded.
-                                canister.system_state = cleanup_output.system_state;
+                                canister.system_state = output_system_state;
                                 let heap_delta = NumBytes::from(
                                     (cleanup_output.instance_stats.dirty_pages * PAGE_SIZE) as u64,
                                 );
@@ -607,7 +639,7 @@ impl Hypervisor {
             None => {
                 return (
                     CanisterState::from_parts(None, system_state, scheduler_state),
-                    execution_parameters.instruction_limit,
+                    execution_parameters.total_instruction_limit,
                     Err(HypervisorError::WasmModuleNotFound),
                 );
             }
@@ -619,25 +651,26 @@ impl Hypervisor {
         if !execution_state.exports_method(&method) {
             return (
                 CanisterState::from_parts(Some(execution_state), system_state, scheduler_state),
-                execution_parameters.instruction_limit,
+                execution_parameters.total_instruction_limit,
                 Ok(NumBytes::from(0)),
             );
         }
 
-        let output = execute(
+        let (output, output_execution_state, _system_state_accessor) = self.execute(
             ApiType::start(),
             SystemState::new_for_start(canister_id),
             memory_usage,
             execution_parameters,
             FuncRef::Method(method),
             execution_state,
-            Arc::clone(&self.cycles_account_manager),
-            Arc::clone(&self.metrics),
-            Arc::clone(&self.wasm_executor),
-            self.sandbox_executor.clone(),
         );
 
-        self.system_execution_result_with_old_system_state(output, system_state, scheduler_state)
+        self.system_execution_result_with_old_system_state(
+            output,
+            output_execution_state,
+            system_state,
+            scheduler_state,
+        )
     }
 
     /// Executes the system method `canister_pre_upgrade`.
@@ -661,14 +694,14 @@ impl Hypervisor {
     ) -> (CanisterState, NumInstructions, HypervisorResult<NumBytes>) {
         let method = WasmMethod::System(SystemMethod::CanisterPreUpgrade);
         let memory_usage = canister.memory_usage(self.own_subnet_type);
-        let (execution_state, system_state, scheduler_state) = canister.into_parts();
+        let (execution_state, old_system_state, scheduler_state) = canister.into_parts();
 
         // Validate that the Wasm module is present.
         let execution_state = match execution_state {
             None => {
                 return (
-                    CanisterState::from_parts(None, system_state, scheduler_state),
-                    execution_parameters.instruction_limit,
+                    CanisterState::from_parts(None, old_system_state, scheduler_state),
+                    execution_parameters.total_instruction_limit,
                     Err(HypervisorError::WasmModuleNotFound),
                 );
             }
@@ -679,25 +712,27 @@ impl Hypervisor {
         // succeeds as a no-op.
         if !execution_state.exports_method(&method) {
             return (
-                CanisterState::from_parts(Some(execution_state), system_state, scheduler_state),
-                execution_parameters.instruction_limit,
+                CanisterState::from_parts(Some(execution_state), old_system_state, scheduler_state),
+                execution_parameters.total_instruction_limit,
                 Ok(NumBytes::from(0)),
             );
         }
 
-        let output = execute(
+        let (output, output_execution_state, output_system_state) = self.execute(
             ApiType::pre_upgrade(time, caller),
-            system_state.clone(),
+            old_system_state.clone(),
             memory_usage,
             execution_parameters,
             FuncRef::Method(method),
             execution_state,
-            Arc::clone(&self.cycles_account_manager),
-            Arc::clone(&self.metrics),
-            Arc::clone(&self.wasm_executor),
-            self.sandbox_executor.clone(),
         );
-        self.system_execution_result(output, system_state, scheduler_state)
+        self.system_execution_result(
+            output,
+            output_execution_state,
+            old_system_state,
+            scheduler_state,
+            output_system_state,
+        )
     }
 
     /// Executes the system method `canister_init`.
@@ -722,14 +757,14 @@ impl Hypervisor {
     ) -> (CanisterState, NumInstructions, HypervisorResult<NumBytes>) {
         let method = WasmMethod::System(SystemMethod::CanisterInit);
         let memory_usage = canister.memory_usage(self.own_subnet_type);
-        let (execution_state, system_state, scheduler_state) = canister.into_parts();
+        let (execution_state, old_system_state, scheduler_state) = canister.into_parts();
 
         // Validate that the Wasm module is present.
         let execution_state = match execution_state {
             None => {
                 return (
-                    CanisterState::from_parts(None, system_state, scheduler_state),
-                    execution_parameters.instruction_limit,
+                    CanisterState::from_parts(None, old_system_state, scheduler_state),
+                    execution_parameters.total_instruction_limit,
                     Err(HypervisorError::WasmModuleNotFound),
                 );
             }
@@ -740,25 +775,27 @@ impl Hypervisor {
         // succeeds as a no-op.
         if !execution_state.exports_method(&method) {
             return (
-                CanisterState::from_parts(Some(execution_state), system_state, scheduler_state),
-                execution_parameters.instruction_limit,
+                CanisterState::from_parts(Some(execution_state), old_system_state, scheduler_state),
+                execution_parameters.total_instruction_limit,
                 Ok(NumBytes::from(0)),
             );
         }
 
-        let output = execute(
+        let (output, output_execution_state, output_system_state) = self.execute(
             ApiType::init(time, payload.to_vec(), caller),
-            system_state.clone(),
+            old_system_state.clone(),
             memory_usage,
             execution_parameters,
             FuncRef::Method(method),
             execution_state,
-            Arc::clone(&self.cycles_account_manager),
-            Arc::clone(&self.metrics),
-            Arc::clone(&self.wasm_executor),
-            self.sandbox_executor.clone(),
         );
-        self.system_execution_result(output, system_state, scheduler_state)
+        self.system_execution_result(
+            output,
+            output_execution_state,
+            old_system_state,
+            scheduler_state,
+            output_system_state,
+        )
     }
 
     /// Executes the system method `canister_post_upgrade`.
@@ -783,14 +820,14 @@ impl Hypervisor {
     ) -> (CanisterState, NumInstructions, HypervisorResult<NumBytes>) {
         let method = WasmMethod::System(SystemMethod::CanisterPostUpgrade);
         let memory_usage = canister.memory_usage(self.own_subnet_type);
-        let (execution_state, system_state, scheduler_state) = canister.into_parts();
+        let (execution_state, old_system_state, scheduler_state) = canister.into_parts();
 
         // Validate that the Wasm module is present.
         let execution_state = match execution_state {
             None => {
                 return (
-                    CanisterState::from_parts(None, system_state, scheduler_state),
-                    execution_parameters.instruction_limit,
+                    CanisterState::from_parts(None, old_system_state, scheduler_state),
+                    execution_parameters.total_instruction_limit,
                     Err(HypervisorError::WasmModuleNotFound),
                 );
             }
@@ -801,25 +838,27 @@ impl Hypervisor {
         // succeeds as a no-op.
         if !execution_state.exports_method(&method) {
             return (
-                CanisterState::from_parts(Some(execution_state), system_state, scheduler_state),
-                execution_parameters.instruction_limit,
+                CanisterState::from_parts(Some(execution_state), old_system_state, scheduler_state),
+                execution_parameters.total_instruction_limit,
                 Ok(NumBytes::from(0)),
             );
         }
 
-        let output = execute(
+        let (output, output_execution_state, output_system_state) = self.execute(
             ApiType::init(time, payload.to_vec(), caller),
-            system_state.clone(),
+            old_system_state.clone(),
             memory_usage,
             execution_parameters,
             FuncRef::Method(method),
             execution_state,
-            Arc::clone(&self.cycles_account_manager),
-            Arc::clone(&self.metrics),
-            Arc::clone(&self.wasm_executor),
-            self.sandbox_executor.clone(),
         );
-        self.system_execution_result(output, system_state, scheduler_state)
+        self.system_execution_result(
+            output,
+            output_execution_state,
+            old_system_state,
+            scheduler_state,
+            output_system_state,
+        )
     }
 
     /// Executes the system method `canister_inspect_message`.
@@ -834,64 +873,54 @@ impl Hypervisor {
         method_payload: Vec<u8>,
         time: Time,
         execution_parameters: ExecutionParameters,
-    ) -> Result<(), CanonicalError> {
+    ) -> (NumInstructions, Result<(), UserError>) {
         let method = WasmMethod::System(SystemMethod::CanisterInspectMessage);
         let memory_usage = canister.memory_usage(self.own_subnet_type);
+        let canister_id = canister.canister_id();
         let (execution_state, system_state, _) = canister.into_parts();
 
         // Validate that the Wasm module is present.
         let execution_state = match execution_state {
-            None => return Err(not_found_error("Requested canister has no wasm module")),
+            None => {
+                return (
+                    execution_parameters.total_instruction_limit,
+                    Err(UserError::new(
+                        ErrorCode::CanisterWasmModuleNotFound,
+                        "Requested canister has no wasm module",
+                    )),
+                );
+            }
             Some(execution_state) => execution_state,
         };
 
         // If the Wasm module does not export the method, then this execution
         // succeeds as a no-op.
         if !execution_state.exports_method(&method) {
-            return Ok(());
+            return (execution_parameters.total_instruction_limit, Ok(()));
         }
 
         let system_api = ApiType::inspect_message(sender, method_name, method_payload, time);
         let log = self.log.clone();
-        let output = execute(
+        let (output, _output_execution_state, _system_state_accessor) = self.execute(
             system_api,
             system_state,
             memory_usage,
             execution_parameters,
             FuncRef::Method(method),
             execution_state,
-            Arc::clone(&self.cycles_account_manager),
-            Arc::clone(&self.metrics),
-            Arc::clone(&self.wasm_executor),
-            self.sandbox_executor.clone(),
         );
         match output.wasm_result {
             Ok(maybe_wasm_result) => match maybe_wasm_result {
-                None => Ok(()),
+                None => (output.num_instructions_left, Ok(())),
                 Some(_result) => fatal!(
                     log,
                     "SystemApi should guarantee that the canister does not reply"
                 ),
             },
-            Err(err) => match err {
-                HypervisorError::MessageRejected => Err(permission_denied_error(
-                    "Requested canister rejected the message",
-                )),
-                err => {
-                    let canonical_error = match err {
-                        HypervisorError::MethodNotFound(_) => not_found_error(
-                            "Attempt to execute non-existent method on the canister",
-                        ),
-                        HypervisorError::CalledTrap(_) => {
-                            permission_denied_error("Requested canister rejected the message")
-                        }
-                        _ => internal_error(
-                            "Requested canister failed to process the message acceptance request",
-                        ),
-                    };
-                    Err(canonical_error)
-                }
-            },
+            Err(err) => (
+                output.num_instructions_left,
+                Err(err.into_user_error(&canister_id)),
+            ),
         }
     }
 
@@ -910,22 +939,20 @@ impl Hypervisor {
     pub fn execute_canister_heartbeat(
         &self,
         canister: CanisterState,
-        routing_table: Arc<RoutingTable>,
-        subnet_records: Arc<BTreeMap<SubnetId, SubnetType>>,
+        network_topology: Arc<NetworkTopology>,
         time: Time,
         execution_parameters: ExecutionParameters,
-        nns_subnet_id: SubnetId,
     ) -> (CanisterState, NumInstructions, HypervisorResult<NumBytes>) {
         let method = WasmMethod::System(SystemMethod::CanisterHeartbeat);
         let memory_usage = canister.memory_usage(self.own_subnet_type);
-        let (execution_state, mut system_state, scheduler_state) = canister.into_parts();
+        let (execution_state, mut old_system_state, scheduler_state) = canister.into_parts();
 
         // Validate that the Wasm module is present.
         let execution_state = match execution_state {
             None => {
                 return (
-                    CanisterState::from_parts(None, system_state, scheduler_state),
-                    execution_parameters.instruction_limit,
+                    CanisterState::from_parts(None, old_system_state, scheduler_state),
+                    execution_parameters.total_instruction_limit,
                     Err(HypervisorError::WasmModuleNotFound),
                 );
             }
@@ -936,44 +963,43 @@ impl Hypervisor {
         // succeeds as a no-op.
         if !execution_state.exports_method(&method) {
             return (
-                CanisterState::from_parts(Some(execution_state), system_state, scheduler_state),
-                execution_parameters.instruction_limit,
+                CanisterState::from_parts(Some(execution_state), old_system_state, scheduler_state),
+                execution_parameters.total_instruction_limit,
                 Ok(NumBytes::from(0)),
             );
         }
 
-        let call_context_id = system_state
+        let call_context_id = old_system_state
             .call_context_manager_mut()
             .unwrap()
-            .new_call_context(CallOrigin::Heartbeat, Cycles::from(0));
+            .new_call_context(CallOrigin::Heartbeat, Cycles::from(0), time);
 
         let api_type = ApiType::heartbeat(
             time,
             call_context_id,
             self.own_subnet_id,
             self.own_subnet_type,
-            nns_subnet_id,
-            routing_table,
-            subnet_records,
+            network_topology,
         );
 
-        let output = execute(
+        let (output, output_execution_state, output_system_state) = self.execute(
             api_type,
-            system_state.clone(),
+            old_system_state.clone(),
             memory_usage,
             execution_parameters,
             FuncRef::Method(method),
             execution_state,
-            Arc::clone(&self.cycles_account_manager),
-            Arc::clone(&self.metrics),
-            Arc::clone(&self.wasm_executor),
-            self.sandbox_executor.clone(),
         );
 
         {
             let wasm_result = output.wasm_result.clone();
-            let (mut canister, num_instructions_left, heap_delta) =
-                self.system_execution_result(output, system_state, scheduler_state);
+            let (mut canister, num_instructions_left, heap_delta) = self.system_execution_result(
+                output,
+                output_execution_state,
+                old_system_state,
+                scheduler_state,
+                output_system_state,
+            );
             let _action = canister
                 .system_state
                 .call_context_manager_mut()
@@ -990,13 +1016,15 @@ impl Hypervisor {
     // as follows:
     // - `execution_state` is taken from the Wasm output.
     // - `scheduler_state` is taken from the corresponding argument.
-    // - `system_state` is taken from the Wasm output if the execution succeeded;
-    //   otherwise, it is taken from the corresponding argument.
+    // - `system_state` is taken from the system_state_accessor if the execution
+    //   succeeded; otherwise, it is taken from the corresponding argument.
     fn system_execution_result(
         &self,
         output: WasmExecutionOutput,
+        execution_state: ExecutionState,
         old_system_state: SystemState,
         scheduler_state: SchedulerState,
+        output_system_state: SystemState,
     ) -> (CanisterState, NumInstructions, HypervisorResult<NumBytes>) {
         let (system_state, heap_delta) = match output.wasm_result {
             Ok(opt_result) => {
@@ -1004,12 +1032,12 @@ impl Hypervisor {
                     fatal!(self.log, "[EXC-BUG] System methods cannot use msg_reply.");
                 }
                 let bytes = NumBytes::from((output.instance_stats.dirty_pages * PAGE_SIZE) as u64);
-                (output.system_state, Ok(bytes))
+                (output_system_state, Ok(bytes))
             }
             Err(err) => (old_system_state, Err(err)),
         };
         let canister =
-            CanisterState::from_parts(Some(output.execution_state), system_state, scheduler_state);
+            CanisterState::from_parts(Some(execution_state), system_state, scheduler_state);
         (canister, output.num_instructions_left, heap_delta)
     }
 
@@ -1018,6 +1046,7 @@ impl Hypervisor {
     fn system_execution_result_with_old_system_state(
         &self,
         output: WasmExecutionOutput,
+        execution_state: ExecutionState,
         old_system_state: SystemState,
         scheduler_state: SchedulerState,
     ) -> (CanisterState, NumInstructions, HypervisorResult<NumBytes>) {
@@ -1032,11 +1061,8 @@ impl Hypervisor {
             }
             Err(err) => Err(err),
         };
-        let canister = CanisterState::from_parts(
-            Some(output.execution_state),
-            old_system_state,
-            scheduler_state,
-        );
+        let canister =
+            CanisterState::from_parts(Some(execution_state), old_system_state, scheduler_state);
         (canister, output.num_instructions_left, heap_delta)
     }
 
@@ -1057,7 +1083,6 @@ impl Hypervisor {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: Config,
-        num_runtime_threads: usize,
         metrics_registry: &MetricsRegistry,
         own_subnet_id: SubnetId,
         own_subnet_type: SubnetType,
@@ -1065,9 +1090,17 @@ impl Hypervisor {
         cycles_account_manager: Arc<CyclesAccountManager>,
     ) -> Self {
         let mut embedder_config = EmbeddersConfig::new();
-        embedder_config.persistence_type = config.persistence_type;
-        embedder_config.num_runtime_generic_threads = num_runtime_threads;
-        embedder_config.num_runtime_query_threads = std::cmp::min(num_runtime_threads, 4);
+        embedder_config.query_execution_threads = config.query_execution_threads;
+        embedder_config.feature_flags.rate_limiting_of_debug_prints =
+            config.rate_limiting_of_debug_prints;
+
+        let sandbox_executor = match config.canister_sandboxing_flag {
+            FlagStatus::Enabled => Some(Arc::new(
+                SandboxedExecutionController::new(log.clone(), metrics_registry, &embedder_config)
+                    .expect("Failed to start sandboxed execution controller"),
+            )),
+            FlagStatus::Disabled => None,
+        };
 
         let wasm_embedder = WasmtimeEmbedder::new(embedder_config.clone(), log.clone());
         let wasm_executor = WasmExecutor::new(
@@ -1076,13 +1109,6 @@ impl Hypervisor {
             embedder_config,
             log.clone(),
         );
-
-        let sandbox_executor = match config.canister_sandboxing_flag {
-            FeatureStatus::Enabled => {
-                Some(Arc::new(SandboxedExecutionController::new(log.clone())))
-            }
-            FeatureStatus::Disabled => None,
-        };
 
         Self {
             wasm_executor: Arc::new(wasm_executor),
@@ -1103,55 +1129,45 @@ impl Hypervisor {
             self.wasm_executor.compile_count_for_testing()
         }
     }
-}
 
-/// Executes a Wasm function.
-///
-/// The function returns an updated execution state as well as an updated
-/// system state and WasmResult using the SystemApi.
-//
-/// If the method is not found or if execution fails, an error is returned
-/// via the system API.
-///
-/// NOTE: this is public to enable integration testing.
-#[allow(clippy::too_many_arguments)]
-#[doc(hidden)]
-pub fn execute(
-    api_type: ApiType,
-    system_state: SystemState,
-    canister_current_memory_usage: NumBytes,
-    execution_parameters: ExecutionParameters,
-    func_ref: FuncRef,
-    execution_state: ExecutionState,
-    cycles_account_manager: Arc<CyclesAccountManager>,
-    metrics: Arc<HypervisorMetrics>,
-    wasm_executor: Arc<WasmExecutor>,
-    sandbox_executor: Option<Arc<SandboxedExecutionController>>,
-) -> WasmExecutionOutput {
-    let api_type_str = api_type.as_str();
+    /// Wrapper around the standalone `execute`.
+    /// NOTE: this is public to enable integration testing.
+    #[doc(hidden)]
+    pub fn execute(
+        &self,
+        api_type: ApiType,
+        mut system_state: SystemState,
+        canister_current_memory_usage: NumBytes,
+        execution_parameters: ExecutionParameters,
+        func_ref: FuncRef,
+        execution_state: ExecutionState,
+    ) -> (WasmExecutionOutput, ExecutionState, SystemState) {
+        let api_type_str = api_type.as_str();
+        let static_system_state =
+            SandboxSafeSystemState::new(&system_state, *self.cycles_account_manager);
 
-    let result = if let Some(sandbox_executor) = sandbox_executor {
-        sandbox_executor.process(WasmExecutionInput {
-            api_type: api_type.clone(),
-            system_state,
-            canister_current_memory_usage,
-            execution_parameters,
-            func_ref,
-            execution_state,
-            cycles_account_manager,
-        })
-    } else {
-        wasm_executor.process(WasmExecutionInput {
-            api_type: api_type.clone(),
-            system_state,
-            canister_current_memory_usage,
-            execution_parameters,
-            func_ref,
-            execution_state,
-            cycles_account_manager,
-        })
-    };
-
-    metrics.observe(api_type_str, &result);
-    result
+        let (output, execution_state, system_state_changes) =
+            if let Some(sandbox_executor) = self.sandbox_executor.as_ref() {
+                sandbox_executor.process(WasmExecutionInput {
+                    api_type: api_type.clone(),
+                    sandbox_safe_system_state: static_system_state,
+                    canister_current_memory_usage,
+                    execution_parameters,
+                    func_ref,
+                    execution_state,
+                })
+            } else {
+                self.wasm_executor.process(WasmExecutionInput {
+                    api_type: api_type.clone(),
+                    sandbox_safe_system_state: static_system_state,
+                    canister_current_memory_usage,
+                    execution_parameters,
+                    func_ref,
+                    execution_state,
+                })
+            };
+        self.metrics.observe(api_type_str, &output);
+        system_state_changes.apply_changes(&mut system_state);
+        (output, execution_state, system_state)
+    }
 }

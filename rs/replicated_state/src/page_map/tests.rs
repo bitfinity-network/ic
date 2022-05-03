@@ -1,7 +1,7 @@
 use super::{
     checkpoint::{Checkpoint, MappingSerialization},
     page_allocator::PageAllocatorSerialization,
-    Buffer, FileDescriptor, PageIndex, PageMap,
+    Buffer, FileDescriptor, PageIndex, PageMap, PageMapSerialization,
 };
 use ic_sys::PAGE_SIZE;
 use nix::unistd::dup;
@@ -15,6 +15,32 @@ fn assert_equal_page_maps(page_map1: &PageMap, page_map2: &PageMap) {
             page_map2.get_page(PageIndex::new(i as u64))
         );
     }
+}
+
+// Since tests run in the same process, we need to duplicate all file
+// descriptors so that both page maps can close them.
+fn duplicate_file_descriptors(
+    mut serialized_page_map: PageMapSerialization,
+) -> PageMapSerialization {
+    serialized_page_map.checkpoint.mapping =
+        serialized_page_map
+            .checkpoint
+            .mapping
+            .map(|mapping| MappingSerialization {
+                file_descriptor: FileDescriptor {
+                    fd: dup(mapping.file_descriptor.fd).unwrap(),
+                },
+                ..mapping
+            });
+    serialized_page_map.page_allocator = match serialized_page_map.page_allocator {
+        PageAllocatorSerialization::Mmap(file_descriptor) => {
+            PageAllocatorSerialization::Mmap(FileDescriptor {
+                fd: dup(file_descriptor.fd).unwrap(),
+            })
+        }
+        _ => serialized_page_map.page_allocator,
+    };
+    serialized_page_map
 }
 
 #[test]
@@ -175,43 +201,29 @@ fn can_use_buffer_to_modify_page_map() {
 #[test]
 fn serialize_empty_page_map() {
     let original_page_map = PageMap::default();
-    let serialized_page_map = original_page_map.serialize();
+    let serialized_page_map = duplicate_file_descriptors(original_page_map.serialize());
     let deserialized_page_map = PageMap::deserialize(serialized_page_map).unwrap();
     assert_equal_page_maps(&original_page_map, &deserialized_page_map);
 }
 
 #[test]
 fn serialize_page_map() {
+    let mut replica = PageMap::default();
+    // The replica process sends the page map to the sandbox process.
+    let serialized_page_map = duplicate_file_descriptors(replica.serialize());
+    let mut sandbox = PageMap::deserialize(serialized_page_map).unwrap();
+    // The sandbox process allocates new pages.
     let page_1 = [1u8; PAGE_SIZE];
     let page_3 = [3u8; PAGE_SIZE];
     let page_7 = [7u8; PAGE_SIZE];
     let pages = &[(PageIndex::new(1), &page_1), (PageIndex::new(3), &page_3)];
-    let mut original_page_map = PageMap::default();
-    original_page_map.update(pages);
-    original_page_map.strip_round_delta();
-    original_page_map.update(&[(PageIndex::new(7), &page_7)]);
-
-    let mut serialized_page_map = original_page_map.serialize();
-    // Since the test runs in the same process, we need to duplicate all file
-    // descriptors so that both page maps can close them.
-    serialized_page_map.checkpoint.mapping =
-        serialized_page_map
-            .checkpoint
-            .mapping
-            .map(|mapping| MappingSerialization {
-                file_descriptor: FileDescriptor {
-                    fd: dup(mapping.file_descriptor.fd).unwrap(),
-                },
-                ..mapping
-            });
-    serialized_page_map.page_allocator = match serialized_page_map.page_allocator {
-        PageAllocatorSerialization::Mmap(file_descriptor) => {
-            PageAllocatorSerialization::Mmap(FileDescriptor {
-                fd: dup(file_descriptor.fd).unwrap(),
-            })
-        }
-        _ => serialized_page_map.page_allocator,
-    };
-    let deserialized_page_map = PageMap::deserialize(serialized_page_map).unwrap();
-    assert_equal_page_maps(&original_page_map, &deserialized_page_map);
+    sandbox.update(pages);
+    sandbox.strip_round_delta();
+    sandbox.update(&[(PageIndex::new(7), &page_7)]);
+    // The sandbox process sends the dirty pages to the replica process.
+    let page_delta =
+        sandbox.serialize_delta(&[PageIndex::new(1), PageIndex::new(3), PageIndex::new(7)]);
+    replica.deserialize_delta(page_delta);
+    // The page deltas must be in sync.
+    assert_equal_page_maps(&replica, &sandbox);
 }
